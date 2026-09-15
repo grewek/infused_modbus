@@ -18,13 +18,12 @@
 // standard Modbus (the master always has to initiate), so this is as
 // close to "efficient" as the protocol allows.
 
+use crate::connection::Connection;
 use fuse_fs::{RegisterStore, RegisterValue};
-use protocol::adu::TcpAdu;
 use protocol::device_description::{DataType, RegisterDescription};
 use protocol::pdu::{ReadHoldingRegistersRequest, ReadHoldingRegistersResponse};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as AsyncMutex;
 
 // Modbus's own limit on how many registers one Read Holding Registers
@@ -80,35 +79,27 @@ pub fn build_read_batches(registers: &[RegisterDescription]) -> Vec<RegisterBatc
 /// `store`. A failed batch (I/O error, timeout, Modbus exception, or a
 /// malformed/short response) is logged and skipped — it'll be retried on
 /// the next poll tick rather than treated as fatal.
-pub async fn poll_once<S>(
-    stream: &Arc<AsyncMutex<S>>,
+pub async fn poll_once(
+    connection: &Arc<AsyncMutex<Connection>>,
     batches: &[RegisterBatch],
     store: &Arc<Mutex<RegisterStore>>,
     unit_id: u8,
-    next_transaction_id: &mut u16,
     timeout: Duration,
-) where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) {
     for batch in batches {
-        *next_transaction_id = next_transaction_id.wrapping_add(1);
-        let request = TcpAdu {
-            transaction_id: *next_transaction_id,
-            unit_id,
-            pdu: ReadHoldingRegistersRequest {
-                starting_address: batch.starting_address,
-                quantity: batch.quantity(),
-            }
-            .encode(),
-        };
+        let request_pdu = ReadHoldingRegistersRequest {
+            starting_address: batch.starting_address,
+            quantity: batch.quantity(),
+        }
+        .encode();
 
         let result = {
-            let mut stream = stream.lock().await;
-            protocol::tcp::send_request(&mut *stream, request, timeout).await
+            let mut connection = connection.lock().await;
+            connection.request(unit_id, request_pdu, timeout).await
         };
 
-        let response = match result {
-            Ok(response) => response,
+        let response_pdu = match result {
+            Ok(response_pdu) => response_pdu,
             Err(error) => {
                 eprintln!(
                     "poll: read of {} register(s) at {} failed: {error}",
@@ -119,7 +110,7 @@ pub async fn poll_once<S>(
             }
         };
 
-        match ReadHoldingRegistersResponse::decode(&response.pdu) {
+        match ReadHoldingRegistersResponse::decode(&response_pdu) {
             Ok(decoded) if decoded.register_values.len() == batch.registers.len() => {
                 let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
                 for (register, value) in batch.registers.iter().zip(decoded.register_values) {
@@ -131,7 +122,7 @@ pub async fn poll_once<S>(
                     "poll: unexpected response reading {} register(s) at {}: {:02X?}",
                     batch.quantity(),
                     batch.starting_address,
-                    response.pdu
+                    response_pdu
                 );
             }
         }
@@ -141,30 +132,19 @@ pub async fn poll_once<S>(
 /// Polls every batch on a fixed interval, forever — meant to run as its
 /// own tokio task alongside the transaction consumer, sharing the same
 /// connection (`stream`).
-pub async fn run_polling_loop<S>(
-    stream: Arc<AsyncMutex<S>>,
+pub async fn run_polling_loop(
+    connection: Arc<AsyncMutex<Connection>>,
     registers: &[RegisterDescription],
     store: Arc<Mutex<RegisterStore>>,
     unit_id: u8,
     poll_interval: Duration,
     timeout: Duration,
-) where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) {
     let batches = build_read_batches(registers);
-    let mut next_transaction_id: u16 = 0;
     let mut ticker = tokio::time::interval(poll_interval);
     loop {
         ticker.tick().await;
-        poll_once(
-            &stream,
-            &batches,
-            &store,
-            unit_id,
-            &mut next_transaction_id,
-            timeout,
-        )
-        .await;
+        poll_once(&connection, &batches, &store, unit_id, timeout).await;
     }
 }
 
@@ -250,10 +230,18 @@ mod tests {
         assert_eq!(batches[1].quantity(), 5);
     }
 
+    async fn connected_pair() -> (Connection, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let connection = Connection::connect_tcp(&address).await.unwrap();
+        let (device, _peer) = listener.accept().await.unwrap();
+        (connection, device)
+    }
+
     #[tokio::test]
     async fn poll_once_applies_a_successful_batch_to_the_store() {
-        let (client, mut device) = tokio::io::duplex(1024);
-        let stream = Arc::new(AsyncMutex::new(client));
+        let (connection, mut device) = connected_pair().await;
+        let connection = Arc::new(AsyncMutex::new(connection));
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         let batches = build_read_batches(&[
             register("A", 40001, DataType::U16),
@@ -277,16 +265,7 @@ mod tests {
             device.write_all(&response).await.unwrap();
         });
 
-        let mut next_transaction_id = 0;
-        poll_once(
-            &stream,
-            &batches,
-            &store,
-            0x01,
-            &mut next_transaction_id,
-            Duration::from_secs(1),
-        )
-        .await;
+        poll_once(&connection, &batches, &store, 0x01, Duration::from_secs(1)).await;
 
         device_task.await.unwrap();
         assert_eq!(store.lock().unwrap().get("A"), Some(RegisterValue::U16(11)));
@@ -295,18 +274,16 @@ mod tests {
 
     #[tokio::test]
     async fn poll_once_leaves_the_store_untouched_when_the_device_times_out() {
-        let (client, _device) = tokio::io::duplex(1024);
-        let stream = Arc::new(AsyncMutex::new(client));
+        let (connection, _device) = connected_pair().await;
+        let connection = Arc::new(AsyncMutex::new(connection));
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         let batches = build_read_batches(&[register("A", 40001, DataType::U16)]);
 
-        let mut next_transaction_id = 0;
         poll_once(
-            &stream,
+            &connection,
             &batches,
             &store,
             0x01,
-            &mut next_transaction_id,
             Duration::from_millis(50),
         )
         .await;

@@ -9,56 +9,43 @@
 // tokio task), using `handle` to drive the async Modbus write to
 // completion one register at a time.
 //
-// `stream` is shared (behind a tokio::sync::Mutex, not std::sync::Mutex —
-// held across the .await inside confirm_write) with whoever else also
+// `connection` is shared (behind a tokio::sync::Mutex, not std::sync::Mutex
+// — held across the .await inside confirm_write) with whoever else also
 // talks to the device (the polling loop, see client/src/polling.rs): a
 // generic Modbus device/gateway can't be assumed to accept more than one
-// concurrent connection, so every use of the connection — a poll read or a
-// confirmed write — takes the lock only for the duration of its own
-// request/response, never holds it across unrelated work.
+// concurrent connection, so every use — a poll read or a confirmed write —
+// takes the lock only for the duration of its own request/response, never
+// holds it across unrelated work. `Connection` itself hides whether that's
+// actually TCP or RTU underneath.
 
+use crate::connection::Connection;
 use crate::write_confirmation::confirm_write;
 use fuse_fs::{RegisterStore, RegisterValue, WriteReport, WriteStatus};
 use protocol::device_description::RegisterDescription;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_transaction_consumer<S>(
+pub fn run_transaction_consumer(
     handle: &Handle,
-    stream: &Arc<AsyncMutex<S>>,
+    connection: &Arc<AsyncMutex<Connection>>,
     registers: &[RegisterDescription],
     store: &Arc<Mutex<RegisterStore>>,
     report: &Arc<Mutex<WriteReport>>,
     transaction_receiver: mpsc::Receiver<HashMap<String, RegisterValue>>,
     unit_id: u8,
     timeout: Duration,
-) where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut next_transaction_id: u16 = 0;
+) {
     for transaction in transaction_receiver {
         for (name, value) in transaction {
             let status = match registers.iter().find(|register| register.name == name) {
-                Some(register) => {
-                    next_transaction_id = next_transaction_id.wrapping_add(1);
-                    handle.block_on(async {
-                        let mut stream = stream.lock().await;
-                        confirm_write(
-                            &mut *stream,
-                            register,
-                            value,
-                            unit_id,
-                            next_transaction_id,
-                            timeout,
-                        )
-                        .await
-                    })
-                }
+                Some(register) => handle.block_on(async {
+                    let mut connection = connection.lock().await;
+                    confirm_write(&mut connection, register, value, unit_id, timeout).await
+                }),
                 None => WriteStatus::Failed(format!("unknown register: {name}")),
             };
 
@@ -84,9 +71,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    async fn connected_pair() -> (Connection, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let connection = Connection::connect_tcp(&address).await.unwrap();
+        let (device, _peer) = listener.accept().await.unwrap();
+        (connection, device)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn confirms_a_write_and_updates_store_and_report() {
-        let (client, mut device) = tokio::io::duplex(1024);
+        let (connection, mut device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
@@ -109,13 +104,13 @@ mod tests {
         });
 
         let handle = Handle::current();
-        let stream = Arc::new(AsyncMutex::new(client));
+        let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_store = Arc::clone(&store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
-                &stream,
+                &connection,
                 &registers,
                 &consumer_store,
                 &consumer_report,
@@ -145,9 +140,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_write_updates_report_but_not_store() {
-        let (client, mut device) = tokio::io::duplex(1024);
+        let (connection, mut device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
@@ -177,13 +172,13 @@ mod tests {
         });
 
         let handle = Handle::current();
-        let stream = Arc::new(AsyncMutex::new(client));
+        let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_store = Arc::clone(&store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
-                &stream,
+                &connection,
                 &registers,
                 &consumer_store,
                 &consumer_report,
@@ -208,22 +203,22 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn an_unknown_register_is_reported_as_failed_without_sending_anything() {
-        let (client, device) = tokio::io::duplex(1024);
+        let (connection, device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let registers = vec![u16_register()];
 
         let handle = Handle::current();
-        let stream = Arc::new(AsyncMutex::new(client));
+        let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_store = Arc::clone(&store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
-                &stream,
+                &connection,
                 &registers,
                 &consumer_store,
                 &consumer_report,

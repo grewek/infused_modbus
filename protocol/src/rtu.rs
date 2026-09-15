@@ -34,6 +34,25 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 // growing this buffer without bound.
 const RTU_MAX_FRAME_LEN: usize = 256;
 
+/// The spec's 3.5-character-time silence gap that marks a frame boundary,
+/// for a link running at `baud_rate`. A Modbus character is 11 bits total
+/// (start bit, 8 data bits, a parity-or-filler bit, and a stop bit), so 3.5
+/// character times is `38.5 / baud_rate` seconds — except the spec fixes it
+/// to a flat 1.75ms at 19200 baud and above, since the formula would
+/// otherwise give a gap too short to detect reliably in software at high
+/// baud rates.
+pub fn frame_silence_for_baud_rate(baud_rate: u32) -> Duration {
+    const HIGH_BAUD_RATE_THRESHOLD: u32 = 19200;
+    const HIGH_BAUD_RATE_FRAME_SILENCE: Duration = Duration::from_micros(1750);
+
+    if baud_rate >= HIGH_BAUD_RATE_THRESHOLD {
+        HIGH_BAUD_RATE_FRAME_SILENCE
+    } else {
+        let char_time_nanos = 11_000_000_000u64 / baud_rate as u64;
+        Duration::from_nanos(char_time_nanos * 7 / 2)
+    }
+}
+
 /// Reads one RTU frame's raw bytes (unit ID + PDU + CRC, undecoded) by
 /// waiting for silence: `timeout` bounds how long to wait for the *first*
 /// byte (matching how a stalled peer is handled elsewhere in this crate),
@@ -135,6 +154,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_silence_is_a_flat_1_75ms_at_high_baud_rates() {
+        assert_eq!(
+            frame_silence_for_baud_rate(19200),
+            Duration::from_micros(1750)
+        );
+        assert_eq!(
+            frame_silence_for_baud_rate(115200),
+            Duration::from_micros(1750)
+        );
+    }
+
+    #[test]
+    fn frame_silence_follows_the_3_5_character_time_formula_below_19200() {
+        // At 9600 baud, one character (11 bits) takes 11/9600 s ≈ 1145.83µs;
+        // 3.5 character times ≈ 4010.4µs.
+        let silence = frame_silence_for_baud_rate(9600);
+        assert!(
+            silence >= Duration::from_micros(4000) && silence <= Duration::from_micros(4020),
+            "expected ~4010µs, got {silence:?}"
+        );
+    }
 
     #[tokio::test]
     async fn send_request_returns_the_response_after_a_silence_gap() {

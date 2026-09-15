@@ -1,13 +1,12 @@
 // Turning a staged (register, value) pair into a real Modbus write, and
 // turning the device's response back into a WriteStatus.
 
+use crate::connection::Connection;
 use fuse_fs::{RegisterValue, WriteStatus};
 use protocol::DecodeError;
-use protocol::adu::TcpAdu;
 use protocol::device_description::{DataType, RegisterDescription};
 use protocol::pdu::{ExceptionResponse, WriteSingleRegisterRequest};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Encodes the Modbus request PDU for writing `value` to `register`.
 ///
@@ -59,28 +58,19 @@ pub fn interpret_write_response(response_pdu: &[u8]) -> WriteStatus {
 /// a dropped connection, ...): those are reported as `WriteStatus::Failed`
 /// just like a Modbus-level rejection, since from the caller's perspective
 /// both just mean "the write didn't happen".
-pub async fn confirm_write<S>(
-    stream: &mut S,
+pub async fn confirm_write(
+    connection: &mut Connection,
     register: &RegisterDescription,
     value: RegisterValue,
     unit_id: u8,
-    transaction_id: u16,
     timeout: Duration,
-) -> WriteStatus
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) -> WriteStatus {
     let pdu = match encode_write_request(register, value) {
         Ok(pdu) => pdu,
         Err(reason) => return WriteStatus::Failed(reason),
     };
-    let request = TcpAdu {
-        transaction_id,
-        unit_id,
-        pdu,
-    };
-    match protocol::tcp::send_request(stream, request, timeout).await {
-        Ok(response) => interpret_write_response(&response.pdu),
+    match connection.request(unit_id, pdu, timeout).await {
+        Ok(response_pdu) => interpret_write_response(&response_pdu),
         Err(error) => WriteStatus::Failed(format!("write failed: {error}")),
     }
 }
@@ -157,9 +147,17 @@ mod tests {
         ));
     }
 
+    async fn connected_pair() -> (Connection, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let connection = Connection::connect_tcp(&address).await.unwrap();
+        let (device, _peer) = listener.accept().await.unwrap();
+        (connection, device)
+    }
+
     #[tokio::test]
     async fn confirm_write_returns_ok_when_device_echoes_the_write() {
-        let (mut client, mut device) = tokio::io::duplex(1024);
+        let (mut connection, mut device) = connected_pair().await;
 
         let device_task = tokio::spawn(async move {
             let mut header = vec![0u8; 7];
@@ -182,11 +180,10 @@ mod tests {
         });
 
         let status = confirm_write(
-            &mut client,
+            &mut connection,
             &u16_register(),
             RegisterValue::U16(1),
             0x01,
-            0x0001,
             Duration::from_secs(1),
         )
         .await;
@@ -197,7 +194,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_write_returns_failed_when_device_returns_an_exception() {
-        let (mut client, mut device) = tokio::io::duplex(1024);
+        let (mut connection, mut device) = connected_pair().await;
 
         let device_task = tokio::spawn(async move {
             let mut header = vec![0u8; 7];
@@ -228,11 +225,10 @@ mod tests {
         });
 
         let status = confirm_write(
-            &mut client,
+            &mut connection,
             &u16_register(),
             RegisterValue::U16(1),
             0x01,
-            0x0001,
             Duration::from_secs(1),
         )
         .await;
@@ -243,14 +239,13 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_write_returns_failed_when_the_device_never_responds() {
-        let (mut client, _device) = tokio::io::duplex(1024);
+        let (mut connection, _device) = connected_pair().await;
 
         let status = confirm_write(
-            &mut client,
+            &mut connection,
             &u16_register(),
             RegisterValue::U16(1),
             0x01,
-            0x0001,
             Duration::from_millis(50),
         )
         .await;
@@ -260,14 +255,13 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_write_returns_failed_without_sending_for_unsupported_types() {
-        let (mut client, _device) = tokio::io::duplex(1024);
+        let (mut connection, _device) = connected_pair().await;
 
         let status = confirm_write(
-            &mut client,
+            &mut connection,
             &f32_register(),
             RegisterValue::F32(3.5),
             0x01,
-            0x0001,
             Duration::from_secs(1),
         )
         .await;
