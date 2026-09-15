@@ -1,4 +1,5 @@
 pub mod adu;
+pub mod device_description;
 pub mod pdu;
 pub mod tcp;
 
