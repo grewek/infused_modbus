@@ -1,7 +1,27 @@
 use crate::adu::{MBAP_HEADER_LEN, MBAP_LENGTH_BYTE, MBAP_MAX_LENGTH, TcpAdu};
 use crate::read_u16_be;
+use std::future::Future;
 use std::io;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+// Wraps a single I/O step (one read or one write) so a peer that stalls
+// mid-operation — sends half a header and then nothing, or stops reading so
+// our write never drains — can't tie up a connection indefinitely. `timeout`
+// bounds each I/O step individually, not the whole request/response exchange,
+// matching how a plain socket read/write timeout behaves.
+async fn with_timeout<T>(
+    timeout: Duration,
+    future: impl Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    match tokio::time::timeout(timeout, future).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Modbus TCP operation timed out",
+        )),
+    }
+}
 
 // Generic over AsyncRead/AsyncWrite rather than named to `tokio::net::TcpStream`
 // directly: a real caller still passes a TcpStream (which implements both
@@ -39,13 +59,19 @@ where
 }
 
 /// Sends `request` over `stream` and returns the response with the matching
-/// transaction ID.
-pub async fn send_request<S>(stream: &mut S, request: TcpAdu) -> io::Result<TcpAdu>
+/// transaction ID. `timeout` bounds the write and the read as separate steps
+/// (see `with_timeout`), so a stalled peer fails fast instead of hanging the
+/// connection forever.
+pub async fn send_request<S>(
+    stream: &mut S,
+    request: TcpAdu,
+    timeout: Duration,
+) -> io::Result<TcpAdu>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    stream.write_all(&request.encode()).await?;
-    let response = read_adu(stream).await?;
+    with_timeout(timeout, stream.write_all(&request.encode())).await?;
+    let response = with_timeout(timeout, read_adu(stream)).await?;
     if response.transaction_id != request.transaction_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -60,22 +86,30 @@ where
 
 /// Reads one request off `stream`, passes its PDU bytes to `handler`, and
 /// writes the handler's response PDU back with the same transaction ID and
-/// unit ID. `handler` is PDU-agnostic here too — it's whoever calls this that
+/// unit ID. `timeout` bounds the read and the write as separate steps (see
+/// `with_timeout`) so a stalled peer can't tie up the connection forever;
+/// `handler` itself is not subject to `timeout`, since how long it's allowed
+/// to take is the caller's own business, not a network-peer concern.
+/// `handler` is PDU-agnostic here too — it's whoever calls this that
 /// knows how to turn request bytes into response bytes (e.g. an exception
 /// response's own bytes, if it wants to signal a Modbus-level error).
-pub async fn serve_request<S, H>(stream: &mut S, mut handler: H) -> io::Result<()>
+pub async fn serve_request<S, H>(
+    stream: &mut S,
+    mut handler: H,
+    timeout: Duration,
+) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     H: AsyncFnMut(&[u8]) -> Vec<u8>,
 {
-    let request = read_adu(stream).await?;
+    let request = with_timeout(timeout, read_adu(stream)).await?;
     let response_pdu = handler(&request.pdu).await;
     let response = TcpAdu {
         transaction_id: request.transaction_id,
         unit_id: request.unit_id,
         pdu: response_pdu,
     };
-    stream.write_all(&response.encode()).await?;
+    with_timeout(timeout, stream.write_all(&response.encode())).await?;
     Ok(())
 }
 
@@ -108,7 +142,9 @@ mod tests {
             server.write_all(&response_bytes).await.unwrap();
         });
 
-        let received_response = send_request(&mut client, request).await.unwrap();
+        let received_response = send_request(&mut client, request, Duration::from_secs(1))
+            .await
+            .unwrap();
         assert_eq!(received_response, response);
 
         server_task.await.unwrap();
@@ -137,7 +173,7 @@ mod tests {
             server.write_all(&response_bytes).await.unwrap();
         });
 
-        let result = send_request(&mut client, request).await;
+        let result = send_request(&mut client, request, Duration::from_secs(1)).await;
         assert!(result.is_err());
 
         server_task.await.unwrap();
@@ -167,10 +203,26 @@ mod tests {
             server.write_all(&malicious_header).await.unwrap();
         });
 
-        let result = send_request(&mut client, request).await;
+        let result = send_request(&mut client, request, Duration::from_secs(1)).await;
         assert!(result.is_err());
 
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_request_times_out_when_response_never_arrives() {
+        let (mut client, _server) = tokio::io::duplex(1024);
+
+        let request = TcpAdu {
+            transaction_id: 0x0001,
+            unit_id: 0x01,
+            pdu: vec![0x03, 0x00, 0x00, 0x00, 0x0A],
+        };
+
+        // `_server` is kept alive (not dropped) so the connection stays open
+        // but idle: the peer never sends a response, it doesn't just vanish.
+        let result = send_request(&mut client, request, Duration::from_millis(50)).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]
@@ -199,14 +251,33 @@ mod tests {
             received
         });
 
-        serve_request(&mut server, async move |pdu: &[u8]| {
-            assert_eq!(pdu, &[0x03, 0x00, 0x00, 0x00, 0x0A]);
-            response_pdu.clone()
-        })
+        serve_request(
+            &mut server,
+            async move |pdu: &[u8]| {
+                assert_eq!(pdu, &[0x03, 0x00, 0x00, 0x00, 0x0A]);
+                response_pdu.clone()
+            },
+            Duration::from_secs(1),
+        )
         .await
         .unwrap();
 
         let received_bytes = client_task.await.unwrap();
         assert_eq!(TcpAdu::decode(&received_bytes).unwrap(), expected_response);
+    }
+
+    #[tokio::test]
+    async fn serve_request_times_out_when_request_never_arrives() {
+        let (mut server, _client) = tokio::io::duplex(1024);
+
+        // `_client` is kept alive (not dropped) so the connection stays open
+        // but idle: the peer never sends a request, it doesn't just vanish.
+        let result = serve_request(
+            &mut server,
+            async move |_pdu: &[u8]| Vec::new(),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 }
