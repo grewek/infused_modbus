@@ -2,7 +2,7 @@
 // Run with `cargo run --bin fuzz_pdu` for a fresh random seed, or
 // `cargo run --bin fuzz_pdu -- <seed>` to reproduce a specific run.
 
-use protocol::{
+use protocol::pdu::{
     ExceptionResponse, ReadHoldingRegistersRequest, ReadHoldingRegistersResponse,
     WriteMultipleRegistersRequest, WriteMultipleRegistersResponse, WriteSingleRegisterRequest,
     WriteSingleRegisterResponse,
