@@ -85,6 +85,54 @@ impl PendingTransaction {
     }
 }
 
+// Outcome of the most recent write attempt for one register. Deliberately
+// just a status word, not a structured error with timestamp/Modbus
+// exception code — see CLAUDE.md's Milestone H3 notes for why the richer
+// version was deferred until a real confirmed-write consumer exists to show
+// what it would actually need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteStatus {
+    Ok,
+    Failed(String),
+}
+
+// How a write status is rendered as the content of its `Report/` file.
+impl fmt::Display for WriteStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteStatus::Ok => write!(formatter, "OK"),
+            WriteStatus::Failed(reason) => write!(formatter, "FAILED: {reason}"),
+        }
+    }
+}
+
+// Per-register write outcomes, keyed by register name — mirrors
+// RegisterStore's shape exactly, but holds the result of the last write
+// attempt rather than the current value. Whoever confirms or fails a write
+// (client/server, once wired to `protocol`) reports it here; a new attempt
+// simply overwrites the previous outcome, so `Report/<name>` always
+// reflects only the most recent attempt. Plain data structure, no FUSE
+// awareness — mirrors how RegisterStore (F1) and PendingTransaction (H1)
+// preceded their own FUSE wiring.
+#[derive(Debug, Default)]
+pub struct WriteReport {
+    statuses: HashMap<String, WriteStatus>,
+}
+
+impl WriteReport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&WriteStatus> {
+        self.statuses.get(name)
+    }
+
+    pub fn set(&mut self, name: impl Into<String>, status: WriteStatus) {
+        self.statuses.insert(name.into(), status);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +229,45 @@ mod tests {
         assert_eq!(drained.get("Flow_Rate"), Some(&RegisterValue::F32(3.5)));
         assert_eq!(drained.len(), 2);
         assert!(transaction.is_empty());
+    }
+
+    #[test]
+    fn write_report_get_returns_none_for_unknown_register() {
+        let report = WriteReport::new();
+        assert_eq!(report.get("Stop_Process"), None);
+    }
+
+    #[test]
+    fn write_report_set_then_get_returns_the_status() {
+        let mut report = WriteReport::new();
+        report.set("Stop_Process", WriteStatus::Ok);
+        assert_eq!(report.get("Stop_Process"), Some(&WriteStatus::Ok));
+    }
+
+    #[test]
+    fn write_report_set_overwrites_previous_status() {
+        let mut report = WriteReport::new();
+        report.set("Stop_Process", WriteStatus::Ok);
+        report.set(
+            "Stop_Process",
+            WriteStatus::Failed("device timed out".to_string()),
+        );
+        assert_eq!(
+            report.get("Stop_Process"),
+            Some(&WriteStatus::Failed("device timed out".to_string()))
+        );
+    }
+
+    #[test]
+    fn write_status_ok_displays_as_ok() {
+        assert_eq!(WriteStatus::Ok.to_string(), "OK");
+    }
+
+    #[test]
+    fn write_status_failed_displays_reason() {
+        assert_eq!(
+            WriteStatus::Failed("device timed out".to_string()).to_string(),
+            "FAILED: device timed out"
+        );
     }
 }

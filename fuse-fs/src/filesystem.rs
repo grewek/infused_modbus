@@ -1,4 +1,4 @@
-use crate::{PendingTransaction, RegisterStore, RegisterValue};
+use crate::{PendingTransaction, RegisterStore, RegisterValue, WriteReport};
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner, OpenFlags,
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request,
@@ -40,19 +40,29 @@ struct TransactionFsState {
     ino_to_name: HashMap<INodeNo, String>,
     buffers: HashMap<INodeNo, Vec<u8>>,
     next_ino: u64,
+    // The inode handed back by the most recent TRANSACTION_END `create()`
+    // call. It's deliberately untracked everywhere else (see `create`), but
+    // tools like `touch` immediately follow their create() with a
+    // setattr(times) call on the same inode as one logical operation — see
+    // `setattr`'s doc comment for why that one follow-up call still needs
+    // to succeed.
+    last_transaction_end_ino: Option<INodeNo>,
 }
 
 /// A minimal FUSE projection: root -> `holding-registers` -> one read-only
-/// file per register (current value from `store`), and root ->
-/// `transactions` -> user-created files that stage a pending write per the
-/// scheme in CLAUDE.md (filename = register name, content = value to
-/// write). Creating `TRANSACTION_END` drains the staged values and hands
-/// them off over `transaction_sender` — this layer has no Modbus knowledge,
-/// so it cannot itself confirm a write reached the device; `store` (and so
-/// `holding-registers/`) is deliberately **not** touched here. Whoever owns
-/// the receiving end of `transaction_sender` is responsible for performing
-/// the real write and only then updating `store` once the device confirms
-/// it (see CLAUDE.md's "TRANSACTION_END confirmation semantics").
+/// file per register (current value from `store`), root -> `transactions`
+/// -> user-created files that stage a pending write per the scheme in
+/// CLAUDE.md (filename = register name, content = value to write), and
+/// root -> `report` -> one read-only file per register showing the outcome
+/// of its most recent write attempt (Milestone H3; content = `WriteReport`,
+/// overwritten on every new attempt, no history). Creating `TRANSACTION_END`
+/// drains the staged values and hands them off over `transaction_sender` —
+/// this layer has no Modbus knowledge, so it cannot itself confirm a write
+/// reached the device; `store` (and so `holding-registers/`) is
+/// deliberately **not** touched here, and neither is `report` — both are
+/// only ever updated by whoever owns the receiving end of
+/// `transaction_sender`, once the real write is confirmed or fails (see
+/// CLAUDE.md's "TRANSACTION_END confirmation semantics").
 pub struct InfusedFilesystem {
     registers: Vec<RegisterDescription>,
     name_to_ino: HashMap<String, INodeNo>,
@@ -60,6 +70,8 @@ pub struct InfusedFilesystem {
     transactions_ino: INodeNo,
     transactions: Mutex<TransactionFsState>,
     transaction_sender: mpsc::Sender<HashMap<String, RegisterValue>>,
+    report_ino: INodeNo,
+    report: Arc<Mutex<WriteReport>>,
 }
 
 impl InfusedFilesystem {
@@ -67,6 +79,7 @@ impl InfusedFilesystem {
         registers: Vec<RegisterDescription>,
         store: Arc<Mutex<RegisterStore>>,
         transaction_sender: mpsc::Sender<HashMap<String, RegisterValue>>,
+        report: Arc<Mutex<WriteReport>>,
     ) -> Self {
         let name_to_ino = registers
             .iter()
@@ -79,8 +92,10 @@ impl InfusedFilesystem {
             })
             .collect();
         let transactions_ino = INodeNo(FIRST_REGISTER_INO + registers.len() as u64);
+        let report_ino = INodeNo(transactions_ino.0 + 1);
+        let first_report_ino = report_ino.0 + 1;
         let transactions = Mutex::new(TransactionFsState {
-            next_ino: transactions_ino.0 + 1,
+            next_ino: first_report_ino + registers.len() as u64,
             ..Default::default()
         });
         Self {
@@ -90,6 +105,8 @@ impl InfusedFilesystem {
             transactions_ino,
             transactions,
             transaction_sender,
+            report_ino,
+            report,
         }
     }
 
@@ -107,8 +124,24 @@ impl InfusedFilesystem {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn report_lock(&self) -> MutexGuard<'_, WriteReport> {
+        self.report.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // report/'s file inodes sit right after the fixed report/ directory
+    // inode itself — see `new`, where `report_ino` is computed the same way
+    // relative to `transactions_ino`.
+    fn first_report_ino(&self) -> u64 {
+        self.report_ino.0 + 1
+    }
+
     fn register_by_ino(&self, ino: INodeNo) -> Option<&RegisterDescription> {
         let index = ino.0.checked_sub(FIRST_REGISTER_INO)?;
+        self.registers.get(index as usize)
+    }
+
+    fn report_register_by_ino(&self, ino: INodeNo) -> Option<&RegisterDescription> {
+        let index = ino.0.checked_sub(self.first_report_ino())?;
         self.registers.get(index as usize)
     }
 
@@ -129,6 +162,15 @@ impl InfusedFilesystem {
     fn transaction_content(&self, name: &str) -> String {
         match self.transactions_lock().pending.get(name) {
             Some(value) => format!("{value}\n"),
+            None => String::new(),
+        }
+    }
+
+    // Content of a report/ file: the outcome of the most recent write
+    // attempt for that register, or empty if none has been attempted yet.
+    fn report_content(&self, name: &str) -> String {
+        match self.report_lock().get(name) {
+            Some(status) => format!("{status}\n"),
             None => String::new(),
         }
     }
@@ -235,6 +277,13 @@ impl Filesystem for InfusedFilesystem {
                         Generation(0),
                     );
                 }
+                Some("report") => {
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.directory_attr(self.report_ino, req),
+                        Generation(0),
+                    );
+                }
                 _ => reply.error(Errno::ENOENT),
             }
             return;
@@ -279,17 +328,54 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
+        if parent == self.report_ino {
+            let Some(name) = name.to_str() else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            let index = self
+                .registers
+                .iter()
+                .position(|register| register.name == name);
+            match index {
+                Some(index) => {
+                    let ino = INodeNo(self.first_report_ino() + index as u64);
+                    let content = self.report_content(name);
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.file_attr(ino, content.len() as u64, 0o444, req),
+                        Generation(0),
+                    );
+                }
+                None => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
         reply.error(Errno::ENOENT);
     }
 
     fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        if ino == ROOT_INO || ino == HOLDING_REGISTERS_INO || ino == self.transactions_ino {
+        if ino == ROOT_INO
+            || ino == HOLDING_REGISTERS_INO
+            || ino == self.transactions_ino
+            || ino == self.report_ino
+        {
             reply.attr(&ATTR_TTL, &self.directory_attr(ino, req));
             return;
         }
 
         if let Some(register) = self.register_by_ino(ino) {
             let content = self.register_content(register);
+            reply.attr(
+                &ATTR_TTL,
+                &self.file_attr(ino, content.len() as u64, 0o444, req),
+            );
+            return;
+        }
+
+        if let Some(register) = self.report_register_by_ino(ino) {
+            let content = self.report_content(&register.name);
             reply.attr(
                 &ATTR_TTL,
                 &self.file_attr(ino, content.len() as u64, 0o444, req),
@@ -342,6 +428,24 @@ impl Filesystem for InfusedFilesystem {
             reply.attr(&ATTR_TTL, &self.file_attr(ino, reported_size, 0o644, req));
             return;
         }
+
+        // `touch` on a brand-new file does create() then immediately
+        // futimens() on the same fd as one logical operation. The
+        // TRANSACTION_END inode create() just handed out isn't tracked
+        // anywhere else (it's meant to vanish instantly), so without this
+        // it would wrongly fail that follow-up call even though the
+        // create() itself (and the commit it triggered) succeeded. Consumed
+        // on use — a *later*, unrelated setattr on the same stale inode
+        // number correctly falls through to ENOENT below.
+        let mut state = self.transactions_lock();
+        if state.last_transaction_end_ino == Some(ino) {
+            state.last_transaction_end_ino = None;
+            drop(state);
+            reply.attr(&ATTR_TTL, &self.file_attr(ino, 0, 0o644, req));
+            return;
+        }
+        drop(state);
+
         reply.error(Errno::ENOENT);
     }
 
@@ -358,6 +462,8 @@ impl Filesystem for InfusedFilesystem {
     ) {
         let content = if let Some(register) = self.register_by_ino(ino) {
             self.register_content(register)
+        } else if let Some(register) = self.report_register_by_ino(ino) {
+            self.report_content(&register.name)
         } else {
             // The lock must be released before `transaction_content` tries
             // to take it again — std::sync::Mutex isn't reentrant, so
@@ -405,6 +511,7 @@ impl Filesystem for InfusedFilesystem {
                     FileType::Directory,
                     "transactions".to_string(),
                 ),
+                (self.report_ino, FileType::Directory, "report".to_string()),
             ]
         } else if ino == HOLDING_REGISTERS_INO {
             let mut entries = vec![
@@ -424,6 +531,16 @@ impl Filesystem for InfusedFilesystem {
             let state = self.transactions_lock();
             for (name, &ino) in &state.name_to_ino {
                 entries.push((ino, FileType::RegularFile, name.clone()));
+            }
+            entries
+        } else if ino == self.report_ino {
+            let mut entries = vec![
+                (self.report_ino, FileType::Directory, ".".to_string()),
+                (ROOT_INO, FileType::Directory, "..".to_string()),
+            ];
+            for (index, register) in self.registers.iter().enumerate() {
+                let register_ino = INodeNo(self.first_report_ino() + index as u64);
+                entries.push((register_ino, FileType::RegularFile, register.name.clone()));
             }
             entries
         } else {
@@ -470,6 +587,7 @@ impl Filesystem for InfusedFilesystem {
             let mut state = self.transactions_lock();
             let ino = INodeNo(state.next_ino);
             state.next_ino += 1;
+            state.last_transaction_end_ino = Some(ino);
             drop(state);
             reply.created(
                 &ATTR_TTL,
@@ -595,6 +713,7 @@ impl Filesystem for InfusedFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WriteStatus;
     use protocol::device_description::AccessRight;
 
     fn test_filesystem() -> (
@@ -608,8 +727,12 @@ mod tests {
             access: AccessRight::ReadWrite,
         }];
         let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, receiver) = mpsc::channel();
-        (InfusedFilesystem::new(registers, store, sender), receiver)
+        (
+            InfusedFilesystem::new(registers, store, sender, report),
+            receiver,
+        )
     }
 
     #[test]
@@ -664,5 +787,46 @@ mod tests {
         let (filesystem, receiver) = test_filesystem();
         filesystem.commit_transaction();
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn report_content_is_empty_when_nothing_was_attempted() {
+        let (filesystem, _receiver) = test_filesystem();
+        assert_eq!(filesystem.report_content("Stop_Process"), "");
+    }
+
+    #[test]
+    fn report_content_reflects_the_most_recent_status() {
+        let (filesystem, _receiver) = test_filesystem();
+        filesystem
+            .report_lock()
+            .set("Stop_Process", WriteStatus::Ok);
+        assert_eq!(filesystem.report_content("Stop_Process"), "OK\n");
+
+        filesystem
+            .report_lock()
+            .set("Stop_Process", WriteStatus::Failed("timeout".to_string()));
+        assert_eq!(
+            filesystem.report_content("Stop_Process"),
+            "FAILED: timeout\n"
+        );
+    }
+
+    #[test]
+    fn report_register_by_ino_resolves_a_report_file_inode() {
+        let (filesystem, _receiver) = test_filesystem();
+        let report_ino = INodeNo(filesystem.first_report_ino());
+        assert_eq!(
+            filesystem
+                .report_register_by_ino(report_ino)
+                .map(|r| &r.name),
+            Some(&"Stop_Process".to_string())
+        );
+    }
+
+    #[test]
+    fn report_register_by_ino_returns_none_for_unrelated_inode() {
+        let (filesystem, _receiver) = test_filesystem();
+        assert_eq!(filesystem.report_register_by_ino(ROOT_INO), None);
     }
 }

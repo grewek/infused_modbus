@@ -13,16 +13,17 @@
 //   ls <mountpoint>/transactions
 //   rm <mountpoint>/transactions/Stop_Process
 //   touch <mountpoint>/transactions/TRANSACTION_END
+//   cat <mountpoint>/report/Stop_Process
 //
 // There's no real Modbus device here, so "confirming" a transaction is
-// faked by a background thread that applies it to the store immediately
-// instead of waiting on a real write response — see the println! it prints
-// when it does so.
+// faked by a background thread that applies it to the store and reports it
+// as OK, immediately instead of waiting on a real write response — see the
+// println! it prints when it does so.
 //
 // Ctrl+C to stop; the kernel unmounts automatically once the process exits.
 
 use fuse_fs::filesystem::InfusedFilesystem;
-use fuse_fs::{RegisterStore, RegisterValue};
+use fuse_fs::{RegisterStore, RegisterValue, WriteReport, WriteStatus};
 use protocol::device_description::{AccessRight, DataType, DeviceDescription, RegisterDescription};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -76,14 +77,20 @@ fn main() {
 
     std::fs::create_dir_all(&mountpoint).ok();
 
-    let (transaction_sender, transaction_receiver) = mpsc::channel();
+    let report = Arc::new(Mutex::new(WriteReport::new()));
+
+    let (transaction_sender, transaction_receiver) =
+        mpsc::channel::<std::collections::HashMap<String, RegisterValue>>();
     {
         let store = Arc::clone(&store);
+        let report = Arc::clone(&report);
         std::thread::spawn(move || {
             for transaction in transaction_receiver {
                 let mut store = store.lock().unwrap();
+                let mut report = report.lock().unwrap();
                 for (name, value) in transaction {
                     println!("(demo) confirming write: {name} = {value}");
+                    report.set(name.clone(), WriteStatus::Ok);
                     store.set(name, value);
                 }
             }
@@ -99,10 +106,12 @@ fn main() {
     println!("  cat {mountpoint}/transactions/Stop_Process");
     println!("  ls {mountpoint}/transactions");
     println!("  rm {mountpoint}/transactions/Stop_Process");
+    println!("  touch {mountpoint}/transactions/TRANSACTION_END");
+    println!("  cat {mountpoint}/report/Stop_Process");
     println!();
     println!("Ctrl+C to stop (the kernel unmounts automatically on exit).");
 
-    let filesystem = InfusedFilesystem::new(registers, store, transaction_sender);
+    let filesystem = InfusedFilesystem::new(registers, store, transaction_sender, report);
     fuser::mount(filesystem, &mountpoint, &fuser::Config::default())
         .unwrap_or_else(|error| panic!("mount failed: {error}"));
 }
