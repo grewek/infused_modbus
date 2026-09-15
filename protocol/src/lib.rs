@@ -22,6 +22,13 @@ const WRITE_MULTIPLE_REGISTERS_BYTE_COUNT_BYTE: usize = 5;
 const WRITE_MULTIPLE_REGISTERS_VALUES_START: usize = 6;
 const WRITE_MULTIPLE_REGISTERS_REQUEST_HEADER_LEN: usize = 6;
 
+// Modbus marks a response as an exception by setting the top bit of the
+// (otherwise normal) function code byte; the original function code is
+// recovered by clearing that bit again.
+const EXCEPTION_RESPONSE_FUNCTION_CODE_BIT: u8 = 0x80;
+const EXCEPTION_CODE_BYTE: usize = 1;
+const EXCEPTION_RESPONSE_LEN: usize = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadHoldingRegistersRequest {
     pub starting_address: u16,
@@ -58,10 +65,17 @@ pub struct WriteMultipleRegistersResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionResponse {
+    pub function_code: u8,
+    pub exception_code: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
     TooShort,
     UnexpectedFunctionCode { expected: u8, actual: u8 },
     OddByteCount { byte_count: u8 },
+    NotAnExceptionResponse { function_code: u8 },
 }
 
 fn read_u16_be(bytes: &[u8], offset: usize) -> u16 {
@@ -254,6 +268,33 @@ impl WriteMultipleRegistersResponse {
         Ok(Self {
             starting_address,
             quantity,
+        })
+    }
+}
+
+impl ExceptionResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        vec![
+            self.function_code | EXCEPTION_RESPONSE_FUNCTION_CODE_BIT,
+            self.exception_code,
+        ]
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < EXCEPTION_RESPONSE_LEN {
+            return Err(DecodeError::TooShort);
+        }
+        let raw_function_code = bytes[FUNCTION_CODE_BYTE];
+        if raw_function_code & EXCEPTION_RESPONSE_FUNCTION_CODE_BIT == 0 {
+            return Err(DecodeError::NotAnExceptionResponse {
+                function_code: raw_function_code,
+            });
+        }
+        let function_code = raw_function_code & !EXCEPTION_RESPONSE_FUNCTION_CODE_BIT;
+        let exception_code = bytes[EXCEPTION_CODE_BYTE];
+        Ok(Self {
+            function_code,
+            exception_code,
         })
     }
 }
@@ -541,6 +582,46 @@ mod tests {
             Err(DecodeError::UnexpectedFunctionCode {
                 expected: 0x10,
                 actual: 0x03
+            })
+        );
+    }
+
+    #[test]
+    fn exception_response_round_trip() {
+        let response = ExceptionResponse {
+            function_code: FUNCTION_CODE_READ_HOLDING_REGISTERS,
+            exception_code: 0x02,
+        };
+        let encoded = response.encode();
+        let decoded = ExceptionResponse::decode(&encoded).unwrap();
+        assert_eq!(response, decoded);
+    }
+
+    #[test]
+    fn exception_response_encode_produces_expected_bytes() {
+        let response = ExceptionResponse {
+            function_code: FUNCTION_CODE_READ_HOLDING_REGISTERS,
+            exception_code: 0x02,
+        };
+        assert_eq!(response.encode(), vec![0x83, 0x02]);
+    }
+
+    #[test]
+    fn exception_response_decode_rejects_too_short_buffer() {
+        let bytes = [0x83];
+        assert_eq!(
+            ExceptionResponse::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn exception_response_decode_rejects_missing_exception_bit() {
+        let bytes = [0x03, 0x02];
+        assert_eq!(
+            ExceptionResponse::decode(&bytes),
+            Err(DecodeError::NotAnExceptionResponse {
+                function_code: 0x03
             })
         );
     }
