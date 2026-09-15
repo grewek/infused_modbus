@@ -3,30 +3,24 @@ pub const FUNCTION_CODE_WRITE_SINGLE_REGISTER: u8 = 0x06;
 pub const FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS: u8 = 0x10;
 
 const FUNCTION_CODE_BYTE: usize = 0;
-const STARTING_ADDRESS_HI_BYTE: usize = 1;
-const STARTING_ADDRESS_LO_BYTE: usize = 2;
-const QUANTITY_HI_BYTE: usize = 3;
-const QUANTITY_LO_BYTE: usize = 4;
-const REQUEST_LEN: usize = 5;
+
+// Byte 0 is always the function code, and every PDU in this family (Read Holding
+// Registers request, Write Single Register request/response, Write Multiple
+// Registers response) places an address field followed by a quantity-or-value
+// field at these same fixed offsets, so one shared pair of offsets covers all of them.
+const ADDRESS_FIELD_BYTE: usize = 1;
+const QUANTITY_OR_VALUE_FIELD_BYTE: usize = 3;
+
+// Length of any PDU that is just function code + two u16 fields (see above).
+const TWO_FIELD_PDU_LEN: usize = 5;
 
 const BYTE_COUNT_BYTE: usize = 1;
 const REGISTER_VALUES_START: usize = 2;
 const RESPONSE_HEADER_LEN: usize = 2;
 
-const REGISTER_ADDRESS_HI_BYTE: usize = 1;
-const REGISTER_ADDRESS_LO_BYTE: usize = 2;
-const REGISTER_VALUE_HI_BYTE: usize = 3;
-const REGISTER_VALUE_LO_BYTE: usize = 4;
-const WRITE_SINGLE_REGISTER_LEN: usize = 5;
-
-const WRITE_MULTIPLE_REGISTERS_STARTING_ADDRESS_HI_BYTE: usize = 1;
-const WRITE_MULTIPLE_REGISTERS_STARTING_ADDRESS_LO_BYTE: usize = 2;
-const WRITE_MULTIPLE_REGISTERS_QUANTITY_HI_BYTE: usize = 3;
-const WRITE_MULTIPLE_REGISTERS_QUANTITY_LO_BYTE: usize = 4;
 const WRITE_MULTIPLE_REGISTERS_BYTE_COUNT_BYTE: usize = 5;
 const WRITE_MULTIPLE_REGISTERS_VALUES_START: usize = 6;
 const WRITE_MULTIPLE_REGISTERS_REQUEST_HEADER_LEN: usize = 6;
-const WRITE_MULTIPLE_REGISTERS_RESPONSE_LEN: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadHoldingRegistersRequest {
@@ -70,6 +64,10 @@ pub enum DecodeError {
     OddByteCount { byte_count: u8 },
 }
 
+fn read_u16_be(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
+}
+
 impl ReadHoldingRegistersRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut buffer = Vec::with_capacity(5);
@@ -80,7 +78,7 @@ impl ReadHoldingRegistersRequest {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < REQUEST_LEN {
+        if bytes.len() < TWO_FIELD_PDU_LEN {
             return Err(DecodeError::TooShort);
         }
         if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_HOLDING_REGISTERS {
@@ -89,11 +87,8 @@ impl ReadHoldingRegistersRequest {
                 actual: bytes[FUNCTION_CODE_BYTE],
             });
         }
-        let starting_address = u16::from_be_bytes([
-            bytes[STARTING_ADDRESS_HI_BYTE],
-            bytes[STARTING_ADDRESS_LO_BYTE],
-        ]);
-        let quantity = u16::from_be_bytes([bytes[QUANTITY_HI_BYTE], bytes[QUANTITY_LO_BYTE]]);
+        let starting_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
+        let quantity = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
         Ok(Self {
             starting_address,
             quantity,
@@ -139,7 +134,7 @@ impl ReadHoldingRegistersResponse {
 }
 
 fn encode_write_single_register(register_address: u16, register_value: u16) -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(WRITE_SINGLE_REGISTER_LEN);
+    let mut buffer = Vec::with_capacity(TWO_FIELD_PDU_LEN);
     buffer.push(FUNCTION_CODE_WRITE_SINGLE_REGISTER);
     buffer.extend_from_slice(&register_address.to_be_bytes());
     buffer.extend_from_slice(&register_value.to_be_bytes());
@@ -147,7 +142,7 @@ fn encode_write_single_register(register_address: u16, register_value: u16) -> V
 }
 
 fn decode_write_single_register(bytes: &[u8]) -> Result<(u16, u16), DecodeError> {
-    if bytes.len() < WRITE_SINGLE_REGISTER_LEN {
+    if bytes.len() < TWO_FIELD_PDU_LEN {
         return Err(DecodeError::TooShort);
     }
     if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_WRITE_SINGLE_REGISTER {
@@ -156,12 +151,8 @@ fn decode_write_single_register(bytes: &[u8]) -> Result<(u16, u16), DecodeError>
             actual: bytes[FUNCTION_CODE_BYTE],
         });
     }
-    let register_address = u16::from_be_bytes([
-        bytes[REGISTER_ADDRESS_HI_BYTE],
-        bytes[REGISTER_ADDRESS_LO_BYTE],
-    ]);
-    let register_value =
-        u16::from_be_bytes([bytes[REGISTER_VALUE_HI_BYTE], bytes[REGISTER_VALUE_LO_BYTE]]);
+    let register_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
+    let register_value = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
     Ok((register_address, register_value))
 }
 
@@ -219,10 +210,7 @@ impl WriteMultipleRegistersRequest {
                 actual: bytes[FUNCTION_CODE_BYTE],
             });
         }
-        let starting_address = u16::from_be_bytes([
-            bytes[WRITE_MULTIPLE_REGISTERS_STARTING_ADDRESS_HI_BYTE],
-            bytes[WRITE_MULTIPLE_REGISTERS_STARTING_ADDRESS_LO_BYTE],
-        ]);
+        let starting_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
         let byte_count = bytes[WRITE_MULTIPLE_REGISTERS_BYTE_COUNT_BYTE];
         if !byte_count.is_multiple_of(2) {
             return Err(DecodeError::OddByteCount { byte_count });
@@ -244,7 +232,7 @@ impl WriteMultipleRegistersRequest {
 
 impl WriteMultipleRegistersResponse {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(WRITE_MULTIPLE_REGISTERS_RESPONSE_LEN);
+        let mut buffer = Vec::with_capacity(TWO_FIELD_PDU_LEN);
         buffer.push(FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS);
         buffer.extend_from_slice(&self.starting_address.to_be_bytes());
         buffer.extend_from_slice(&self.quantity.to_be_bytes());
@@ -252,7 +240,7 @@ impl WriteMultipleRegistersResponse {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < WRITE_MULTIPLE_REGISTERS_RESPONSE_LEN {
+        if bytes.len() < TWO_FIELD_PDU_LEN {
             return Err(DecodeError::TooShort);
         }
         if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS {
@@ -261,14 +249,8 @@ impl WriteMultipleRegistersResponse {
                 actual: bytes[FUNCTION_CODE_BYTE],
             });
         }
-        let starting_address = u16::from_be_bytes([
-            bytes[WRITE_MULTIPLE_REGISTERS_STARTING_ADDRESS_HI_BYTE],
-            bytes[WRITE_MULTIPLE_REGISTERS_STARTING_ADDRESS_LO_BYTE],
-        ]);
-        let quantity = u16::from_be_bytes([
-            bytes[WRITE_MULTIPLE_REGISTERS_QUANTITY_HI_BYTE],
-            bytes[WRITE_MULTIPLE_REGISTERS_QUANTITY_LO_BYTE],
-        ]);
+        let starting_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
+        let quantity = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
         Ok(Self {
             starting_address,
             quantity,
