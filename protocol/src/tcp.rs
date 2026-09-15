@@ -1,27 +1,8 @@
 use crate::adu::{MBAP_HEADER_LEN, MBAP_LENGTH_BYTE, MBAP_MAX_LENGTH, TcpAdu};
-use crate::read_u16_be;
-use std::future::Future;
+use crate::{read_u16_be, with_timeout};
 use std::io;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-
-// Wraps a single I/O step (one read or one write) so a peer that stalls
-// mid-operation — sends half a header and then nothing, or stops reading so
-// our write never drains — can't tie up a connection indefinitely. `timeout`
-// bounds each I/O step individually, not the whole request/response exchange,
-// matching how a plain socket read/write timeout behaves.
-async fn with_timeout<T>(
-    timeout: Duration,
-    future: impl Future<Output = io::Result<T>>,
-) -> io::Result<T> {
-    match tokio::time::timeout(timeout, future).await {
-        Ok(result) => result,
-        Err(_elapsed) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "Modbus TCP operation timed out",
-        )),
-    }
-}
 
 // Generic over AsyncRead/AsyncWrite rather than named to `tokio::net::TcpStream`
 // directly: a real caller still passes a TcpStream (which implements both
