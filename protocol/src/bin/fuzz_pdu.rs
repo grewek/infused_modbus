@@ -2,6 +2,7 @@
 // Run with `cargo run --bin fuzz_pdu` for a fresh random seed, or
 // `cargo run --bin fuzz_pdu -- <seed>` to reproduce a specific run.
 
+use protocol::adu::{RtuAdu, TcpAdu};
 use protocol::pdu::{
     ExceptionResponse, ReadHoldingRegistersRequest, ReadHoldingRegistersResponse,
     WriteMultipleRegistersRequest, WriteMultipleRegistersResponse, WriteSingleRegisterRequest,
@@ -20,6 +21,10 @@ const MAX_FUZZ_BUFFER_LEN: usize = 300;
 // inside it rather than exercising that known gap.
 const MAX_READ_HOLDING_REGISTERS_COUNT: usize = 125;
 const MAX_WRITE_MULTIPLE_REGISTERS_COUNT: usize = 123;
+
+// Modbus's own PDU size limit (253 bytes), which bounds how large a PDU an ADU
+// can realistically carry.
+const MAX_ADU_PDU_LEN: usize = 253;
 
 struct Xorshift64 {
     state: u64,
@@ -72,7 +77,7 @@ fn seed_from_time() -> u64 {
 type NamedDecoder = (&'static str, fn(&[u8]));
 
 fn fuzz_decoders(rng: &mut Xorshift64) {
-    let decoders: [NamedDecoder; 7] = [
+    let decoders: [NamedDecoder; 9] = [
         ("ReadHoldingRegistersRequest", |bytes| {
             let _ = ReadHoldingRegistersRequest::decode(bytes);
         }),
@@ -93,6 +98,12 @@ fn fuzz_decoders(rng: &mut Xorshift64) {
         }),
         ("ExceptionResponse", |bytes| {
             let _ = ExceptionResponse::decode(bytes);
+        }),
+        ("TcpAdu", |bytes| {
+            let _ = TcpAdu::decode(bytes);
+        }),
+        ("RtuAdu", |bytes| {
+            let _ = RtuAdu::decode(bytes);
         }),
     ];
 
@@ -225,6 +236,31 @@ fn fuzz_round_trips(rng: &mut Xorshift64) {
         assert_eq!(response, decoded, "ExceptionResponse round trip mismatch");
     }
     println!("ExceptionResponse: {ROUND_TRIP_FUZZ_ITERATIONS} round trips ok");
+
+    for _ in 0..ROUND_TRIP_FUZZ_ITERATIONS {
+        let pdu_len = rng.next_usize_below(MAX_ADU_PDU_LEN + 1);
+        let adu = TcpAdu {
+            transaction_id: rng.next_u16(),
+            unit_id: rng.next_u8(),
+            pdu: rng.next_bytes(pdu_len),
+        };
+        let decoded = TcpAdu::decode(&adu.encode())
+            .unwrap_or_else(|error| panic!("TcpAdu failed to decode: {error:?}"));
+        assert_eq!(adu, decoded, "TcpAdu round trip mismatch");
+    }
+    println!("TcpAdu: {ROUND_TRIP_FUZZ_ITERATIONS} round trips ok");
+
+    for _ in 0..ROUND_TRIP_FUZZ_ITERATIONS {
+        let pdu_len = rng.next_usize_below(MAX_ADU_PDU_LEN + 1);
+        let adu = RtuAdu {
+            unit_id: rng.next_u8(),
+            pdu: rng.next_bytes(pdu_len),
+        };
+        let decoded = RtuAdu::decode(&adu.encode())
+            .unwrap_or_else(|error| panic!("RtuAdu failed to decode: {error:?}"));
+        assert_eq!(adu, decoded, "RtuAdu round trip mismatch");
+    }
+    println!("RtuAdu: {ROUND_TRIP_FUZZ_ITERATIONS} round trips ok");
 }
 
 fn main() {
