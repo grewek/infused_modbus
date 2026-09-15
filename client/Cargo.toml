@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 protocol = { path = "../protocol" }
 fuse-fs = { path = "../fuse-fs" }
+tokio = { version = "1", features = ["io-util", "time", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
