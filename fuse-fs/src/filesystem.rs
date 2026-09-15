@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 const ROOT_INO: INodeNo = INodeNo(1);
-const DATA_INO: INodeNo = INodeNo(2);
+const HOLDING_REGISTERS_INO: INodeNo = INodeNo(2);
 const FIRST_REGISTER_INO: u64 = 3;
 
 // How long the kernel may cache an entry/attr reply before asking again.
@@ -20,12 +20,13 @@ const FIRST_REGISTER_INO: u64 = 3;
 // default.
 const ATTR_TTL: Duration = Duration::from_secs(1);
 
-// Bookkeeping for `transactions/`'s dynamic children — unlike `data/`'s
-// register files (fixed set, known at construction time), these are created
-// and removed by the user at runtime, so inode numbers have to be handed out
-// on the fly. `buffers` accumulates each open file's written bytes until
-// `release` parses them into a RegisterValue and stages it (see the
-// `release` doc comment for why parsing happens there, not in `write`).
+// Bookkeeping for `transactions/`'s dynamic children — unlike
+// `holding-registers/`'s register files (fixed set, known at construction
+// time), these are created and removed by the user at runtime, so inode
+// numbers have to be handed out on the fly. `buffers` accumulates each open
+// file's written bytes until `release` parses them into a RegisterValue and
+// stages it (see the `release` doc comment for why parsing happens there,
+// not in `write`).
 #[derive(Debug, Default)]
 struct TransactionFsState {
     pending: PendingTransaction,
@@ -35,9 +36,9 @@ struct TransactionFsState {
     next_ino: u64,
 }
 
-/// A minimal FUSE projection: root -> `data` -> one read-only file per
-/// register (current value from `store`), and root -> `transactions` ->
-/// user-created files that stage a pending write per the scheme in
+/// A minimal FUSE projection: root -> `holding-registers` -> one read-only
+/// file per register (current value from `store`), and root ->
+/// `transactions` -> user-created files that stage a pending write per the scheme in
 /// CLAUDE.md (filename = register name, content = value to write).
 /// Draining a transaction on `TRANSACTION_END` (Milestone H2) isn't wired up
 /// yet, so staged writes currently just sit in `PendingTransaction` and are
@@ -185,10 +186,10 @@ impl Filesystem for InfusedFilesystem {
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         if parent == ROOT_INO {
             match name.to_str() {
-                Some("data") => {
+                Some("holding-registers") => {
                     reply.entry(
                         &ATTR_TTL,
-                        &self.directory_attr(DATA_INO, req),
+                        &self.directory_attr(HOLDING_REGISTERS_INO, req),
                         Generation(0),
                     );
                 }
@@ -204,7 +205,7 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
-        if parent == DATA_INO {
+        if parent == HOLDING_REGISTERS_INO {
             let register = name
                 .to_str()
                 .and_then(|name| self.name_to_ino.get(name))
@@ -247,7 +248,7 @@ impl Filesystem for InfusedFilesystem {
     }
 
     fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        if ino == ROOT_INO || ino == DATA_INO || ino == self.transactions_ino {
+        if ino == ROOT_INO || ino == HOLDING_REGISTERS_INO || ino == self.transactions_ino {
             reply.attr(&ATTR_TTL, &self.directory_attr(ino, req));
             return;
         }
@@ -359,16 +360,20 @@ impl Filesystem for InfusedFilesystem {
             vec![
                 (ROOT_INO, FileType::Directory, ".".to_string()),
                 (ROOT_INO, FileType::Directory, "..".to_string()),
-                (DATA_INO, FileType::Directory, "data".to_string()),
+                (
+                    HOLDING_REGISTERS_INO,
+                    FileType::Directory,
+                    "holding-registers".to_string(),
+                ),
                 (
                     self.transactions_ino,
                     FileType::Directory,
                     "transactions".to_string(),
                 ),
             ]
-        } else if ino == DATA_INO {
+        } else if ino == HOLDING_REGISTERS_INO {
             let mut entries = vec![
-                (DATA_INO, FileType::Directory, ".".to_string()),
+                (HOLDING_REGISTERS_INO, FileType::Directory, ".".to_string()),
                 (ROOT_INO, FileType::Directory, "..".to_string()),
             ];
             for register in &self.registers {

@@ -6,8 +6,8 @@
 //   cargo run -p fuse-fs --example mount_demo -- <mountpoint> [device-description.toml]
 //
 // Then, in another terminal:
-//   ls <mountpoint>/data
-//   cat <mountpoint>/data/Tank_Temperature
+//   ls <mountpoint>/holding-registers
+//   cat <mountpoint>/holding-registers/Tank_Temperature
 //   echo 0xbad > <mountpoint>/transactions/Stop_Process
 //   cat <mountpoint>/transactions/Stop_Process
 //   ls <mountpoint>/transactions
@@ -73,8 +73,8 @@ fn main() {
     println!("Mounting infused_modbus demo filesystem at {mountpoint}");
     println!();
     println!("Try, from another terminal:");
-    println!("  ls {mountpoint}/data");
-    println!("  cat {mountpoint}/data/Tank_Temperature");
+    println!("  ls {mountpoint}/holding-registers");
+    println!("  cat {mountpoint}/holding-registers/Tank_Temperature");
     println!("  echo 0xbad > {mountpoint}/transactions/Stop_Process");
     println!("  cat {mountpoint}/transactions/Stop_Process");
     println!("  ls {mountpoint}/transactions");

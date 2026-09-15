@@ -29,7 +29,7 @@ Connection details (IP/port for TCP, serial port/slave ID for RTU) are **not** p
 
 The mounted filesystem (per client or server instance) exposes at least:
 
-- a `data`/`registers` directory — current live values as readable files, named/structured per the TOML description
+- a `holding-registers` directory — current live values as readable files, named/structured per the TOML description. Named after the specific Modbus data type rather than a generic `data`, since other Modbus data types (coils, discrete inputs, input registers) are meant to get their own sibling directories later.
 - a `transactions` directory — the write mechanism (resolved 2026-09-15, after considering a single-file batch-write alternative — rejected because it's less filesystem-native: no `ls` to inspect what's staged, no `rm` to unstage a single value, and a comma-separated custom syntax to parse/report errors against):
   1. The user creates a file per value they want to change, named after the register's human-readable name from the TOML description, and writes the desired value as that file's **content** (e.g. `echo True > transactions/Stop_Process`) — not encoded in the filename. Staging happens on write, not on bare creation.
   2. Once all desired changes are staged, the user creates a sentinel file named `TRANSACTION_END`.
@@ -42,7 +42,7 @@ This transactional, filesystem-native interface is the core "twist" of the proje
 The project will be a **Cargo workspace** with (at least) these crates:
 
 - **`protocol`** — the Modbus protocol implementation itself (TCP + RTU). This is a **from-scratch implementation**, not a wrapper around `tokio-modbus` — full control over protocol details was a deliberate choice.
-- **`fuse-fs`** — the FUSE filesystem layer shared by client and server: the `data`/`registers` and `transactions` directory logic, TOML device-description parsing, and the mapping between filesystem operations and Modbus reads/writes.
+- **`fuse-fs`** — the FUSE filesystem layer shared by client and server: the `holding-registers` and `transactions` directory logic, TOML device-description parsing, and the mapping between filesystem operations and Modbus reads/writes.
 - **`client`** — binary crate; thin entry point wiring `protocol` (as Modbus master) + `fuse-fs` together, configured via CLI args/config file for target device connection info.
 - **`server`** — binary crate; thin entry point wiring `protocol` (as Modbus slave) + `fuse-fs` together.
 
