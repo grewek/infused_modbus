@@ -58,6 +58,27 @@ where
     Ok(response)
 }
 
+/// Reads one request off `stream`, passes its PDU bytes to `handler`, and
+/// writes the handler's response PDU back with the same transaction ID and
+/// unit ID. `handler` is PDU-agnostic here too — it's whoever calls this that
+/// knows how to turn request bytes into response bytes (e.g. an exception
+/// response's own bytes, if it wants to signal a Modbus-level error).
+pub async fn serve_request<S, H>(stream: &mut S, mut handler: H) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    H: AsyncFnMut(&[u8]) -> Vec<u8>,
+{
+    let request = read_adu(stream).await?;
+    let response_pdu = handler(&request.pdu).await;
+    let response = TcpAdu {
+        transaction_id: request.transaction_id,
+        unit_id: request.unit_id,
+        pdu: response_pdu,
+    };
+    stream.write_all(&response.encode()).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +171,42 @@ mod tests {
         assert!(result.is_err());
 
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_request_dispatches_to_handler_and_writes_response() {
+        let (mut server, mut client) = tokio::io::duplex(1024);
+
+        let request = TcpAdu {
+            transaction_id: 0x0007,
+            unit_id: 0x01,
+            pdu: vec![0x03, 0x00, 0x00, 0x00, 0x0A],
+        };
+        let request_bytes = request.encode();
+
+        let response_pdu = vec![0x03, 0x04, 0x00, 0x01, 0x00, 0x02];
+        let expected_response = TcpAdu {
+            transaction_id: 0x0007,
+            unit_id: 0x01,
+            pdu: response_pdu.clone(),
+        };
+        let expected_response_bytes = expected_response.encode();
+
+        let client_task = tokio::spawn(async move {
+            client.write_all(&request_bytes).await.unwrap();
+            let mut received = vec![0u8; expected_response_bytes.len()];
+            client.read_exact(&mut received).await.unwrap();
+            received
+        });
+
+        serve_request(&mut server, async move |pdu: &[u8]| {
+            assert_eq!(pdu, &[0x03, 0x00, 0x00, 0x00, 0x0A]);
+            response_pdu.clone()
+        })
+        .await
+        .unwrap();
+
+        let received_bytes = client_task.await.unwrap();
+        assert_eq!(TcpAdu::decode(&received_bytes).unwrap(), expected_response);
     }
 }
