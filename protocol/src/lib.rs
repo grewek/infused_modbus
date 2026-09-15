@@ -14,6 +14,7 @@ pub enum DecodeError {
     UnexpectedFunctionCode { expected: u8, actual: u8 },
     OddByteCount { byte_count: u8 },
     NotAnExceptionResponse { function_code: u8 },
+    UnexpectedMeiType { expected: u8, actual: u8 },
     UnexpectedProtocolId { actual: u16 },
     InvalidAduLength { length: u16 },
     CrcMismatch { expected: u16, actual: u16 },

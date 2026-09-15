@@ -16,6 +16,11 @@
 // served; F32 registers and Write Multiple Registers requests get a
 // Modbus exception rather than a guessed wire format, matching the same
 // boundary drawn on the client side.
+//
+// Also serves FC 43 / MEI 0x0E (Read Device Identification, Extended
+// access only) so a client can fetch this server's device-description.toml
+// over the wire instead of needing its own local copy — see
+// device_identification.rs for the object layout.
 
 use fuse_fs::filesystem::InfusedFilesystem;
 use fuse_fs::{RegisterStore, WriteReport};
@@ -68,6 +73,7 @@ fn main() {
 
     let accept_registers = Arc::new(registers.clone());
     let accept_store = Arc::clone(&store);
+    let accept_toml_source = Arc::new(toml_source.clone());
     runtime.spawn(async move {
         loop {
             let (stream, _peer_address) = match listener.accept().await {
@@ -78,8 +84,9 @@ fn main() {
             };
             let registers = Arc::clone(&accept_registers);
             let store = Arc::clone(&accept_store);
+            let toml_source = Arc::clone(&accept_toml_source);
             tokio::spawn(async move {
-                serve_connection(stream, registers, store, REQUEST_TIMEOUT).await;
+                serve_connection(stream, registers, store, toml_source, REQUEST_TIMEOUT).await;
             });
         }
     });

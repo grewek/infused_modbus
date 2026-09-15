@@ -25,6 +25,12 @@ Each PLC/device has an associated TOML description supplied by the user (not aut
 
 Connection details (IP/port for TCP, serial port/slave ID for RTU) are **not** part of this TOML file — they are supplied separately via a config file or CLI arguments when starting the client/server binary.
 
+**Server "introduces itself" via FC 43 (resolved 2026-09-15):** rather than requiring the client to keep its own copy of the server's TOML in sync by hand, the client fetches it over the wire at startup using Modbus function code 43 (Encapsulated Interface Transport), MEI type 0x0E (Read Device Identification), Extended access. This FC was chosen specifically because its object model (arbitrary-length byte strings, keyed by ID) and its built-in More-Follows/Next-Object-Id continuation mechanism already solve "transfer a string too long for one response" for free — no custom chunking protocol needed on top of what the FC already does. Two private objects are used (the 0x80-0xFF range is reserved by the spec for vendor-specific use):
+- `0x80` — presence flag, one byte (`0x01` = server has a description, `0x00`/absent = it doesn't).
+- `0x81`, `0x82`, ... — the raw TOML source, split into chunks (each object's own 255-byte length limit, further capped in practice so a chunk plus response overhead still fits in one 253-byte PDU — see `server/src/device_identification.rs`).
+
+The client always still requires a local `device-description.toml` argument as a fallback: if the server has no description, doesn't support FC 43 at all (a Modbus exception — e.g. a simpler/older device), or the fetch fails for any other reason, the client falls back to it rather than treating this as fatal. Fetching can take several round trips (one per response that didn't fit everything), so progress is printed as it happens — otherwise a user watching the client start up has no way to tell "still fetching" apart from "hung". Scope of the current implementation: only Extended access and these two object kinds are supported; the rest of what FC 43 can do (Basic/Regular/Individual access, the standard VendorName/ProductCode/etc. objects) plus exposing these text objects through the FUSE filesystem itself is intentionally deferred to a later pass.
+
 ### FUSE filesystem layout
 
 The mounted filesystem (per client or server instance) exposes at least:

@@ -18,6 +18,7 @@ pub async fn serve_connection<S>(
     mut stream: S,
     registers: Arc<Vec<RegisterDescription>>,
     store: Arc<Mutex<RegisterStore>>,
+    toml_source: Arc<String>,
     timeout: Duration,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -31,9 +32,17 @@ pub async fn serve_connection<S>(
         // owned clones sidestep it entirely, and Arc::clone is cheap.
         let handler_registers = Arc::clone(&registers);
         let handler_store = Arc::clone(&store);
+        let handler_toml_source = Arc::clone(&toml_source);
         let result = protocol::tcp::serve_request(
             &mut stream,
-            async move |pdu: &[u8]| handle_request(pdu, &handler_registers, &handler_store),
+            async move |pdu: &[u8]| {
+                handle_request(
+                    pdu,
+                    &handler_registers,
+                    &handler_store,
+                    &handler_toml_source,
+                )
+            },
             timeout,
         )
         .await;
@@ -85,6 +94,7 @@ mod tests {
             server_stream,
             registers(),
             Arc::clone(&store),
+            Arc::new(String::new()),
             Duration::from_secs(1),
         ));
 
@@ -122,6 +132,7 @@ mod tests {
             server_stream,
             registers(),
             Arc::clone(&store),
+            Arc::new(String::new()),
             Duration::from_secs(1),
         ));
 
@@ -165,6 +176,7 @@ mod tests {
             server_stream,
             registers(),
             Arc::clone(&store),
+            Arc::new(String::new()),
             Duration::from_secs(1),
         ));
 

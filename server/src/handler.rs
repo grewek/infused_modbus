@@ -15,13 +15,15 @@
 // Registers falls through to the same "illegal function" handling as any
 // other unimplemented function code.
 
+use crate::device_identification::{build_objects, handle_read_device_identification};
 use fuse_fs::{RegisterStore, RegisterValue};
 use protocol::device_description::{AccessRight, DataType, RegisterDescription};
 use protocol::pdu::{
     EXCEPTION_ILLEGAL_DATA_ADDRESS, EXCEPTION_ILLEGAL_DATA_VALUE, EXCEPTION_ILLEGAL_FUNCTION,
-    ExceptionResponse, FUNCTION_CODE_READ_HOLDING_REGISTERS, FUNCTION_CODE_WRITE_SINGLE_REGISTER,
-    ReadHoldingRegistersRequest, ReadHoldingRegistersResponse, WriteSingleRegisterRequest,
-    WriteSingleRegisterResponse,
+    ExceptionResponse, FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
+    FUNCTION_CODE_READ_HOLDING_REGISTERS, FUNCTION_CODE_WRITE_SINGLE_REGISTER,
+    ReadDeviceIdentificationRequest, ReadHoldingRegistersRequest, ReadHoldingRegistersResponse,
+    WriteSingleRegisterRequest, WriteSingleRegisterResponse,
 };
 use std::sync::{Mutex, PoisonError};
 
@@ -29,6 +31,7 @@ pub fn handle_request(
     pdu: &[u8],
     registers: &[RegisterDescription],
     store: &Mutex<RegisterStore>,
+    toml_source: &str,
 ) -> Vec<u8> {
     let Some(&function_code) = pdu.first() else {
         return ExceptionResponse {
@@ -41,12 +44,35 @@ pub fn handle_request(
     match function_code {
         FUNCTION_CODE_READ_HOLDING_REGISTERS => handle_read(pdu, registers, store),
         FUNCTION_CODE_WRITE_SINGLE_REGISTER => handle_write_single(pdu, registers, store),
+        FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT => {
+            handle_encapsulated_interface_transport(pdu, toml_source)
+        }
         _ => ExceptionResponse {
             function_code,
             exception_code: EXCEPTION_ILLEGAL_FUNCTION,
         }
         .encode(),
     }
+}
+
+// See device_identification.rs for the object layout and continuation
+// handling; this just decodes the request PDU and hands off to it. MEI
+// types other than Read Device Identification (0x0E) — only CANopen,
+// 0x0D, exists in the spec — aren't implemented, hence the plain
+// ILLEGAL_FUNCTION fallback in the decode-failure branch (decode() itself
+// distinguishes "wrong MEI type" from other malformed-request cases, but
+// there's no other MEI type to dispatch to yet, so it collapses to the
+// same response here).
+fn handle_encapsulated_interface_transport(pdu: &[u8], toml_source: &str) -> Vec<u8> {
+    let Ok(request) = ReadDeviceIdentificationRequest::decode(pdu) else {
+        return ExceptionResponse {
+            function_code: FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
+            exception_code: EXCEPTION_ILLEGAL_FUNCTION,
+        }
+        .encode();
+    };
+    let objects = build_objects(toml_source);
+    handle_read_device_identification(&request, &objects)
 }
 
 fn handle_read(
@@ -174,7 +200,7 @@ mod tests {
             quantity: 1,
         }
         .encode();
-        let response = handle_request(&request, &registers(), &store);
+        let response = handle_request(&request, &registers(), &store, "");
 
         assert_eq!(
             ReadHoldingRegistersResponse::decode(&response).unwrap(),
@@ -192,7 +218,7 @@ mod tests {
             quantity: 1,
         }
         .encode();
-        let response = handle_request(&request, &registers(), &store);
+        let response = handle_request(&request, &registers(), &store, "");
         assert_eq!(
             ReadHoldingRegistersResponse::decode(&response).unwrap(),
             ReadHoldingRegistersResponse {
@@ -209,7 +235,7 @@ mod tests {
             quantity: 1,
         }
         .encode();
-        let response = handle_request(&request, &registers(), &store);
+        let response = handle_request(&request, &registers(), &store, "");
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
             ExceptionResponse {
@@ -227,7 +253,7 @@ mod tests {
             quantity: 1,
         }
         .encode();
-        let response = handle_request(&request, &registers(), &store);
+        let response = handle_request(&request, &registers(), &store, "");
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
             ExceptionResponse {
@@ -246,7 +272,7 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(&request, &registers(), &store);
+        let response = handle_request(&request, &registers(), &store, "");
 
         assert_eq!(
             WriteSingleRegisterResponse::decode(&response).unwrap(),
@@ -270,7 +296,7 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(&request, &registers(), &store);
+        let response = handle_request(&request, &registers(), &store, "");
 
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
@@ -287,7 +313,7 @@ mod tests {
         let store = Mutex::new(RegisterStore::new());
         // Write Multiple Registers (0x10) — decodable, but not handled yet.
         let request = vec![0x10, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x01];
-        let response = handle_request(&request, &registers(), &store);
+        let response = handle_request(&request, &registers(), &store, "");
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
             ExceptionResponse {
@@ -300,10 +326,31 @@ mod tests {
     #[test]
     fn empty_pdu_returns_illegal_function_without_panicking() {
         let store = Mutex::new(RegisterStore::new());
-        let response = handle_request(&[], &registers(), &store);
+        let response = handle_request(&[], &registers(), &store, "");
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap().exception_code,
             EXCEPTION_ILLEGAL_FUNCTION
         );
+    }
+
+    #[test]
+    fn dispatches_encapsulated_interface_transport_requests() {
+        use protocol::pdu::{
+            READ_DEVICE_ID_EXTENDED, ReadDeviceIdentificationRequest,
+            ReadDeviceIdentificationResponse,
+        };
+
+        let store = Mutex::new(RegisterStore::new());
+        let request = ReadDeviceIdentificationRequest {
+            read_device_id_code: READ_DEVICE_ID_EXTENDED,
+            object_id: 0x80,
+        }
+        .encode();
+
+        let response = handle_request(&request, &registers(), &store, "name = \"X\"");
+
+        let decoded = ReadDeviceIdentificationResponse::decode(&response).unwrap();
+        assert_eq!(decoded.objects[0].id, 0x80);
+        assert_eq!(decoded.objects[0].value, vec![0x01]);
     }
 }

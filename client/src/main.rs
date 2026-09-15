@@ -1,10 +1,17 @@
-// Modbus master: mounts a FUSE projection of `device-description.toml` at
+// Modbus master: mounts a FUSE projection of a device description at
 // `mountpoint`, backed by a real device reachable over TCP or RTU (see
 // `<connection>` below). Staging a transaction and creating
 // TRANSACTION_END sends the real write(s) to that device;
 // `holding-registers/`/`report/` only update once the device actually
 // confirms them (see CLAUDE.md's "TRANSACTION_END confirmation
 // semantics").
+//
+// The device description itself is preferably fetched from the server
+// over the wire (FC 43 / MEI 0x0E — see client/src/device_identification.rs)
+// so it doesn't need to be kept in sync with a local file by hand;
+// `<device-description.toml>` is still a required argument as the fallback
+// used if the server has none, doesn't support the request, or the fetch
+// otherwise fails.
 //
 // Usage:
 //   cargo run -p client -- <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms]
@@ -23,6 +30,7 @@
 // tokio-serial's defaults (8 data bits, no parity, 1 stop bit).
 
 use client::connection::Connection;
+use client::device_identification::fetch_device_description;
 use client::polling::run_polling_loop;
 use client::transaction_consumer::run_transaction_consumer;
 use fuse_fs::filesystem::InfusedFilesystem;
@@ -36,6 +44,7 @@ const DEFAULT_UNIT_ID: u8 = 1;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_TIMEOUT: Duration = Duration::from_secs(5);
+const DEVICE_DESCRIPTION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn usage() -> ! {
     eprintln!(
@@ -90,14 +99,31 @@ fn main() {
         None => Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
     };
 
-    let toml_source = std::fs::read_to_string(&device_description_path)
+    let local_toml_source = std::fs::read_to_string(&device_description_path)
         .unwrap_or_else(|error| panic!("failed to read {device_description_path}: {error}"));
-    let registers = DeviceDescription::parse(&toml_source)
-        .unwrap_or_else(|error| panic!("failed to parse {device_description_path}: {error}"))
-        .registers;
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");
-    let connection = open_connection(&runtime, &connection_string);
+    let mut connection = open_connection(&runtime, &connection_string);
+
+    // Ask the server to "introduce itself" (FC 43) before doing anything
+    // else with the connection — see client/src/device_identification.rs.
+    // Any failure (server has none, doesn't support it, transport error)
+    // falls back to `local_toml_source`, which is why that's always read
+    // above regardless of whether it ends up used.
+    let toml_source = runtime
+        .block_on(fetch_device_description(
+            &mut connection,
+            unit_id,
+            DEVICE_DESCRIPTION_FETCH_TIMEOUT,
+        ))
+        .unwrap_or_else(|| {
+            println!("Using the local device description ({device_description_path}).");
+            local_toml_source
+        });
+    let registers = DeviceDescription::parse(&toml_source)
+        .unwrap_or_else(|error| panic!("failed to parse device description: {error}"))
+        .registers;
+
     // Shared, not owned outright: the polling loop and the transaction
     // consumer both need to talk to the device over this same connection,
     // and a generic Modbus device/gateway can't be assumed to accept more
