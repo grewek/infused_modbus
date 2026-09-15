@@ -1,9 +1,10 @@
-use crate::RegisterStore;
+use crate::{PendingTransaction, RegisterStore, RegisterValue};
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner, OpenFlags,
-    ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request,
+    TimeOrNow,
 };
-use protocol::device_description::RegisterDescription;
+use protocol::device_description::{DataType, RegisterDescription};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
@@ -19,13 +20,34 @@ const FIRST_REGISTER_INO: u64 = 3;
 // default.
 const ATTR_TTL: Duration = Duration::from_secs(1);
 
-/// A minimal, read-only FUSE projection: root -> `data` -> one file per
-/// register, whose content is that register's current value in `store`.
-/// No writes yet — that's the `transactions` mechanism, a later milestone.
+// Bookkeeping for `transactions/`'s dynamic children — unlike `data/`'s
+// register files (fixed set, known at construction time), these are created
+// and removed by the user at runtime, so inode numbers have to be handed out
+// on the fly. `buffers` accumulates each open file's written bytes until
+// `release` parses them into a RegisterValue and stages it (see the
+// `release` doc comment for why parsing happens there, not in `write`).
+#[derive(Debug, Default)]
+struct TransactionFsState {
+    pending: PendingTransaction,
+    name_to_ino: HashMap<String, INodeNo>,
+    ino_to_name: HashMap<INodeNo, String>,
+    buffers: HashMap<INodeNo, Vec<u8>>,
+    next_ino: u64,
+}
+
+/// A minimal FUSE projection: root -> `data` -> one read-only file per
+/// register (current value from `store`), and root -> `transactions` ->
+/// user-created files that stage a pending write per the scheme in
+/// CLAUDE.md (filename = register name, content = value to write).
+/// Draining a transaction on `TRANSACTION_END` (Milestone H2) isn't wired up
+/// yet, so staged writes currently just sit in `PendingTransaction` and are
+/// only visible by reading them back.
 pub struct InfusedFilesystem {
     registers: Vec<RegisterDescription>,
     name_to_ino: HashMap<String, INodeNo>,
     store: Arc<Mutex<RegisterStore>>,
+    transactions_ino: INodeNo,
+    transactions: Mutex<TransactionFsState>,
 }
 
 impl InfusedFilesystem {
@@ -40,10 +62,17 @@ impl InfusedFilesystem {
                 )
             })
             .collect();
+        let transactions_ino = INodeNo(FIRST_REGISTER_INO + registers.len() as u64);
+        let transactions = Mutex::new(TransactionFsState {
+            next_ino: transactions_ino.0 + 1,
+            ..Default::default()
+        });
         Self {
             registers,
             name_to_ino,
             store,
+            transactions_ino,
+            transactions,
         }
     }
 
@@ -52,10 +81,38 @@ impl InfusedFilesystem {
         self.registers.get(index as usize)
     }
 
+    fn register_by_name(&self, name: &str) -> Option<&RegisterDescription> {
+        self.registers.iter().find(|register| register.name == name)
+    }
+
     fn register_content(&self, register: &RegisterDescription) -> String {
         match self.store.lock().unwrap().get(&register.name) {
             Some(value) => format!("{value}\n"),
             None => String::new(),
+        }
+    }
+
+    // Content of an already-staged transaction file: whatever value is
+    // currently pending for that register, or empty if none (e.g. it was
+    // just created and nothing has been written to it yet).
+    fn transaction_content(&self, name: &str) -> String {
+        match self.transactions.lock().unwrap().pending.get(name) {
+            Some(value) => format!("{value}\n"),
+            None => String::new(),
+        }
+    }
+
+    fn parse_register_value(data_type: DataType, text: &str) -> Option<RegisterValue> {
+        let text = text.trim();
+        match data_type {
+            DataType::U16 => {
+                let value = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+                    Some(hex) => u16::from_str_radix(hex, 16).ok()?,
+                    None => text.parse().ok()?,
+                };
+                Some(RegisterValue::U16(value))
+            }
+            DataType::F32 => Some(RegisterValue::F32(text.parse().ok()?)),
         }
     }
 
@@ -80,7 +137,7 @@ impl InfusedFilesystem {
         }
     }
 
-    fn file_attr(&self, ino: INodeNo, size: u64, req: &Request) -> FileAttr {
+    fn file_attr(&self, ino: INodeNo, size: u64, perm: u16, req: &Request) -> FileAttr {
         let now = SystemTime::now();
         FileAttr {
             ino,
@@ -91,11 +148,7 @@ impl InfusedFilesystem {
             ctime: now,
             crtime: now,
             kind: FileType::RegularFile,
-            // Read-only for every register regardless of its own declared
-            // AccessRight: nothing can write through this filesystem yet at
-            // all (that's the `transactions` mechanism, a later milestone),
-            // so there's no meaningful distinction to make here yet.
-            perm: 0o444,
+            perm,
             nlink: 1,
             uid: req.uid(),
             gid: req.gid(),
@@ -109,14 +162,22 @@ impl InfusedFilesystem {
 impl Filesystem for InfusedFilesystem {
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         if parent == ROOT_INO {
-            if name == "data" {
-                reply.entry(
-                    &ATTR_TTL,
-                    &self.directory_attr(DATA_INO, req),
-                    Generation(0),
-                );
-            } else {
-                reply.error(Errno::ENOENT);
+            match name.to_str() {
+                Some("data") => {
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.directory_attr(DATA_INO, req),
+                        Generation(0),
+                    );
+                }
+                Some("transactions") => {
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.directory_attr(self.transactions_ino, req),
+                        Generation(0),
+                    );
+                }
+                _ => reply.error(Errno::ENOENT),
             }
             return;
         }
@@ -131,7 +192,33 @@ impl Filesystem for InfusedFilesystem {
                     let content = self.register_content(register);
                     reply.entry(
                         &ATTR_TTL,
-                        &self.file_attr(ino, content.len() as u64, req),
+                        &self.file_attr(ino, content.len() as u64, 0o444, req),
+                        Generation(0),
+                    );
+                }
+                None => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
+        if parent == self.transactions_ino {
+            let Some(name) = name.to_str() else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            let ino = self
+                .transactions
+                .lock()
+                .unwrap()
+                .name_to_ino
+                .get(name)
+                .copied();
+            match ino {
+                Some(ino) => {
+                    let content = self.transaction_content(name);
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.file_attr(ino, content.len() as u64, 0o644, req),
                         Generation(0),
                     );
                 }
@@ -144,18 +231,86 @@ impl Filesystem for InfusedFilesystem {
     }
 
     fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        if ino == ROOT_INO || ino == DATA_INO {
+        if ino == ROOT_INO || ino == DATA_INO || ino == self.transactions_ino {
             reply.attr(&ATTR_TTL, &self.directory_attr(ino, req));
             return;
         }
 
-        match self.register_by_ino(ino) {
-            Some(register) => {
-                let content = self.register_content(register);
-                reply.attr(&ATTR_TTL, &self.file_attr(ino, content.len() as u64, req));
+        if let Some(register) = self.register_by_ino(ino) {
+            let content = self.register_content(register);
+            reply.attr(
+                &ATTR_TTL,
+                &self.file_attr(ino, content.len() as u64, 0o444, req),
+            );
+            return;
+        }
+
+        let name = self
+            .transactions
+            .lock()
+            .unwrap()
+            .ino_to_name
+            .get(&ino)
+            .cloned();
+        match name {
+            Some(name) => {
+                let content = self.transaction_content(&name);
+                reply.attr(
+                    &ATTR_TTL,
+                    &self.file_attr(ino, content.len() as u64, 0o644, req),
+                );
             }
             None => reply.error(Errno::ENOENT),
         }
+    }
+
+    fn setattr(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        // Only meaningful case here: `> transactions/Foo` truncating an
+        // already-staged file before writing its new value (O_CREAT on an
+        // existing name goes through open+setattr, not create). There's no
+        // real backing buffer to shrink — the next `write` replaces the
+        // staged value outright — so this just has to succeed and report
+        // an attr back.
+        if ino == self.transactions_ino
+            || self
+                .transactions
+                .lock()
+                .unwrap()
+                .ino_to_name
+                .contains_key(&ino)
+        {
+            let name = self
+                .transactions
+                .lock()
+                .unwrap()
+                .ino_to_name
+                .get(&ino)
+                .cloned();
+            let content_len = name
+                .map(|name| self.transaction_content(&name).len() as u64)
+                .unwrap_or(0);
+            let reported_size = size.unwrap_or(content_len);
+            reply.attr(&ATTR_TTL, &self.file_attr(ino, reported_size, 0o644, req));
+            return;
+        }
+        reply.error(Errno::ENOENT);
     }
 
     fn read(
@@ -169,11 +324,30 @@ impl Filesystem for InfusedFilesystem {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let Some(register) = self.register_by_ino(ino) else {
-            reply.error(Errno::ENOENT);
-            return;
+        let content = if let Some(register) = self.register_by_ino(ino) {
+            self.register_content(register)
+        } else {
+            // The lock must be released before `transaction_content` tries
+            // to take it again — std::sync::Mutex isn't reentrant, so
+            // holding this guard through that call (as a direct `if let`
+            // condition would, since its temporary lives for the whole
+            // `if let` body) deadlocks.
+            let name = self
+                .transactions
+                .lock()
+                .unwrap()
+                .ino_to_name
+                .get(&ino)
+                .cloned();
+            match name {
+                Some(name) => self.transaction_content(&name),
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
         };
-        let content = self.register_content(register);
+
         let bytes = content.as_bytes();
         let offset = offset as usize;
         if offset >= bytes.len() {
@@ -197,6 +371,11 @@ impl Filesystem for InfusedFilesystem {
                 (ROOT_INO, FileType::Directory, ".".to_string()),
                 (ROOT_INO, FileType::Directory, "..".to_string()),
                 (DATA_INO, FileType::Directory, "data".to_string()),
+                (
+                    self.transactions_ino,
+                    FileType::Directory,
+                    "transactions".to_string(),
+                ),
             ]
         } else if ino == DATA_INO {
             let mut entries = vec![
@@ -206,6 +385,16 @@ impl Filesystem for InfusedFilesystem {
             for register in &self.registers {
                 let register_ino = self.name_to_ino[&register.name];
                 entries.push((register_ino, FileType::RegularFile, register.name.clone()));
+            }
+            entries
+        } else if ino == self.transactions_ino {
+            let mut entries = vec![
+                (self.transactions_ino, FileType::Directory, ".".to_string()),
+                (ROOT_INO, FileType::Directory, "..".to_string()),
+            ];
+            let state = self.transactions.lock().unwrap();
+            for (name, &ino) in &state.name_to_ino {
+                entries.push((ino, FileType::RegularFile, name.clone()));
             }
             entries
         } else {
@@ -222,5 +411,133 @@ impl Filesystem for InfusedFilesystem {
             }
         }
         reply.ok();
+    }
+
+    fn create(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        if parent != self.transactions_ino {
+            reply.error(Errno::EPERM);
+            return;
+        }
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if self.register_by_name(name).is_none() {
+            // Staging a value only makes sense for a real register.
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        let mut state = self.transactions.lock().unwrap();
+        let ino = match state.name_to_ino.get(name).copied() {
+            Some(ino) => ino,
+            None => {
+                let ino = INodeNo(state.next_ino);
+                state.next_ino += 1;
+                state.name_to_ino.insert(name.to_string(), ino);
+                state.ino_to_name.insert(ino, name.to_string());
+                ino
+            }
+        };
+        state.buffers.insert(ino, Vec::new());
+        drop(state);
+
+        reply.created(
+            &ATTR_TTL,
+            &self.file_attr(ino, 0, 0o644, req),
+            Generation(0),
+            FileHandle(0),
+            fuser::FopenFlags::empty(),
+        );
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        let mut state = self.transactions.lock().unwrap();
+        if !state.ino_to_name.contains_key(&ino) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let buffer = state.buffers.entry(ino).or_default();
+        let offset = offset as usize;
+        if buffer.len() < offset {
+            buffer.resize(offset, 0);
+        }
+        let end = offset + data.len();
+        if buffer.len() < end {
+            buffer.resize(end, 0);
+        }
+        buffer[offset..end].copy_from_slice(data);
+        reply.written(data.len() as u32);
+    }
+
+    // Parsing (rather than in `write`) matters because `write` can be
+    // called multiple times with fragments of one logical value; `release`
+    // is the point where the write is actually finished (the caller closed
+    // the file), so it's the first point a full value is guaranteed to be
+    // present. A value that fails to parse is silently dropped rather than
+    // staged — surfacing that failure back through the filesystem is the
+    // open question in CLAUDE.md's Milestone H3, not solved here.
+    fn release(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        let mut state = self.transactions.lock().unwrap();
+        if let Some(name) = state.ino_to_name.get(&ino).cloned()
+            && let Some(buffer) = state.buffers.remove(&ino)
+            && let Some(register) = self.register_by_name(&name)
+            && let Ok(text) = String::from_utf8(buffer)
+            && let Some(value) = Self::parse_register_value(register.data_type, &text)
+        {
+            state.pending.stage(name, value);
+        }
+        reply.ok();
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if parent != self.transactions_ino {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        let mut state = self.transactions.lock().unwrap();
+        match state.name_to_ino.remove(name) {
+            Some(ino) => {
+                state.ino_to_name.remove(&ino);
+                state.buffers.remove(&ino);
+                state.pending.unstage(name);
+                reply.ok();
+            }
+            None => reply.error(Errno::ENOENT),
+        }
     }
 }
