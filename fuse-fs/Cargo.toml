@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 protocol = { path = "../protocol" }
+fuser = "0.18"
+libc = "0.2"

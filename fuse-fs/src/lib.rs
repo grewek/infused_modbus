@@ -1,4 +1,7 @@
+pub mod filesystem;
+
 use std::collections::HashMap;
+use std::fmt;
 
 // Mirrors protocol::device_description::DataType — a register's value is
 // whichever of these its TOML description declares it to be.
@@ -6,6 +9,16 @@ use std::collections::HashMap;
 pub enum RegisterValue {
     U16(u16),
     F32(f32),
+}
+
+// How a register's value is rendered as the content of its FUSE file.
+impl fmt::Display for RegisterValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RegisterValue::U16(value) => write!(formatter, "{value}"),
+            RegisterValue::F32(value) => write!(formatter, "{value}"),
+        }
+    }
 }
 
 // The shared state between protocol I/O (which updates values from what a
@@ -62,5 +75,15 @@ mod tests {
         store.set("Tank_Temperature", RegisterValue::U16(42));
         store.set("Tank_Temperature", RegisterValue::U16(43));
         assert_eq!(store.get("Tank_Temperature"), Some(RegisterValue::U16(43)));
+    }
+
+    #[test]
+    fn u16_value_displays_as_plain_decimal() {
+        assert_eq!(RegisterValue::U16(42).to_string(), "42");
+    }
+
+    #[test]
+    fn f32_value_displays_as_plain_decimal() {
+        assert_eq!(RegisterValue::F32(3.5).to_string(), "3.5");
     }
 }
