@@ -30,8 +30,8 @@ Connection details (IP/port for TCP, serial port/slave ID for RTU) are **not** p
 The mounted filesystem (per client or server instance) exposes at least:
 
 - a `data`/`registers` directory — current live values as readable files, named/structured per the TOML description
-- a `transactions` directory — the write mechanism:
-  1. The user creates a file per value they want to change, using the human-readable name from the TOML description (e.g. a file representing `Stop_Process = True`).
+- a `transactions` directory — the write mechanism (resolved 2026-09-15, after considering a single-file batch-write alternative — rejected because it's less filesystem-native: no `ls` to inspect what's staged, no `rm` to unstage a single value, and a comma-separated custom syntax to parse/report errors against):
+  1. The user creates a file per value they want to change, named after the register's human-readable name from the TOML description, and writes the desired value as that file's **content** (e.g. `echo True > transactions/Stop_Process`) — not encoded in the filename. Staging happens on write, not on bare creation.
   2. Once all desired changes are staged, the user creates a sentinel file named `TRANSACTION_END`.
   3. Creating `TRANSACTION_END` triggers the actual batched Modbus write(s) for everything staged in the transaction.
 

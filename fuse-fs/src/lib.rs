@@ -45,6 +45,39 @@ impl RegisterStore {
     }
 }
 
+// Staged writes for one in-progress transaction: creating a file in
+// `transactions/` and writing a value to it stages a name=value entry here;
+// creating `TRANSACTION_END` (Milestone H2, not implemented yet) drains this
+// and applies it to a RegisterStore. Plain data structure, no FUSE
+// awareness — mirrors how RegisterStore (F1) preceded its own FUSE wiring
+// (G1).
+#[derive(Debug, Default)]
+pub struct PendingTransaction {
+    staged: HashMap<String, RegisterValue>,
+}
+
+impl PendingTransaction {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn stage(&mut self, name: impl Into<String>, value: RegisterValue) {
+        self.staged.insert(name.into(), value);
+    }
+
+    pub fn get(&self, name: &str) -> Option<RegisterValue> {
+        self.staged.get(name).copied()
+    }
+
+    pub fn unstage(&mut self, name: &str) -> Option<RegisterValue> {
+        self.staged.remove(name)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.staged.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +118,47 @@ mod tests {
     #[test]
     fn f32_value_displays_as_plain_decimal() {
         assert_eq!(RegisterValue::F32(3.5).to_string(), "3.5");
+    }
+
+    #[test]
+    fn pending_transaction_get_returns_none_for_unstaged_register() {
+        let transaction = PendingTransaction::new();
+        assert_eq!(transaction.get("Stop_Process"), None);
+    }
+
+    #[test]
+    fn pending_transaction_stage_then_get_returns_the_value() {
+        let mut transaction = PendingTransaction::new();
+        transaction.stage("Stop_Process", RegisterValue::U16(1));
+        assert_eq!(transaction.get("Stop_Process"), Some(RegisterValue::U16(1)));
+    }
+
+    #[test]
+    fn pending_transaction_stage_overwrites_previous_value() {
+        let mut transaction = PendingTransaction::new();
+        transaction.stage("Stop_Process", RegisterValue::U16(1));
+        transaction.stage("Stop_Process", RegisterValue::U16(0));
+        assert_eq!(transaction.get("Stop_Process"), Some(RegisterValue::U16(0)));
+    }
+
+    #[test]
+    fn pending_transaction_unstage_removes_a_staged_value() {
+        let mut transaction = PendingTransaction::new();
+        transaction.stage("Stop_Process", RegisterValue::U16(1));
+        assert_eq!(
+            transaction.unstage("Stop_Process"),
+            Some(RegisterValue::U16(1))
+        );
+        assert_eq!(transaction.get("Stop_Process"), None);
+    }
+
+    #[test]
+    fn pending_transaction_is_empty_reflects_staged_state() {
+        let mut transaction = PendingTransaction::new();
+        assert!(transaction.is_empty());
+        transaction.stage("Stop_Process", RegisterValue::U16(1));
+        assert!(!transaction.is_empty());
+        transaction.unstage("Stop_Process");
+        assert!(transaction.is_empty());
     }
 }
