@@ -4,6 +4,14 @@ pub const FUNCTION_CODE_READ_HOLDING_REGISTERS: u8 = 0x03;
 pub const FUNCTION_CODE_WRITE_SINGLE_REGISTER: u8 = 0x06;
 pub const FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS: u8 = 0x10;
 
+// Standard Modbus exception codes (Modbus Application Protocol V1.1b3,
+// section 7) — a slave/server puts one of these in an ExceptionResponse's
+// exception_code field to say why it's rejecting an otherwise
+// well-formed-looking request.
+pub const EXCEPTION_ILLEGAL_FUNCTION: u8 = 0x01;
+pub const EXCEPTION_ILLEGAL_DATA_ADDRESS: u8 = 0x02;
+pub const EXCEPTION_ILLEGAL_DATA_VALUE: u8 = 0x03;
+
 const FUNCTION_CODE_BYTE: usize = 0;
 
 // Byte 0 is always the function code, and every PDU in this family (Read Holding

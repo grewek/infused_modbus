@@ -351,7 +351,9 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "fuse-fs",
+ "fuser",
  "protocol",
+ "tokio",
 ]
 
 [[package]]
