@@ -7,7 +7,7 @@ use fuser::{
 use protocol::device_description::{DataType, RegisterDescription};
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 const ROOT_INO: INodeNo = INodeNo(1);
@@ -76,6 +76,20 @@ impl InfusedFilesystem {
         }
     }
 
+    // A poisoned lock (a prior panic while holding it) shouldn't take down
+    // every future filesystem call with it — recovering the guard is safe
+    // here since a panic mid-mutation would at worst leave stale/partial
+    // bookkeeping, not memory unsafety.
+    fn transactions_lock(&self) -> MutexGuard<'_, TransactionFsState> {
+        self.transactions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn store_lock(&self) -> MutexGuard<'_, RegisterStore> {
+        self.store.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn register_by_ino(&self, ino: INodeNo) -> Option<&RegisterDescription> {
         let index = ino.0.checked_sub(FIRST_REGISTER_INO)?;
         self.registers.get(index as usize)
@@ -86,7 +100,7 @@ impl InfusedFilesystem {
     }
 
     fn register_content(&self, register: &RegisterDescription) -> String {
-        match self.store.lock().unwrap().get(&register.name) {
+        match self.store_lock().get(&register.name) {
             Some(value) => format!("{value}\n"),
             None => String::new(),
         }
@@ -96,10 +110,18 @@ impl InfusedFilesystem {
     // currently pending for that register, or empty if none (e.g. it was
     // just created and nothing has been written to it yet).
     fn transaction_content(&self, name: &str) -> String {
-        match self.transactions.lock().unwrap().pending.get(name) {
+        match self.transactions_lock().pending.get(name) {
             Some(value) => format!("{value}\n"),
             None => String::new(),
         }
+    }
+
+    // Resolves a transaction file's inode back to its register name. Used
+    // by every trait method that has to tell "this ino is a staged
+    // transaction file" apart from "this ino doesn't exist" — `getattr`,
+    // `setattr`, and `read` all needed this exact lookup.
+    fn transaction_name_by_ino(&self, ino: INodeNo) -> Option<String> {
+        self.transactions_lock().ino_to_name.get(&ino).cloned()
     }
 
     fn parse_register_value(data_type: DataType, text: &str) -> Option<RegisterValue> {
@@ -206,13 +228,7 @@ impl Filesystem for InfusedFilesystem {
                 reply.error(Errno::ENOENT);
                 return;
             };
-            let ino = self
-                .transactions
-                .lock()
-                .unwrap()
-                .name_to_ino
-                .get(name)
-                .copied();
+            let ino = self.transactions_lock().name_to_ino.get(name).copied();
             match ino {
                 Some(ino) => {
                     let content = self.transaction_content(name);
@@ -245,14 +261,7 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
-        let name = self
-            .transactions
-            .lock()
-            .unwrap()
-            .ino_to_name
-            .get(&ino)
-            .cloned();
-        match name {
+        match self.transaction_name_by_ino(ino) {
             Some(name) => {
                 let content = self.transaction_content(&name);
                 reply.attr(
@@ -288,21 +297,8 @@ impl Filesystem for InfusedFilesystem {
         // real backing buffer to shrink — the next `write` replaces the
         // staged value outright — so this just has to succeed and report
         // an attr back.
-        if ino == self.transactions_ino
-            || self
-                .transactions
-                .lock()
-                .unwrap()
-                .ino_to_name
-                .contains_key(&ino)
-        {
-            let name = self
-                .transactions
-                .lock()
-                .unwrap()
-                .ino_to_name
-                .get(&ino)
-                .cloned();
+        let name = self.transaction_name_by_ino(ino);
+        if ino == self.transactions_ino || name.is_some() {
             let content_len = name
                 .map(|name| self.transaction_content(&name).len() as u64)
                 .unwrap_or(0);
@@ -332,14 +328,7 @@ impl Filesystem for InfusedFilesystem {
             // holding this guard through that call (as a direct `if let`
             // condition would, since its temporary lives for the whole
             // `if let` body) deadlocks.
-            let name = self
-                .transactions
-                .lock()
-                .unwrap()
-                .ino_to_name
-                .get(&ino)
-                .cloned();
-            match name {
+            match self.transaction_name_by_ino(ino) {
                 Some(name) => self.transaction_content(&name),
                 None => {
                     reply.error(Errno::ENOENT);
@@ -392,7 +381,7 @@ impl Filesystem for InfusedFilesystem {
                 (self.transactions_ino, FileType::Directory, ".".to_string()),
                 (ROOT_INO, FileType::Directory, "..".to_string()),
             ];
-            let state = self.transactions.lock().unwrap();
+            let state = self.transactions_lock();
             for (name, &ino) in &state.name_to_ino {
                 entries.push((ino, FileType::RegularFile, name.clone()));
             }
@@ -437,7 +426,7 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
-        let mut state = self.transactions.lock().unwrap();
+        let mut state = self.transactions_lock();
         let ino = match state.name_to_ino.get(name).copied() {
             Some(ino) => ino,
             None => {
@@ -472,7 +461,7 @@ impl Filesystem for InfusedFilesystem {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let mut state = self.transactions.lock().unwrap();
+        let mut state = self.transactions_lock();
         if !state.ino_to_name.contains_key(&ino) {
             reply.error(Errno::ENOENT);
             return;
@@ -507,7 +496,7 @@ impl Filesystem for InfusedFilesystem {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let mut state = self.transactions.lock().unwrap();
+        let mut state = self.transactions_lock();
         if let Some(name) = state.ino_to_name.get(&ino).cloned()
             && let Some(buffer) = state.buffers.remove(&ino)
             && let Some(register) = self.register_by_name(&name)
@@ -529,7 +518,7 @@ impl Filesystem for InfusedFilesystem {
             return;
         };
 
-        let mut state = self.transactions.lock().unwrap();
+        let mut state = self.transactions_lock();
         match state.name_to_ino.remove(name) {
             Some(ino) => {
                 state.ino_to_name.remove(&ino);
