@@ -3,9 +3,19 @@ use crate::{DecodeError, read_u16_be};
 const MBAP_PROTOCOL_ID: u16 = 0x0000;
 const MBAP_TRANSACTION_ID_BYTE: usize = 0;
 const MBAP_PROTOCOL_ID_BYTE: usize = 2;
-const MBAP_LENGTH_BYTE: usize = 4;
+// Visible to `crate::tcp`, which has to know these to frame a stream of bytes
+// into whole ADUs before it can hand a complete one to `TcpAdu::decode`.
+pub(crate) const MBAP_LENGTH_BYTE: usize = 4;
 const MBAP_UNIT_ID_BYTE: usize = 6;
-const MBAP_HEADER_LEN: usize = 7;
+pub(crate) const MBAP_HEADER_LEN: usize = 7;
+
+// Real Modbus caps the PDU at 253 bytes (1 function code + 252 data bytes), so
+// the length field (unit ID + PDU) can never legitimately exceed 254. Rejecting
+// anything above that here — rather than trusting a peer-supplied length and
+// reading/allocating however much it claims — closes a memory-exhaustion DoS:
+// a malicious peer could otherwise send a 7-byte header claiming a huge length
+// and force a large allocation before ever sending the rest of the frame.
+pub(crate) const MBAP_MAX_LENGTH: u16 = 254;
 
 // A Modbus TCP ADU wraps a PDU with an MBAP header: transaction ID, protocol ID
 // (always 0 for Modbus), a length covering unit ID + PDU, and the unit ID. The
@@ -41,7 +51,7 @@ impl TcpAdu {
             });
         }
         let length = read_u16_be(bytes, MBAP_LENGTH_BYTE);
-        if length == 0 {
+        if length == 0 || length > MBAP_MAX_LENGTH {
             return Err(DecodeError::InvalidAduLength { length });
         }
         let pdu_len = length as usize - 1;
@@ -175,6 +185,16 @@ mod tests {
         assert_eq!(
             TcpAdu::decode(&bytes),
             Err(DecodeError::InvalidAduLength { length: 0 })
+        );
+    }
+
+    #[test]
+    fn tcp_adu_decode_rejects_length_exceeding_maximum() {
+        let mut bytes = vec![0x00, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x01];
+        bytes.extend(std::iter::repeat_n(0u8, 0xFFFF - 1));
+        assert_eq!(
+            TcpAdu::decode(&bytes),
+            Err(DecodeError::InvalidAduLength { length: 0xFFFF })
         );
     }
 

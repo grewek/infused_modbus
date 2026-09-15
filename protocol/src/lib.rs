@@ -1,5 +1,6 @@
 pub mod adu;
 pub mod pdu;
+pub mod tcp;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
