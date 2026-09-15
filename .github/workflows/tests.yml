@@ -1,0 +1,24 @@
+name: Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # fuser uses its pure-Rust mount backend by default (no `libfuse`
+      # feature enabled in any Cargo.toml here), and none of the unit
+      # tests actually mount a FUSE filesystem or open a real serial
+      # port — both of those are exercised manually, not by `cargo test`
+      # — so a plain runner needs no extra system packages.
+      - name: Run unit tests
+        run: cargo test --workspace
