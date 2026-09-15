@@ -35,6 +35,8 @@ The mounted filesystem (per client or server instance) exposes at least:
   2. Once all desired changes are staged, the user creates a sentinel file named `TRANSACTION_END`.
   3. Creating `TRANSACTION_END` triggers the actual batched Modbus write(s) for everything staged in the transaction.
 
+**`TRANSACTION_END` confirmation semantics (resolved 2026-09-15):** creating `TRANSACTION_END` clears the whole `transactions/` staging area immediately (matching a commit consuming its staging area — no partial/pending status is shown; see Milestone H3 below for why that's deliberately out of scope here), but this does **not** mean the write has happened yet. `fuse-fs` has no Modbus protocol knowledge, so it cannot itself confirm a write reached the real device — it only hands the drained transaction off (over an injected `std::sync::mpsc::Sender<HashMap<String, RegisterValue>>`) to whoever owns the receiving end. Values under `holding-registers/` must **not** change as a side effect of `TRANSACTION_END` — they only change once the actual write is confirmed by the device (client: after the Modbus write response / next poll confirms it; server: once it has actually applied and would echo the value to real Modbus clients), which is client/server-specific logic outside `fuse-fs`, wired up once those binaries integrate `protocol`.
+
 This transactional, filesystem-native interface is the core "twist" of the project — treating Modbus reads/writes as file operations rather than requiring a dedicated client API.
 
 ## Planned architecture

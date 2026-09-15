@@ -76,6 +76,13 @@ impl PendingTransaction {
     pub fn is_empty(&self) -> bool {
         self.staged.is_empty()
     }
+
+    // Takes every staged value out at once, leaving the transaction empty —
+    // what `TRANSACTION_END` needs to atomically hand off everything staged
+    // so far to be applied to a RegisterStore.
+    pub fn drain(&mut self) -> HashMap<String, RegisterValue> {
+        std::mem::take(&mut self.staged)
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +166,20 @@ mod tests {
         transaction.stage("Stop_Process", RegisterValue::U16(1));
         assert!(!transaction.is_empty());
         transaction.unstage("Stop_Process");
+        assert!(transaction.is_empty());
+    }
+
+    #[test]
+    fn pending_transaction_drain_returns_staged_values_and_empties_transaction() {
+        let mut transaction = PendingTransaction::new();
+        transaction.stage("Stop_Process", RegisterValue::U16(1));
+        transaction.stage("Flow_Rate", RegisterValue::F32(3.5));
+
+        let drained = transaction.drain();
+
+        assert_eq!(drained.get("Stop_Process"), Some(&RegisterValue::U16(1)));
+        assert_eq!(drained.get("Flow_Rate"), Some(&RegisterValue::F32(3.5)));
+        assert_eq!(drained.len(), 2);
         assert!(transaction.is_empty());
     }
 }

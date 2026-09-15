@@ -7,12 +7,18 @@ use fuser::{
 use protocol::device_description::{DataType, RegisterDescription};
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 const ROOT_INO: INodeNo = INodeNo(1);
 const HOLDING_REGISTERS_INO: INodeNo = INodeNo(2);
 const FIRST_REGISTER_INO: u64 = 3;
+
+// The sentinel name that triggers a transaction commit (see CLAUDE.md's
+// "TRANSACTION_END confirmation semantics"). Not a register name, so it's
+// checked before the "must be a real register" guard in `create`.
+const TRANSACTION_END_NAME: &str = "TRANSACTION_END";
 
 // How long the kernel may cache an entry/attr reply before asking again.
 // Register values can change between our own reads (a real device is polled
@@ -38,21 +44,30 @@ struct TransactionFsState {
 
 /// A minimal FUSE projection: root -> `holding-registers` -> one read-only
 /// file per register (current value from `store`), and root ->
-/// `transactions` -> user-created files that stage a pending write per the scheme in
-/// CLAUDE.md (filename = register name, content = value to write).
-/// Draining a transaction on `TRANSACTION_END` (Milestone H2) isn't wired up
-/// yet, so staged writes currently just sit in `PendingTransaction` and are
-/// only visible by reading them back.
+/// `transactions` -> user-created files that stage a pending write per the
+/// scheme in CLAUDE.md (filename = register name, content = value to
+/// write). Creating `TRANSACTION_END` drains the staged values and hands
+/// them off over `transaction_sender` — this layer has no Modbus knowledge,
+/// so it cannot itself confirm a write reached the device; `store` (and so
+/// `holding-registers/`) is deliberately **not** touched here. Whoever owns
+/// the receiving end of `transaction_sender` is responsible for performing
+/// the real write and only then updating `store` once the device confirms
+/// it (see CLAUDE.md's "TRANSACTION_END confirmation semantics").
 pub struct InfusedFilesystem {
     registers: Vec<RegisterDescription>,
     name_to_ino: HashMap<String, INodeNo>,
     store: Arc<Mutex<RegisterStore>>,
     transactions_ino: INodeNo,
     transactions: Mutex<TransactionFsState>,
+    transaction_sender: mpsc::Sender<HashMap<String, RegisterValue>>,
 }
 
 impl InfusedFilesystem {
-    pub fn new(registers: Vec<RegisterDescription>, store: Arc<Mutex<RegisterStore>>) -> Self {
+    pub fn new(
+        registers: Vec<RegisterDescription>,
+        store: Arc<Mutex<RegisterStore>>,
+        transaction_sender: mpsc::Sender<HashMap<String, RegisterValue>>,
+    ) -> Self {
         let name_to_ino = registers
             .iter()
             .enumerate()
@@ -74,6 +89,7 @@ impl InfusedFilesystem {
             store,
             transactions_ino,
             transactions,
+            transaction_sender,
         }
     }
 
@@ -123,6 +139,25 @@ impl InfusedFilesystem {
     // `setattr`, and `read` all needed this exact lookup.
     fn transaction_name_by_ino(&self, ino: INodeNo) -> Option<String> {
         self.transactions_lock().ino_to_name.get(&ino).cloned()
+    }
+
+    // Drains every staged value and clears the whole transactions/ staging
+    // area — TRANSACTION_END consumes it regardless of whether the write
+    // that's about to be attempted actually succeeds. Does NOT touch
+    // `store`; the drained values are only handed off over
+    // `transaction_sender` for someone else to confirm and apply (see the
+    // struct doc comment).
+    fn commit_transaction(&self) {
+        let mut state = self.transactions_lock();
+        let drained = state.pending.drain();
+        state.name_to_ino.clear();
+        state.ino_to_name.clear();
+        state.buffers.clear();
+        drop(state);
+
+        if !drained.is_empty() {
+            let _ = self.transaction_sender.send(drained);
+        }
     }
 
     fn parse_register_value(data_type: DataType, text: &str) -> Option<RegisterValue> {
@@ -425,6 +460,27 @@ impl Filesystem for InfusedFilesystem {
             reply.error(Errno::ENOENT);
             return;
         };
+
+        if name == TRANSACTION_END_NAME {
+            self.commit_transaction();
+            // Not tracked in name_to_ino/ino_to_name: the staging area it
+            // would belong to was just cleared, so the file doesn't
+            // persist — a later lookup() for TRANSACTION_END correctly
+            // reports ENOENT, as if it vanished the instant it was created.
+            let mut state = self.transactions_lock();
+            let ino = INodeNo(state.next_ino);
+            state.next_ino += 1;
+            drop(state);
+            reply.created(
+                &ATTR_TTL,
+                &self.file_attr(ino, 0, 0o644, req),
+                Generation(0),
+                FileHandle(0),
+                fuser::FopenFlags::empty(),
+            );
+            return;
+        }
+
         if self.register_by_name(name).is_none() {
             // Staging a value only makes sense for a real register.
             reply.error(Errno::ENOENT);
@@ -533,5 +589,80 @@ impl Filesystem for InfusedFilesystem {
             }
             None => reply.error(Errno::ENOENT),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::device_description::AccessRight;
+
+    fn test_filesystem() -> (
+        InfusedFilesystem,
+        mpsc::Receiver<HashMap<String, RegisterValue>>,
+    ) {
+        let registers = vec![RegisterDescription {
+            name: "Stop_Process".to_string(),
+            address: 40001,
+            data_type: DataType::U16,
+            access: AccessRight::ReadWrite,
+        }];
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let (sender, receiver) = mpsc::channel();
+        (InfusedFilesystem::new(registers, store, sender), receiver)
+    }
+
+    #[test]
+    fn commit_transaction_sends_staged_values_and_clears_staging_area() {
+        let (filesystem, receiver) = test_filesystem();
+        {
+            let mut state = filesystem.transactions_lock();
+            state.pending.stage("Stop_Process", RegisterValue::U16(1));
+            state
+                .name_to_ino
+                .insert("Stop_Process".to_string(), INodeNo(100));
+            state
+                .ino_to_name
+                .insert(INodeNo(100), "Stop_Process".to_string());
+            state.buffers.insert(INodeNo(100), b"1".to_vec());
+        }
+
+        filesystem.commit_transaction();
+
+        let received = receiver.try_recv().unwrap();
+        assert_eq!(received.get("Stop_Process"), Some(&RegisterValue::U16(1)));
+
+        let state = filesystem.transactions_lock();
+        assert!(state.pending.is_empty());
+        assert!(state.name_to_ino.is_empty());
+        assert!(state.ino_to_name.is_empty());
+        assert!(state.buffers.is_empty());
+    }
+
+    #[test]
+    fn commit_transaction_does_not_touch_store() {
+        let (filesystem, receiver) = test_filesystem();
+        filesystem
+            .store_lock()
+            .set("Stop_Process", RegisterValue::U16(0));
+        filesystem
+            .transactions_lock()
+            .pending
+            .stage("Stop_Process", RegisterValue::U16(1));
+
+        filesystem.commit_transaction();
+
+        assert_eq!(
+            filesystem.store_lock().get("Stop_Process"),
+            Some(RegisterValue::U16(0))
+        );
+        receiver.try_recv().unwrap();
+    }
+
+    #[test]
+    fn commit_transaction_with_nothing_staged_sends_nothing() {
+        let (filesystem, receiver) = test_filesystem();
+        filesystem.commit_transaction();
+        assert!(receiver.try_recv().is_err());
     }
 }

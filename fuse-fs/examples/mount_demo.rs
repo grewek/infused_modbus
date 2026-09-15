@@ -12,13 +12,19 @@
 //   cat <mountpoint>/transactions/Stop_Process
 //   ls <mountpoint>/transactions
 //   rm <mountpoint>/transactions/Stop_Process
+//   touch <mountpoint>/transactions/TRANSACTION_END
+//
+// There's no real Modbus device here, so "confirming" a transaction is
+// faked by a background thread that applies it to the store immediately
+// instead of waiting on a real write response — see the println! it prints
+// when it does so.
 //
 // Ctrl+C to stop; the kernel unmounts automatically once the process exits.
 
 use fuse_fs::filesystem::InfusedFilesystem;
 use fuse_fs::{RegisterStore, RegisterValue};
 use protocol::device_description::{AccessRight, DataType, DeviceDescription, RegisterDescription};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 fn demo_registers() -> Vec<RegisterDescription> {
     vec![
@@ -70,6 +76,20 @@ fn main() {
 
     std::fs::create_dir_all(&mountpoint).ok();
 
+    let (transaction_sender, transaction_receiver) = mpsc::channel();
+    {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            for transaction in transaction_receiver {
+                let mut store = store.lock().unwrap();
+                for (name, value) in transaction {
+                    println!("(demo) confirming write: {name} = {value}");
+                    store.set(name, value);
+                }
+            }
+        });
+    }
+
     println!("Mounting infused_modbus demo filesystem at {mountpoint}");
     println!();
     println!("Try, from another terminal:");
@@ -82,7 +102,7 @@ fn main() {
     println!();
     println!("Ctrl+C to stop (the kernel unmounts automatically on exit).");
 
-    let filesystem = InfusedFilesystem::new(registers, store);
+    let filesystem = InfusedFilesystem::new(registers, store, transaction_sender);
     fuser::mount(filesystem, &mountpoint, &fuser::Config::default())
         .unwrap_or_else(|error| panic!("mount failed: {error}"));
 }
