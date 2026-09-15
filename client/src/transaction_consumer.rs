@@ -7,7 +7,15 @@
 // The channel is `std::sync::mpsc` (see H2), so receiving is a blocking
 // call — this is meant to run on its own dedicated OS thread (not as a
 // tokio task), using `handle` to drive the async Modbus write to
-// completion one register at a time over one persistent connection.
+// completion one register at a time.
+//
+// `stream` is shared (behind a tokio::sync::Mutex, not std::sync::Mutex —
+// held across the .await inside confirm_write) with whoever else also
+// talks to the device (the polling loop, see client/src/polling.rs): a
+// generic Modbus device/gateway can't be assumed to accept more than one
+// concurrent connection, so every use of the connection — a poll read or a
+// confirmed write — takes the lock only for the duration of its own
+// request/response, never holds it across unrelated work.
 
 use crate::write_confirmation::confirm_write;
 use fuse_fs::{RegisterStore, RegisterValue, WriteReport, WriteStatus};
@@ -17,11 +25,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::runtime::Handle;
+use tokio::sync::Mutex as AsyncMutex;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_transaction_consumer<S>(
     handle: &Handle,
-    mut stream: S,
+    stream: &Arc<AsyncMutex<S>>,
     registers: &[RegisterDescription],
     store: &Arc<Mutex<RegisterStore>>,
     report: &Arc<Mutex<WriteReport>>,
@@ -37,14 +46,18 @@ pub fn run_transaction_consumer<S>(
             let status = match registers.iter().find(|register| register.name == name) {
                 Some(register) => {
                     next_transaction_id = next_transaction_id.wrapping_add(1);
-                    handle.block_on(confirm_write(
-                        &mut stream,
-                        register,
-                        value,
-                        unit_id,
-                        next_transaction_id,
-                        timeout,
-                    ))
+                    handle.block_on(async {
+                        let mut stream = stream.lock().await;
+                        confirm_write(
+                            &mut *stream,
+                            register,
+                            value,
+                            unit_id,
+                            next_transaction_id,
+                            timeout,
+                        )
+                        .await
+                    })
                 }
                 None => WriteStatus::Failed(format!("unknown register: {name}")),
             };
@@ -96,12 +109,13 @@ mod tests {
         });
 
         let handle = Handle::current();
+        let stream = Arc::new(AsyncMutex::new(client));
         let consumer_store = Arc::clone(&store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
-                client,
+                &stream,
                 &registers,
                 &consumer_store,
                 &consumer_report,
@@ -163,12 +177,13 @@ mod tests {
         });
 
         let handle = Handle::current();
+        let stream = Arc::new(AsyncMutex::new(client));
         let consumer_store = Arc::clone(&store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
-                client,
+                &stream,
                 &registers,
                 &consumer_store,
                 &consumer_report,
@@ -202,12 +217,13 @@ mod tests {
         let registers = vec![u16_register()];
 
         let handle = Handle::current();
+        let stream = Arc::new(AsyncMutex::new(client));
         let consumer_store = Arc::clone(&store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
-                client,
+                &stream,
                 &registers,
                 &consumer_store,
                 &consumer_report,
