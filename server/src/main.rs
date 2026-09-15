@@ -1,6 +1,6 @@
-// Modbus TCP slave: mounts a FUSE projection of `device-description.toml`
-// at `mountpoint` and listens on `bind-address` for real Modbus masters to
-// query/write against. This process's own RegisterStore is the
+// Modbus slave: mounts a FUSE projection of `device-description.toml` at
+// `mountpoint` and serves real Modbus masters over TCP or RTU (see
+// `<connection>` below). This process's own RegisterStore is the
 // authoritative state being served — an external write applies directly
 // (see server/src/handler.rs), and a locally staged transaction
 // (transactions/ + TRANSACTION_END) applies directly too (see
@@ -9,7 +9,11 @@
 // either side.
 //
 // Usage:
-//   cargo run -p server -- <mountpoint> <device-description.toml> <bind-address:port>
+//   cargo run -p server -- <mountpoint> <device-description.toml> <connection>
+//
+// <connection> is either:
+//   tcp://<bind-address:port>          e.g. tcp://0.0.0.0:502
+//   rtu://<serial-path>:<baud-rate>    e.g. rtu:///dev/ttyUSB0:9600
 //
 // Scope of this first pass (see handler.rs/connection.rs for detail): only
 // U16 registers over Read Holding Registers / Write Single Register are
@@ -24,18 +28,87 @@
 
 use fuse_fs::filesystem::InfusedFilesystem;
 use fuse_fs::{RegisterStore, WriteReport};
-use protocol::device_description::DeviceDescription;
-use server::connection::serve_connection;
+use protocol::device_description::{DeviceDescription, RegisterDescription};
+use server::connection::{serve_rtu_connection, serve_tcp_connection};
 use server::transaction_consumer::run_transaction_consumer;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio_serial::SerialPortBuilderExt;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn usage() -> ! {
-    eprintln!("Usage: server <mountpoint> <device-description.toml> <bind-address:port>");
+    eprintln!(
+        "Usage: server <mountpoint> <device-description.toml> <connection>\n\
+         <connection> is tcp://<bind-address:port> or rtu://<serial-path>:<baud-rate>"
+    );
     std::process::exit(1);
+}
+
+fn start_serving(
+    runtime: &tokio::runtime::Runtime,
+    connection_string: &str,
+    registers: Arc<Vec<RegisterDescription>>,
+    store: Arc<Mutex<RegisterStore>>,
+    toml_source: Arc<String>,
+) {
+    if let Some(bind_address) = connection_string.strip_prefix("tcp://") {
+        let listener = runtime
+            .block_on(TcpListener::bind(bind_address))
+            .unwrap_or_else(|error| panic!("failed to bind {bind_address}: {error}"));
+        runtime.spawn(async move {
+            loop {
+                let (stream, _peer_address) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    // A single failed accept (e.g. a transient resource
+                    // limit) shouldn't take the whole server down.
+                    Err(_) => continue,
+                };
+                let registers = Arc::clone(&registers);
+                let store = Arc::clone(&store);
+                let toml_source = Arc::clone(&toml_source);
+                tokio::spawn(async move {
+                    serve_tcp_connection(stream, registers, store, toml_source, REQUEST_TIMEOUT)
+                        .await;
+                });
+            }
+        });
+    } else if let Some(rest) = connection_string.strip_prefix("rtu://") {
+        let Some((path, baud_rate)) = rest.rsplit_once(':') else {
+            panic!("rtu:// connection must be rtu://<path>:<baud-rate>, got {connection_string:?}");
+        };
+        let baud_rate: u32 = baud_rate
+            .parse()
+            .unwrap_or_else(|error| panic!("invalid baud rate {baud_rate:?}: {error}"));
+        let frame_silence = protocol::rtu::frame_silence_for_baud_rate(baud_rate);
+        // See client::connection::Connection::open_rtu: tokio-serial
+        // registers the file descriptor with the reactor immediately at
+        // open time, so opening it needs an active runtime context even
+        // though this isn't an async call.
+        let stream = {
+            let _guard = runtime.handle().enter();
+            tokio_serial::new(path, baud_rate)
+                .open_native_async()
+                .unwrap_or_else(|error| panic!("failed to open serial port {path:?}: {error}"))
+        };
+        // Unlike TCP, there's only ever one of these — the physical
+        // serial link itself — so just one spawned task, not an
+        // accept-and-spawn-per-connection loop.
+        runtime.spawn(async move {
+            serve_rtu_connection(
+                stream,
+                registers,
+                store,
+                toml_source,
+                frame_silence,
+                REQUEST_TIMEOUT,
+            )
+            .await;
+        });
+    } else {
+        panic!("connection must start with tcp:// or rtu://, got {connection_string:?}");
+    }
 }
 
 fn main() {
@@ -46,7 +119,7 @@ fn main() {
     let Some(device_description_path) = args.next() else {
         usage();
     };
-    let Some(bind_address) = args.next() else {
+    let Some(connection_string) = args.next() else {
         usage();
     };
 
@@ -67,32 +140,16 @@ fn main() {
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");
-    let listener = runtime
-        .block_on(TcpListener::bind(&bind_address))
-        .unwrap_or_else(|error| panic!("failed to bind {bind_address}: {error}"));
-
-    let accept_registers = Arc::new(registers.clone());
-    let accept_store = Arc::clone(&store);
-    let accept_toml_source = Arc::new(toml_source.clone());
-    runtime.spawn(async move {
-        loop {
-            let (stream, _peer_address) = match listener.accept().await {
-                Ok(accepted) => accepted,
-                // A single failed accept (e.g. a transient resource limit)
-                // shouldn't take the whole server down.
-                Err(_) => continue,
-            };
-            let registers = Arc::clone(&accept_registers);
-            let store = Arc::clone(&accept_store);
-            let toml_source = Arc::clone(&accept_toml_source);
-            tokio::spawn(async move {
-                serve_connection(stream, registers, store, toml_source, REQUEST_TIMEOUT).await;
-            });
-        }
-    });
+    start_serving(
+        &runtime,
+        &connection_string,
+        Arc::new(registers.clone()),
+        Arc::clone(&store),
+        Arc::new(toml_source.clone()),
+    );
 
     std::fs::create_dir_all(&mountpoint).ok();
-    println!("Mounting infused_modbus server at {mountpoint}, listening on {bind_address}");
+    println!("Mounting infused_modbus server at {mountpoint}, serving via {connection_string}");
 
     let filesystem = InfusedFilesystem::new(registers, store, transaction_sender, report);
     let session = fuser::spawn_mount(filesystem, &mountpoint, &fuser::Config::default())

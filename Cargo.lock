@@ -451,6 +451,7 @@ dependencies = [
  "fuser",
  "protocol",
  "tokio",
+ "tokio-serial",
 ]
 
 [[package]]
