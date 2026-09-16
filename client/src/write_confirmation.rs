@@ -5,7 +5,10 @@ use crate::connection::Connection;
 use fuse_fs::{CoilValue, RegisterValue, WriteStatus};
 use protocol::DecodeError;
 use protocol::device_description::{CoilDescription, DataType, RegisterDescription};
-use protocol::pdu::{ExceptionResponse, WriteSingleCoilRequest, WriteSingleRegisterRequest};
+use protocol::pdu::{
+    ExceptionResponse, WriteMultipleCoilsRequest, WriteMultipleRegistersRequest,
+    WriteSingleCoilRequest, WriteSingleRegisterRequest,
+};
 use std::time::Duration;
 
 /// Encodes the Modbus request PDU for writing `value` to `register`.
@@ -97,6 +100,49 @@ pub async fn confirm_coil_write(
     timeout: Duration,
 ) -> WriteStatus {
     let pdu = encode_coil_write_request(coil, value);
+    match connection.request(unit_id, pdu, timeout).await {
+        Ok(response_pdu) => interpret_write_response(&response_pdu),
+        Err(error) => WriteStatus::Failed(format!("write failed: {error}")),
+    }
+}
+
+/// Sends a batch of contiguous register writes as one Write Multiple
+/// Registers request — the round-trip counterpart of `confirm_write`, used
+/// when more than one staged register can be grouped into a single
+/// request. Modbus gives no finer-grained outcome than "the whole request
+/// succeeded or failed", so a caller applying this status to several
+/// staged names must apply the same status to all of them.
+pub async fn confirm_write_multiple(
+    connection: &mut Connection,
+    starting_address: u16,
+    values: &[u16],
+    unit_id: u8,
+    timeout: Duration,
+) -> WriteStatus {
+    let pdu = WriteMultipleRegistersRequest {
+        starting_address,
+        register_values: values.to_vec(),
+    }
+    .encode();
+    match connection.request(unit_id, pdu, timeout).await {
+        Ok(response_pdu) => interpret_write_response(&response_pdu),
+        Err(error) => WriteStatus::Failed(format!("write failed: {error}")),
+    }
+}
+
+/// Coil counterpart of `confirm_write_multiple`.
+pub async fn confirm_coil_write_multiple(
+    connection: &mut Connection,
+    starting_address: u16,
+    values: &[bool],
+    unit_id: u8,
+    timeout: Duration,
+) -> WriteStatus {
+    let pdu = WriteMultipleCoilsRequest {
+        starting_address,
+        coil_values: values.to_vec(),
+    }
+    .encode();
     match connection.request(unit_id, pdu, timeout).await {
         Ok(response_pdu) => interpret_write_response(&response_pdu),
         Err(error) => WriteStatus::Failed(format!("write failed: {error}")),
@@ -391,6 +437,150 @@ mod tests {
             &mut connection,
             &a_coil(),
             CoilValue(true),
+            0x01,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(matches!(status, WriteStatus::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn confirm_write_multiple_returns_ok_when_device_echoes_the_write() {
+        let (mut connection, mut device) = connected_pair().await;
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut header)
+                .await
+                .unwrap();
+            // Write Multiple Registers request PDU for 2 values: function
+            // code (1) + starting address (2) + quantity (2) + byte count
+            // (1) + 2 values (4) = 10 bytes.
+            let mut pdu = vec![0u8; 10];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut pdu)
+                .await
+                .unwrap();
+            // A successful Write Multiple Registers response echoes just
+            // starting address + quantity (5 bytes), not the values.
+            let response_pdu = protocol::pdu::WriteMultipleRegistersResponse {
+                starting_address: 40010,
+                quantity: 2,
+            }
+            .encode();
+            let mut response = header;
+            let length = (response_pdu.len() + 1) as u16;
+            response[4..6].copy_from_slice(&length.to_be_bytes());
+            response.extend_from_slice(&response_pdu);
+            tokio::io::AsyncWriteExt::write_all(&mut device, &response)
+                .await
+                .unwrap();
+        });
+
+        let status = confirm_write_multiple(
+            &mut connection,
+            40010,
+            &[11, 22],
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(status, WriteStatus::Ok);
+        device_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirm_write_multiple_returns_failed_when_device_returns_an_exception() {
+        let (mut connection, mut device) = connected_pair().await;
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut header)
+                .await
+                .unwrap();
+            let mut pdu = vec![0u8; 10];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut pdu)
+                .await
+                .unwrap();
+            let exception = ExceptionResponse {
+                function_code: 0x10,
+                exception_code: 0x02,
+            }
+            .encode();
+            let mut response = header;
+            let length = (exception.len() + 1) as u16;
+            response[4..6].copy_from_slice(&length.to_be_bytes());
+            response.extend_from_slice(&exception);
+            tokio::io::AsyncWriteExt::write_all(&mut device, &response)
+                .await
+                .unwrap();
+        });
+
+        let status = confirm_write_multiple(
+            &mut connection,
+            40010,
+            &[11, 22],
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(status, WriteStatus::Failed(_)));
+        device_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirm_coil_write_multiple_returns_ok_when_device_echoes_the_write() {
+        let (mut connection, mut device) = connected_pair().await;
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut header)
+                .await
+                .unwrap();
+            // Write Multiple Coils request PDU for 2 values: function code
+            // (1) + starting address (2) + quantity (2) + byte count (1) +
+            // 1 packed byte = 7 bytes.
+            let mut pdu = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut pdu)
+                .await
+                .unwrap();
+            let response_pdu = protocol::pdu::WriteMultipleCoilsResponse {
+                starting_address: 1,
+                quantity: 2,
+            }
+            .encode();
+            let mut response = header;
+            let length = (response_pdu.len() + 1) as u16;
+            response[4..6].copy_from_slice(&length.to_be_bytes());
+            response.extend_from_slice(&response_pdu);
+            tokio::io::AsyncWriteExt::write_all(&mut device, &response)
+                .await
+                .unwrap();
+        });
+
+        let status = confirm_coil_write_multiple(
+            &mut connection,
+            1,
+            &[true, false],
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(status, WriteStatus::Ok);
+        device_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirm_coil_write_multiple_returns_failed_when_the_device_never_responds() {
+        let (mut connection, _device) = connected_pair().await;
+
+        let status = confirm_coil_write_multiple(
+            &mut connection,
+            1,
+            &[true, false],
             0x01,
             Duration::from_millis(50),
         )
