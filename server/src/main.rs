@@ -15,10 +15,9 @@
 //   tcp://<bind-address:port>          e.g. tcp://0.0.0.0:502
 //   rtu://<serial-path>:<baud-rate>    e.g. rtu:///dev/ttyUSB0:9600
 //
-// Scope (see handler.rs for detail): every register DataType can be read
-// (Read Holding Registers), but only U16 registers can be *written* over
-// the wire (Write Single/Multiple Register) — writing anything else still
-// gets a Modbus exception rather than a guessed wire format.
+// Every register DataType can be read and written over the wire now (see
+// handler.rs) — Write Single Register only ever carries one register
+// wide value, so wider types go through Write Multiple Registers instead.
 //
 // Also serves FC 43 / MEI 0x0E (Read Device Identification, Extended
 // access only) so a client can fetch this server's device-description.toml

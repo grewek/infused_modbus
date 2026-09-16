@@ -9,15 +9,17 @@
 // "TRANSACTION_END confirmation semantics", which is about the client
 // talking to a real external device).
 //
-// Scope of this first pass, matching the client's write_confirmation.rs:
-// only U16 registers are supported for *writes*. Reads now serve every
-// DataType (see handle_read) — the register store already holds properly
-// typed RegisterValues regardless of how they got there (locally staged or,
-// once wired, a future confirmed external write), so reading them back out
-// doesn't have the write side's word-order-hasn't-been-decided problem;
-// that problem was actually mem_layout, and it's decided now. Coils get the
-// same Read/Write treatment (Read Coils / Write Single Coil / Write
-// Multiple Coils); a coil is always read/write (see
+// Every DataType is served for both reads and writes now (see handle_read/
+// handle_write_single/handle_write_multiple_registers) — mem_layout was the
+// missing piece that made multi-register values a "we'd be guessing a wire
+// format" problem; that's decided now, so there's no more scope boundary
+// here beyond what each function code can physically carry (Write Single
+// Register can only ever hold one wire word, hence
+// DataType::register_count() == 1 types only — anything wider must go
+// through Write Multiple Registers, matching the client's own dispatch
+// choice in client::transaction_consumer). Coils get the same Read/Write
+// treatment (Read Coils / Write Single Coil / Write Multiple Coils); a coil
+// is always read/write (see
 // protocol::device_description::CoilDescription's own doc comment), so
 // unlike registers there's no access-right check on the write side.
 //
@@ -28,7 +30,7 @@
 // old or the fully-requested new one.
 
 use crate::device_identification::{build_objects, handle_read_device_identification};
-use fuse_fs::register_encoding::register_value_to_words;
+use fuse_fs::register_encoding::{register_value_from_words, register_value_to_words};
 use fuse_fs::{CoilStore, CoilValue, RegisterStore, RegisterValue};
 use protocol::device_description::{
     AccessRight, CoilDescription, DataType, MemLayout, RegisterDescription,
@@ -66,9 +68,11 @@ pub fn handle_request(
 
     match function_code {
         FUNCTION_CODE_READ_HOLDING_REGISTERS => handle_read(pdu, registers, store, mem_layout),
-        FUNCTION_CODE_WRITE_SINGLE_REGISTER => handle_write_single(pdu, registers, store),
+        FUNCTION_CODE_WRITE_SINGLE_REGISTER => {
+            handle_write_single(pdu, registers, store, mem_layout)
+        }
         FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS => {
-            handle_write_multiple_registers(pdu, registers, store)
+            handle_write_multiple_registers(pdu, registers, store, mem_layout)
         }
         FUNCTION_CODE_READ_COILS => handle_read_coils(pdu, coils, coil_store),
         FUNCTION_CODE_WRITE_SINGLE_COIL => handle_write_single_coil(pdu, coils, coil_store),
@@ -177,10 +181,18 @@ fn handle_read(
     ReadHoldingRegistersResponse { register_values }.encode()
 }
 
+// Write Single Register (FC6) can only ever carry exactly one wire word —
+// that's the function code's own shape, not a scope decision — so only
+// DataType::register_count() == 1 types (U8/I8/U16/I16) can be served this
+// way at all; anything wider must go through Write Multiple Registers
+// (FC16, handle_write_multiple_registers below), same as the client only
+// ever sends FC6 for a single one-register-wide value (see
+// client::transaction_consumer).
 fn handle_write_single(
     pdu: &[u8],
     registers: &[RegisterDescription],
     store: &Mutex<RegisterStore>,
+    mem_layout: MemLayout,
 ) -> Vec<u8> {
     let Ok(request) = WriteSingleRegisterRequest::decode(pdu) else {
         return ExceptionResponse {
@@ -192,24 +204,32 @@ fn handle_write_single(
 
     let register = registers.iter().find(|register| {
         register.address == request.register_address
-            && register.data_type == DataType::U16
+            && register.data_type.register_count() == 1
             && register.access == AccessRight::ReadWrite
     });
     match register {
         Some(register) => {
-            store.lock().unwrap_or_else(PoisonError::into_inner).set(
-                register.name.clone(),
-                RegisterValue::U16(request.register_value),
-            );
+            // Always Some: register_count() == 1 was just checked above,
+            // matching the one-word slice given here.
+            let value = register_value_from_words(
+                register.data_type,
+                &[request.register_value],
+                mem_layout,
+            )
+            .expect("a single word always decodes for a 1-register-wide DataType");
+            store
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .set(register.name.clone(), value);
             WriteSingleRegisterResponse {
                 register_address: request.register_address,
                 register_value: request.register_value,
             }
             .encode()
         }
-        // Covers three cases alike for now: no register at this address,
-        // an F32 register (unsupported wire format, same as the client
-        // side), and a read-only register — all "you can't write here".
+        // Covers three cases alike: no register at this address, a
+        // register too wide for FC6, and a read-only register — all "you
+        // can't write here [this way]".
         None => ExceptionResponse {
             function_code: FUNCTION_CODE_WRITE_SINGLE_REGISTER,
             exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
@@ -222,6 +242,7 @@ fn handle_write_multiple_registers(
     pdu: &[u8],
     registers: &[RegisterDescription],
     store: &Mutex<RegisterStore>,
+    mem_layout: MemLayout,
 ) -> Vec<u8> {
     let Ok(request) = WriteMultipleRegistersRequest::decode(pdu) else {
         return ExceptionResponse {
@@ -231,28 +252,48 @@ fn handle_write_multiple_registers(
         .encode();
     };
 
-    let mut resolved = Vec::with_capacity(request.register_values.len());
-    for (offset, &value) in request.register_values.iter().enumerate() {
-        let address = request.starting_address.wrapping_add(offset as u16);
-        match registers.iter().find(|register| {
-            register.address == address
-                && register.data_type == DataType::U16
-                && register.access == AccessRight::ReadWrite
-        }) {
-            Some(register) => resolved.push((register, value)),
-            None => {
-                return ExceptionResponse {
-                    function_code: FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
-                    exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-                }
-                .encode();
+    // Walk register-by-register, same shape as handle_read: only a
+    // register's own starting address is a valid boundary, so a value
+    // wider than one register consumes that many words from the request
+    // before moving on to the next register's address.
+    let mut resolved: Vec<(&RegisterDescription, RegisterValue)> = Vec::new();
+    let mut address = request.starting_address;
+    let end_address = request
+        .starting_address
+        .wrapping_add(request.register_values.len() as u16);
+    let mut offset = 0usize;
+    while address != end_address {
+        let Some(register) = registers.iter().find(|register| {
+            register.address == address && register.access == AccessRight::ReadWrite
+        }) else {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
             }
+            .encode();
+        };
+
+        let register_count = register.data_type.register_count() as usize;
+        if offset + register_count > request.register_values.len() {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+            .encode();
         }
+        let words = &request.register_values[offset..offset + register_count];
+        // Always Some: `words` is exactly `register_count` long by
+        // construction above.
+        let value = register_value_from_words(register.data_type, words, mem_layout)
+            .expect("word slice length always matches the register's own width");
+        resolved.push((register, value));
+        offset += register_count;
+        address = address.wrapping_add(register.data_type.register_count());
     }
 
     let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
     for (register, value) in resolved {
-        store.set(register.name.clone(), RegisterValue::U16(value));
+        store.set(register.name.clone(), value);
     }
     WriteMultipleRegistersResponse {
         starting_address: request.starting_address,
@@ -404,6 +445,12 @@ mod tests {
                 name: "Valve_2".to_string(),
                 address: 40011,
                 data_type: DataType::U16,
+                access: AccessRight::ReadWrite,
+            },
+            RegisterDescription {
+                name: "Precise_Value".to_string(),
+                address: 40020,
+                data_type: DataType::F64,
                 access: AccessRight::ReadWrite,
             },
         ]
@@ -664,6 +711,39 @@ mod tests {
     }
 
     #[test]
+    fn write_single_of_a_multi_register_type_returns_an_exception() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        // Precise_Value is F64 (4 registers wide) and read/write — Write
+        // Single Register (FC6) can only ever carry one wire word, so
+        // this can never succeed no matter the access rights.
+        let request = WriteSingleRegisterRequest {
+            register_address: 40020,
+            register_value: 0x3FF0,
+        }
+        .encode();
+
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_WRITE_SINGLE_REGISTER,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
+        assert_eq!(store.lock().unwrap().get("Precise_Value"), None);
+    }
+
+    #[test]
     fn write_multiple_registers_applies_all_and_echoes_the_request() {
         let store = Mutex::new(RegisterStore::new());
         let coil_store = Mutex::new(CoilStore::new());
@@ -697,6 +777,42 @@ mod tests {
         assert_eq!(
             store.lock().unwrap().get("Valve_2"),
             Some(RegisterValue::U16(22))
+        );
+    }
+
+    #[test]
+    fn write_multiple_registers_writes_a_correctly_assembled_multi_register_value() {
+        use fuse_fs::register_encoding::register_value_to_words;
+
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let words = register_value_to_words(RegisterValue::F64(3.5), MemLayout::Dcba);
+        let request = WriteMultipleRegistersRequest {
+            starting_address: 40020,
+            register_values: words,
+        }
+        .encode();
+
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Dcba,
+            "",
+        );
+
+        assert_eq!(
+            WriteMultipleRegistersResponse::decode(&response).unwrap(),
+            WriteMultipleRegistersResponse {
+                starting_address: 40020,
+                quantity: 4,
+            }
+        );
+        assert_eq!(
+            store.lock().unwrap().get("Precise_Value"),
+            Some(RegisterValue::F64(3.5))
         );
     }
 

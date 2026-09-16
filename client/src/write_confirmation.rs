@@ -2,40 +2,53 @@
 // turning the device's response back into a WriteStatus.
 
 use crate::connection::Connection;
+use fuse_fs::register_encoding::register_value_to_words;
 use fuse_fs::{CoilValue, RegisterValue, WriteStatus};
 use protocol::DecodeError;
-use protocol::device_description::{CoilDescription, DataType, RegisterDescription};
+use protocol::device_description::{CoilDescription, MemLayout, RegisterDescription};
 use protocol::pdu::{
     ExceptionResponse, WriteMultipleCoilsRequest, WriteMultipleRegistersRequest,
     WriteSingleCoilRequest, WriteSingleRegisterRequest,
 };
 use std::time::Duration;
 
-/// Encodes the Modbus request PDU for writing `value` to `register`.
+/// Encodes the Modbus request PDU for writing `value` to `register` as a
+/// Write Single Register (FC6) request.
 ///
-/// F32 is deliberately not supported yet: it would need to span two 16-bit
-/// registers, and which one carries the high/low word is a real,
-/// device-dependent decision (see CLAUDE.md) that hasn't been made — better
-/// to fail loudly than guess a wire format.
+/// Only registers whose `DataType::register_count()` is 1 (U8/I8/U16/I16)
+/// can go through FC6 at all — that's the function code's own shape, not a
+/// scope decision: it physically carries exactly one wire word. A wider
+/// value needs Write Multiple Registers (FC16) instead — see
+/// `client::transaction_consumer`, which is the one place that decides
+/// which function code a given batch needs and never calls this for a
+/// register wider than one slot.
 pub fn encode_write_request(
     register: &RegisterDescription,
     value: RegisterValue,
+    mem_layout: MemLayout,
 ) -> Result<Vec<u8>, String> {
-    match (register.data_type, value) {
-        (DataType::U16, RegisterValue::U16(register_value)) => Ok(WriteSingleRegisterRequest {
-            register_address: register.address,
-            register_value,
-        }
-        .encode()),
-        (DataType::F32, RegisterValue::F32(_)) => Err(format!(
-            "register {}: F32 writes not yet supported (32-bit word order over two registers hasn't been decided)",
-            register.name
-        )),
-        (data_type, value) => Err(format!(
-            "register {}: expected a {data_type:?} value but got {value:?}",
-            register.name
-        )),
+    if register.data_type.register_count() != 1 {
+        return Err(format!(
+            "register {}: {:?} needs {} registers, Write Single Register can't carry it",
+            register.name,
+            register.data_type,
+            register.data_type.register_count()
+        ));
     }
+    if value.data_type() != register.data_type {
+        return Err(format!(
+            "register {}: expected a {:?} value but got a {:?} one",
+            register.name,
+            register.data_type,
+            value.data_type()
+        ));
+    }
+    let words = register_value_to_words(value, mem_layout);
+    Ok(WriteSingleRegisterRequest {
+        register_address: register.address,
+        register_value: words[0],
+    }
+    .encode())
 }
 
 /// Encodes the Modbus request PDU for writing `value` to `coil`. Unlike
@@ -76,10 +89,11 @@ pub async fn confirm_write(
     connection: &mut Connection,
     register: &RegisterDescription,
     value: RegisterValue,
+    mem_layout: MemLayout,
     unit_id: u8,
     timeout: Duration,
 ) -> WriteStatus {
-    let pdu = match encode_write_request(register, value) {
+    let pdu = match encode_write_request(register, value, mem_layout) {
         Ok(pdu) => pdu,
         Err(reason) => return WriteStatus::Failed(reason),
     };
@@ -152,7 +166,7 @@ pub async fn confirm_coil_write_multiple(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::device_description::AccessRight;
+    use protocol::device_description::{AccessRight, DataType};
 
     fn u16_register() -> RegisterDescription {
         RegisterDescription {
@@ -187,19 +201,36 @@ mod tests {
 
     #[test]
     fn encode_write_request_builds_write_single_register_pdu_for_u16() {
-        let pdu = encode_write_request(&u16_register(), RegisterValue::U16(1)).unwrap();
+        let pdu =
+            encode_write_request(&u16_register(), RegisterValue::U16(1), MemLayout::Abcd).unwrap();
         assert_eq!(pdu, vec![0x06, 0x9C, 0x41, 0x00, 0x01]);
     }
 
     #[test]
-    fn encode_write_request_rejects_f32() {
-        let result = encode_write_request(&f32_register(), RegisterValue::F32(3.5));
+    fn encode_write_request_builds_write_single_register_pdu_for_i16() {
+        let register = RegisterDescription {
+            name: "Signed_Setpoint".to_string(),
+            address: 40003,
+            data_type: DataType::I16,
+            access: AccessRight::ReadWrite,
+        };
+        let pdu = encode_write_request(&register, RegisterValue::I16(-5), MemLayout::Abcd).unwrap();
+        assert_eq!(pdu, vec![0x06, 0x9C, 0x43, 0xFF, 0xFB]);
+    }
+
+    #[test]
+    fn encode_write_request_rejects_registers_wider_than_one_slot() {
+        // F32 needs 2 registers — Write Single Register can only ever
+        // carry one wire word, regardless of the value's own correctness.
+        let result =
+            encode_write_request(&f32_register(), RegisterValue::F32(3.5), MemLayout::Abcd);
         assert!(result.is_err());
     }
 
     #[test]
     fn encode_write_request_rejects_mismatched_value_type() {
-        let result = encode_write_request(&u16_register(), RegisterValue::F32(3.5));
+        let result =
+            encode_write_request(&u16_register(), RegisterValue::F32(3.5), MemLayout::Abcd);
         assert!(result.is_err());
     }
 
@@ -270,6 +301,7 @@ mod tests {
             &mut connection,
             &u16_register(),
             RegisterValue::U16(1),
+            MemLayout::Abcd,
             0x01,
             Duration::from_secs(1),
         )
@@ -315,6 +347,7 @@ mod tests {
             &mut connection,
             &u16_register(),
             RegisterValue::U16(1),
+            MemLayout::Abcd,
             0x01,
             Duration::from_secs(1),
         )
@@ -332,6 +365,7 @@ mod tests {
             &mut connection,
             &u16_register(),
             RegisterValue::U16(1),
+            MemLayout::Abcd,
             0x01,
             Duration::from_millis(50),
         )
@@ -341,13 +375,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirm_write_returns_failed_without_sending_for_unsupported_types() {
+    async fn confirm_write_returns_failed_without_sending_for_a_register_wider_than_one_slot() {
         let (mut connection, _device) = connected_pair().await;
 
         let status = confirm_write(
             &mut connection,
             &f32_register(),
             RegisterValue::F32(3.5),
+            MemLayout::Abcd,
             0x01,
             Duration::from_secs(1),
         )

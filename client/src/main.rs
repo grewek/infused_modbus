@@ -20,14 +20,13 @@
 //   tcp://<address:port>                e.g. tcp://127.0.0.1:502
 //   rtu://<serial-path>:<baud-rate>      e.g. rtu:///dev/ttyUSB0:9600
 //
-// Scope of this first pass (see client/src/write_confirmation.rs,
-// transaction_consumer.rs, and polling.rs for more detail): one persistent
-// connection (shared between polling and writes) with no reconnect logic,
-// and U16 registers only — F32 is rejected with a clear WriteStatus::Failed
-// / logged and skipped rather than guessing a wire format, on both the
-// write and the poll-read side. RTU's serial parameters beyond baud rate
-// (data bits, parity, stop bits) aren't configurable yet — this uses
-// tokio-serial's defaults (8 data bits, no parity, 1 stop bit).
+// Every register DataType is read (polling.rs) and written
+// (write_confirmation.rs/transaction_consumer.rs) over the wire now, honoring
+// the device description's mem_layout for anything wider than one register.
+// One persistent connection is shared between polling and writes, with no
+// reconnect logic. RTU's serial parameters beyond baud rate (data bits,
+// parity, stop bits) aren't configurable yet — this uses tokio-serial's
+// defaults (8 data bits, no parity, 1 stop bit).
 
 use client::connection::Connection;
 use client::device_identification::fetch_device_description;
@@ -154,6 +153,7 @@ fn main() {
             &consumer_coils,
             &consumer_coil_store,
             &consumer_report,
+            mem_layout,
             transaction_receiver,
             unit_id,
             WRITE_TIMEOUT,

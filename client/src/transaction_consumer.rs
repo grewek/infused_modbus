@@ -22,26 +22,31 @@
 // Staged writes of the same kind (register or coil) whose addresses turn
 // out to be contiguous are batched into one Write Multiple Registers/Coils
 // request instead of one Write Single request per name — same grouping
-// idea as `client::polling`'s read batching, just for writes. A batch of
-// exactly one entry still goes out as a Write Single request rather than a
-// one-element Write Multiple one, to keep behaving the same as before this
-// batching existed for the (overwhelmingly common) single-value-transaction
-// case, and for compatibility with devices that don't implement Write
-// Multiple. Modbus gives no finer-grained outcome than "the whole batched
-// request succeeded or failed" — there is no way to know which specific
-// register/coil within a failed batch caused the rejection — so every name
-// in a failed batch is reported `Failed` alike (confirmed with the project
-// owner rather than guessed at).
+// idea as `client::polling`'s read batching, just for writes. A register
+// batch whose total wire-word quantity is exactly 1 (a single U8/I8/U16/I16
+// register, alone) still goes out as a Write Single Register request
+// rather than a one-word Write Multiple one — both because Write Single is
+// the only function code that can carry a lone value narrower than a full
+// batch, and to keep behaving the same as before batching existed for the
+// (overwhelmingly common) single-value-transaction case. Anything wider
+// than one register (U24 and up) can never go through Write Single at
+// all — see write_confirmation.rs's own note on that. Modbus gives no
+// finer-grained outcome than "the whole batched request succeeded or
+// failed" — there is no way to know which specific register/coil within a
+// failed batch caused the rejection — so every name in a failed batch is
+// reported `Failed` alike (confirmed with the project owner rather than
+// guessed at).
 
 use crate::batching::{Batch, build_batches};
 use crate::connection::Connection;
 use crate::write_confirmation::{
     confirm_coil_write, confirm_coil_write_multiple, confirm_write, confirm_write_multiple,
 };
+use fuse_fs::register_encoding::register_value_to_words;
 use fuse_fs::{
     CoilStore, CoilValue, RegisterStore, RegisterValue, StagedValue, WriteReport, WriteStatus,
 };
-use protocol::device_description::{CoilDescription, RegisterDescription};
+use protocol::device_description::{CoilDescription, MemLayout, RegisterDescription};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -58,21 +63,20 @@ const MAX_REGISTER_WRITE_BATCH_SIZE: u16 = 123;
 // may carry (function code 0x0F).
 const MAX_COIL_WRITE_BATCH_SIZE: u16 = 1968;
 
-type RegisterWriteBatch = Batch<(RegisterDescription, u16)>;
+type RegisterWriteBatch = Batch<(RegisterDescription, RegisterValue)>;
 type CoilWriteBatch = Batch<(CoilDescription, bool)>;
 
 /// Groups staged (register, value) pairs by contiguous address — see
 /// `crate::batching` for the grouping algorithm itself, shared with
-/// `client::polling`'s read batching. Every entry here is U16 (the write
-/// path's only supported type so far — see the module doc comment), so
-/// each one is always exactly one wire slot wide.
+/// `client::polling`'s read batching. Each entry counts as its own
+/// `DataType::register_count()` wire words, same as the read side.
 fn build_register_write_batches(
-    entries: Vec<(RegisterDescription, u16)>,
+    entries: Vec<(RegisterDescription, RegisterValue)>,
 ) -> Vec<RegisterWriteBatch> {
     build_batches(
         entries,
         |(register, _)| register.address,
-        |_| 1,
+        |(register, _)| register.data_type.register_count(),
         MAX_REGISTER_WRITE_BATCH_SIZE,
     )
 }
@@ -96,23 +100,39 @@ pub fn run_transaction_consumer(
     coils: &[CoilDescription],
     coil_store: &Arc<Mutex<CoilStore>>,
     report: &Arc<Mutex<WriteReport>>,
+    mem_layout: MemLayout,
     transaction_receiver: mpsc::Receiver<HashMap<String, StagedValue>>,
     unit_id: u8,
     timeout: Duration,
 ) {
     for transaction in transaction_receiver {
-        let mut register_entries: Vec<(RegisterDescription, u16)> = Vec::new();
+        let mut register_entries: Vec<(RegisterDescription, RegisterValue)> = Vec::new();
         let mut coil_entries: Vec<(CoilDescription, bool)> = Vec::new();
 
         // Resolve every staged name against the known registers/coils
-        // first, reporting anything unknown or not yet writable over the
-        // wire (anything but U16 registers, for now) immediately — only
-        // what's left gets batched below.
+        // first, reporting anything unknown or mismatched immediately —
+        // only what's left gets batched below. A type mismatch shouldn't
+        // actually happen (fuse_fs always stages a value parsed against
+        // the register's own declared type), but is worth checking rather
+        // than assuming.
         for (name, value) in transaction {
             match value {
-                StagedValue::Register(RegisterValue::U16(value)) => {
+                StagedValue::Register(value) => {
                     match registers.iter().find(|register| register.name == name) {
-                        Some(register) => register_entries.push((register.clone(), value)),
+                        Some(register) if register.data_type == value.data_type() => {
+                            register_entries.push((register.clone(), value));
+                        }
+                        Some(register) => {
+                            let reason = format!(
+                                "register {name}: expected a {:?} value but got a {:?} one",
+                                register.data_type,
+                                value.data_type()
+                            );
+                            report
+                                .lock()
+                                .unwrap()
+                                .set(name, WriteStatus::Failed(reason));
+                        }
                         None => {
                             let reason = format!("unknown register: {name}");
                             report
@@ -121,18 +141,6 @@ pub fn run_transaction_consumer(
                                 .set(name, WriteStatus::Failed(reason));
                         }
                     }
-                }
-                // Every other RegisterValue type (F32 and the wider set
-                // added alongside it) has no wire write path yet — see
-                // write_confirmation.rs's own scope note.
-                StagedValue::Register(_) => {
-                    report.lock().unwrap().set(
-                        name,
-                        WriteStatus::Failed(
-                            "only u16 register writes are supported over the wire so far"
-                                .to_string(),
-                        ),
-                    );
                 }
                 StagedValue::Coil(value) => match coils.iter().find(|coil| coil.name == name) {
                     Some(coil) => coil_entries.push((coil.clone(), value.0)),
@@ -148,20 +156,31 @@ pub fn run_transaction_consumer(
         }
 
         for batch in build_register_write_batches(register_entries) {
-            let status = if let [(register, value)] = batch.items.as_slice() {
+            // A batch that's exactly one wire word wide is always a
+            // single one-register-wide value (U8/I8/U16/I16) — anything
+            // wider, or more than one register batched together, has to
+            // go through Write Multiple Registers instead (see the module
+            // doc comment).
+            let status = if batch.quantity() == 1 {
+                let (register, value) = &batch.items[0];
                 handle.block_on(async {
                     let mut connection = connection.lock().await;
                     confirm_write(
                         &mut connection,
                         register,
-                        RegisterValue::U16(*value),
+                        *value,
+                        mem_layout,
                         unit_id,
                         timeout,
                     )
                     .await
                 })
             } else {
-                let values: Vec<u16> = batch.items.iter().map(|(_, value)| *value).collect();
+                let values: Vec<u16> = batch
+                    .items
+                    .iter()
+                    .flat_map(|(_, value)| register_value_to_words(*value, mem_layout))
+                    .collect();
                 handle.block_on(async {
                     let mut connection = connection.lock().await;
                     confirm_write_multiple(
@@ -177,10 +196,7 @@ pub fn run_transaction_consumer(
 
             for (register, value) in &batch.items {
                 if status == WriteStatus::Ok {
-                    store
-                        .lock()
-                        .unwrap()
-                        .set(register.name.clone(), RegisterValue::U16(*value));
+                    store.lock().unwrap().set(register.name.clone(), *value);
                 }
                 report
                     .lock()
@@ -265,6 +281,15 @@ mod tests {
         }
     }
 
+    fn f32_register() -> RegisterDescription {
+        RegisterDescription {
+            name: "Flow_Rate".to_string(),
+            address: 40020,
+            data_type: DataType::F32,
+            access: AccessRight::ReadWrite,
+        }
+    }
+
     async fn connected_pair() -> (Connection, tokio::net::TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -313,6 +338,7 @@ mod tests {
                 &coils,
                 &consumer_coil_store,
                 &consumer_report,
+                MemLayout::Abcd,
                 transaction_receiver,
                 0x01,
                 Duration::from_secs(1),
@@ -389,6 +415,7 @@ mod tests {
                 &coils,
                 &consumer_coil_store,
                 &consumer_report,
+                MemLayout::Abcd,
                 transaction_receiver,
                 0x01,
                 Duration::from_secs(1),
@@ -437,6 +464,7 @@ mod tests {
                 &coils,
                 &consumer_coil_store,
                 &consumer_report,
+                MemLayout::Abcd,
                 transaction_receiver,
                 0x01,
                 Duration::from_secs(1),
@@ -503,6 +531,7 @@ mod tests {
                 &coils,
                 &consumer_coil_store,
                 &consumer_report,
+                MemLayout::Abcd,
                 transaction_receiver,
                 0x01,
                 Duration::from_secs(1),
@@ -582,6 +611,7 @@ mod tests {
                 &coils,
                 &consumer_coil_store,
                 &consumer_report,
+                MemLayout::Abcd,
                 transaction_receiver,
                 0x01,
                 Duration::from_secs(1),
@@ -669,6 +699,7 @@ mod tests {
                 &coils,
                 &consumer_coil_store,
                 &consumer_report,
+                MemLayout::Abcd,
                 transaction_receiver,
                 0x01,
                 Duration::from_secs(1),
@@ -751,6 +782,7 @@ mod tests {
                 &coils,
                 &consumer_coil_store,
                 &consumer_report,
+                MemLayout::Abcd,
                 transaction_receiver,
                 0x01,
                 Duration::from_secs(1),
@@ -837,6 +869,7 @@ mod tests {
                 &coils,
                 &consumer_coil_store,
                 &consumer_report,
+                MemLayout::Abcd,
                 transaction_receiver,
                 0x01,
                 Duration::from_secs(1),
@@ -868,5 +901,142 @@ mod tests {
             report.lock().unwrap().get("Alarm_Reset"),
             Some(WriteStatus::Failed(_))
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lone_wide_register_is_written_via_write_multiple_registers_not_write_single() {
+        let (connection, mut device) = connected_pair().await;
+        let (transaction_sender, transaction_receiver) = mpsc::channel();
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let registers = vec![f32_register()];
+        let coils: Vec<CoilDescription> = vec![];
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut header)
+                .await
+                .unwrap();
+            // A single F32 register (2 registers wide) alone must still go
+            // out as a Write Multiple Registers PDU (10 bytes: function
+            // code + address + quantity + byte count + 2 values), not a
+            // 5-byte Write Single Register one — if this read_exact reads
+            // the wrong length, the test hangs instead of failing cleanly,
+            // which is itself proof the wrong function code was used.
+            let mut pdu = vec![0u8; 10];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut pdu)
+                .await
+                .unwrap();
+            let response_pdu = protocol::pdu::WriteMultipleRegistersResponse {
+                starting_address: 40020,
+                quantity: 2,
+            }
+            .encode();
+            let mut response = header;
+            let length = (response_pdu.len() + 1) as u16;
+            response[4..6].copy_from_slice(&length.to_be_bytes());
+            response.extend_from_slice(&response_pdu);
+            tokio::io::AsyncWriteExt::write_all(&mut device, &response)
+                .await
+                .unwrap();
+        });
+
+        let handle = Handle::current();
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let consumer_store = Arc::clone(&store);
+        let consumer_coil_store = Arc::clone(&coil_store);
+        let consumer_report = Arc::clone(&report);
+        let consumer_thread = std::thread::spawn(move || {
+            run_transaction_consumer(
+                &handle,
+                &connection,
+                &registers,
+                &consumer_store,
+                &coils,
+                &consumer_coil_store,
+                &consumer_report,
+                MemLayout::Abcd,
+                transaction_receiver,
+                0x01,
+                Duration::from_secs(1),
+            );
+        });
+
+        let mut transaction = HashMap::new();
+        transaction.insert(
+            "Flow_Rate".to_string(),
+            StagedValue::Register(RegisterValue::F32(3.5)),
+        );
+        transaction_sender.send(transaction).unwrap();
+        drop(transaction_sender);
+
+        device_task.await.unwrap();
+        consumer_thread.join().unwrap();
+
+        assert_eq!(
+            store.lock().unwrap().get("Flow_Rate"),
+            Some(RegisterValue::F32(3.5))
+        );
+        assert_eq!(
+            report.lock().unwrap().get("Flow_Rate"),
+            Some(&WriteStatus::Ok)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_type_mismatched_register_is_reported_as_failed_without_sending_anything() {
+        let (connection, device) = connected_pair().await;
+        let (transaction_sender, transaction_receiver) = mpsc::channel();
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        // Stop_Process is declared U16, but the staged value is F32 — this
+        // shouldn't happen via real FUSE staging (which always parses
+        // against the register's own type), but is checked defensively
+        // rather than trusted blindly.
+        let registers = vec![u16_register()];
+        let coils: Vec<CoilDescription> = vec![];
+
+        let handle = Handle::current();
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let consumer_store = Arc::clone(&store);
+        let consumer_coil_store = Arc::clone(&coil_store);
+        let consumer_report = Arc::clone(&report);
+        let consumer_thread = std::thread::spawn(move || {
+            run_transaction_consumer(
+                &handle,
+                &connection,
+                &registers,
+                &consumer_store,
+                &coils,
+                &consumer_coil_store,
+                &consumer_report,
+                MemLayout::Abcd,
+                transaction_receiver,
+                0x01,
+                Duration::from_secs(1),
+            );
+        });
+
+        let mut transaction = HashMap::new();
+        transaction.insert(
+            "Stop_Process".to_string(),
+            StagedValue::Register(RegisterValue::F32(3.5)),
+        );
+        transaction_sender.send(transaction).unwrap();
+        drop(transaction_sender);
+
+        consumer_thread.join().unwrap();
+
+        assert_eq!(store.lock().unwrap().get("Stop_Process"), None);
+        assert!(matches!(
+            report.lock().unwrap().get("Stop_Process"),
+            Some(WriteStatus::Failed(_))
+        ));
+
+        // Nothing was ever sent to the "device" — dropping it without a
+        // pending read (which would panic on EOF) confirms that.
+        drop(device);
     }
 }
