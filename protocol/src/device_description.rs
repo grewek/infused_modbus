@@ -35,9 +35,21 @@ pub struct RegisterDescription {
     pub access: AccessRight,
 }
 
+// Coils have no `data_type` (always 1 bit) and no `access` (assumed always
+// read/write for now, since that's what the Modbus spec's own coil object
+// is — see CLAUDE.md's FUSE layout section for the reasoning). Both are
+// deliberately not modeled as fields yet; add `access` only once making it
+// configurable is an actual, concrete need.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoilDescription {
+    pub name: String,
+    pub address: u16,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceDescription {
     pub registers: Vec<RegisterDescription>,
+    pub coils: Vec<CoilDescription>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,15 +60,35 @@ struct RawRegisterEntry {
     access: AccessRight,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct RawRegisterSection {
     base_address: u16,
     entries: Vec<RawRegisterEntry>,
 }
 
 #[derive(Debug, Deserialize)]
+struct RawCoilEntry {
+    name: String,
+    offset: u16,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawCoilSection {
+    base_address: u16,
+    entries: Vec<RawCoilEntry>,
+}
+
+// `registers`/`coils` are each optional at the top level (default: no
+// entries) so a device that only has one of the two doesn't need to spell
+// out an empty section for the other. Once a section *is* present, though,
+// its own `base_address` stays a required field — see `DeviceDescription`'s
+// existing `parse_rejects_missing_base_address` test.
+#[derive(Debug, Default, Deserialize)]
 struct RawDeviceDescription {
+    #[serde(default)]
     registers: RawRegisterSection,
+    #[serde(default)]
+    coils: RawCoilSection,
 }
 
 #[derive(Debug)]
@@ -79,7 +111,7 @@ impl fmt::Display for DeviceDescriptionError {
                 offset,
             } => write!(
                 formatter,
-                "register '{name}' address overflows u16: base_address {base_address} + offset {offset}"
+                "'{name}' address overflows u16: base_address {base_address} + offset {offset}"
             ),
         }
     }
@@ -93,35 +125,64 @@ impl From<toml::de::Error> for DeviceDescriptionError {
     }
 }
 
+// Resolves `base_address + offset` for every entry in a section, sharing the
+// same overflow handling regardless of whether the caller is registers or
+// coils.
+fn resolve_addresses<Entry>(
+    base_address: u16,
+    entries: Vec<Entry>,
+    offset_of: impl Fn(&Entry) -> u16,
+    name_of: impl Fn(&Entry) -> String,
+) -> Result<Vec<(Entry, u16)>, DeviceDescriptionError> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let offset = offset_of(&entry);
+            let address = base_address.checked_add(offset).ok_or_else(|| {
+                DeviceDescriptionError::AddressOverflow {
+                    name: name_of(&entry),
+                    base_address,
+                    offset,
+                }
+            })?;
+            Ok((entry, address))
+        })
+        .collect()
+}
+
 impl DeviceDescription {
     pub fn parse(toml_source: &str) -> Result<Self, DeviceDescriptionError> {
         let raw: RawDeviceDescription = toml::from_str(toml_source)?;
-        let RawRegisterSection {
-            base_address,
-            entries,
-        } = raw.registers;
 
-        let registers = entries
-            .into_iter()
-            .map(|entry| {
-                let address = base_address.checked_add(entry.offset).ok_or(
-                    DeviceDescriptionError::AddressOverflow {
-                        name: entry.name.clone(),
-                        base_address,
-                        offset: entry.offset,
-                    },
-                )?;
+        let registers = resolve_addresses(
+            raw.registers.base_address,
+            raw.registers.entries,
+            |entry: &RawRegisterEntry| entry.offset,
+            |entry: &RawRegisterEntry| entry.name.clone(),
+        )?
+        .into_iter()
+        .map(|(entry, address)| RegisterDescription {
+            name: entry.name,
+            address,
+            data_type: entry.data_type,
+            access: entry.access,
+        })
+        .collect();
 
-                Ok(RegisterDescription {
-                    name: entry.name,
-                    address,
-                    data_type: entry.data_type,
-                    access: entry.access,
-                })
-            })
-            .collect::<Result<Vec<_>, DeviceDescriptionError>>()?;
+        let coils = resolve_addresses(
+            raw.coils.base_address,
+            raw.coils.entries,
+            |entry: &RawCoilEntry| entry.offset,
+            |entry: &RawCoilEntry| entry.name.clone(),
+        )?
+        .into_iter()
+        .map(|(entry, address)| CoilDescription {
+            name: entry.name,
+            address,
+        })
+        .collect();
 
-        Ok(DeviceDescription { registers })
+        Ok(DeviceDescription { registers, coils })
     }
 }
 
@@ -146,6 +207,17 @@ mod tests {
             offset = 2
             data_type = "f32"
             access = "read_write"
+
+            [coils]
+            base_address = 0
+
+            [[coils.entries]]
+            name = "Motor_Running"
+            offset = 1
+
+            [[coils.entries]]
+            name = "Alarm_Active"
+            offset = 2
         "#;
 
         let description = DeviceDescription::parse(toml_source).unwrap();
@@ -167,8 +239,53 @@ mod tests {
                         access: AccessRight::ReadWrite,
                     },
                 ],
+                coils: vec![
+                    CoilDescription {
+                        name: "Motor_Running".to_string(),
+                        address: 1,
+                    },
+                    CoilDescription {
+                        name: "Alarm_Active".to_string(),
+                        address: 2,
+                    },
+                ],
             }
         );
+    }
+
+    #[test]
+    fn parse_treats_an_absent_coils_section_as_no_coils() {
+        let toml_source = r#"
+            [registers]
+            base_address = 40000
+
+            [[registers.entries]]
+            name = "Tank_Temperature"
+            offset = 1
+            data_type = "u16"
+            access = "read_only"
+        "#;
+
+        let description = DeviceDescription::parse(toml_source).unwrap();
+
+        assert!(description.coils.is_empty());
+    }
+
+    #[test]
+    fn parse_treats_an_absent_registers_section_as_no_registers() {
+        let toml_source = r#"
+            [coils]
+            base_address = 0
+
+            [[coils.entries]]
+            name = "Motor_Running"
+            offset = 1
+        "#;
+
+        let description = DeviceDescription::parse(toml_source).unwrap();
+
+        assert!(description.registers.is_empty());
+        assert_eq!(description.coils.len(), 1);
     }
 
     #[test]
@@ -194,6 +311,30 @@ mod tests {
             offset = 1
             data_type = "u16"
             access = "read_only"
+        "#;
+
+        assert!(DeviceDescription::parse(toml_source).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_coil_missing_base_address() {
+        let toml_source = r#"
+            [[coils.entries]]
+            name = "Motor_Running"
+            offset = 1
+        "#;
+
+        assert!(DeviceDescription::parse(toml_source).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_coil_missing_offset() {
+        let toml_source = r#"
+            [coils]
+            base_address = 0
+
+            [[coils.entries]]
+            name = "Motor_Running"
         "#;
 
         assert!(DeviceDescription::parse(toml_source).is_err());
@@ -249,6 +390,29 @@ mod tests {
             offset = 1
             data_type = "u16"
             access = "read_only"
+        "#;
+
+        let error = DeviceDescription::parse(toml_source).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeviceDescriptionError::AddressOverflow {
+                base_address: 65535,
+                offset: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_coil_address_overflow() {
+        let toml_source = r#"
+            [coils]
+            base_address = 65535
+
+            [[coils.entries]]
+            name = "Motor_Running"
+            offset = 1
         "#;
 
         let error = DeviceDescription::parse(toml_source).unwrap_err();
