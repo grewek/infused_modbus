@@ -565,7 +565,24 @@ impl WriteMultipleCoilsRequest {
             });
         }
         let starting_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
-        let byte_count = bytes[WRITE_MULTIPLE_BYTE_COUNT_BYTE] as usize;
+        let quantity = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
+        let byte_count = bytes[WRITE_MULTIPLE_BYTE_COUNT_BYTE];
+        // Unlike registers (2 wire bytes per value, so byte_count alone
+        // pins down the exact count), coils are packed 8-to-a-byte: any
+        // quantity from (byte_count-1)*8+1 up to byte_count*8 encodes to
+        // the same byte_count, with the rest of the last byte as
+        // meaningless padding. The wire's own quantity field is the only
+        // way to know how many of those bits are real, so it must agree
+        // with byte_count exactly (per spec, byte_count = ceil(quantity /
+        // 8)) rather than being ignored in favor of just trusting
+        // byte_count and exposing padding bits as if they were real data.
+        if byte_count as usize != (quantity as usize).div_ceil(8) {
+            return Err(DecodeError::QuantityByteCountMismatch {
+                quantity,
+                byte_count,
+            });
+        }
+        let byte_count = byte_count as usize;
         if bytes.len() < WRITE_MULTIPLE_VALUES_START + byte_count {
             return Err(DecodeError::TooShort);
         }
@@ -573,6 +590,7 @@ impl WriteMultipleCoilsRequest {
             [WRITE_MULTIPLE_VALUES_START..(WRITE_MULTIPLE_VALUES_START + byte_count)]
             .iter()
             .flat_map(|&byte| (0..8).map(move |bit| byte & (1 << bit) != 0))
+            .take(quantity as usize)
             .collect();
         Ok(Self {
             starting_address,
@@ -1302,19 +1320,31 @@ mod tests {
 
     #[test]
     fn write_multiple_coils_request_round_trip() {
-        // 9 coils, not a multiple of 8, so decode pads the last byte back
-        // out to a full 16 bits — the request must already carry those
-        // trailing `false` padding bits for the round trip to match.
+        // 9 coils, not a multiple of 8 — decode must trim the last byte's
+        // padding bits back off using the wire's own quantity field,
+        // rather than exposing all 16 raw bits from byte_count.
         let request = WriteMultipleCoilsRequest {
             starting_address: 0x0013,
-            coil_values: vec![
-                true, false, true, true, false, false, false, true, true, false, false, false,
-                false, false, false, false,
-            ],
+            coil_values: vec![true, false, true, true, false, false, false, true, true],
         };
         let encoded = request.encode();
         let decoded = WriteMultipleCoilsRequest::decode(&encoded).unwrap();
         assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn write_multiple_coils_request_decode_rejects_quantity_byte_count_mismatch() {
+        // quantity = 9 (needs byte_count 2) but byte_count claims 3 —
+        // decode must not silently trust byte_count and expose an extra,
+        // meaningless byte of "coil" data.
+        let bytes = [0x0F, 0x00, 0x13, 0x00, 0x09, 0x03, 0x8D, 0x01, 0x00];
+        assert_eq!(
+            WriteMultipleCoilsRequest::decode(&bytes),
+            Err(DecodeError::QuantityByteCountMismatch {
+                quantity: 9,
+                byte_count: 3
+            })
+        );
     }
 
     #[test]

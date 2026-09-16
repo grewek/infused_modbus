@@ -10,13 +10,17 @@
 // talking to a real external device).
 //
 // Scope of this first pass, matching the client's write_confirmation.rs:
-// only U16 registers are supported for both reads and writes, and only
-// Read Holding Registers / Write Single Register — Write Multiple
-// Registers falls through to the same "illegal function" handling as any
-// other unimplemented function code. Coils get the same Read/Write Single
-// treatment (Read Coils / Write Single Coil); a coil is always read/write
-// (see protocol::device_description::CoilDescription's own doc comment),
-// so unlike registers there's no access-right check on the write side.
+// only U16 registers are supported for reads/writes. Coils get the same
+// Read/Write treatment (Read Coils / Write Single Coil / Write Multiple
+// Coils); a coil is always read/write (see
+// protocol::device_description::CoilDescription's own doc comment), so
+// unlike registers there's no access-right check on the write side.
+//
+// Both "write multiple" handlers validate every address in the request
+// before applying anything — a bad address partway through the batch
+// rejects the whole request with no partial write, rather than applying
+// a prefix and leaving the store in a state that doesn't match either the
+// old or the fully-requested new one.
 
 use crate::device_identification::{build_objects, handle_read_device_identification};
 use fuse_fs::{CoilStore, CoilValue, RegisterStore, RegisterValue};
@@ -24,11 +28,13 @@ use protocol::device_description::{AccessRight, CoilDescription, DataType, Regis
 use protocol::pdu::{
     EXCEPTION_ILLEGAL_DATA_ADDRESS, EXCEPTION_ILLEGAL_DATA_VALUE, EXCEPTION_ILLEGAL_FUNCTION,
     ExceptionResponse, FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT, FUNCTION_CODE_READ_COILS,
-    FUNCTION_CODE_READ_HOLDING_REGISTERS, FUNCTION_CODE_WRITE_SINGLE_COIL,
+    FUNCTION_CODE_READ_HOLDING_REGISTERS, FUNCTION_CODE_WRITE_MULTIPLE_COILS,
+    FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS, FUNCTION_CODE_WRITE_SINGLE_COIL,
     FUNCTION_CODE_WRITE_SINGLE_REGISTER, ReadCoilsRequest, ReadCoilsResponse,
     ReadDeviceIdentificationRequest, ReadHoldingRegistersRequest, ReadHoldingRegistersResponse,
-    WriteSingleCoilRequest, WriteSingleCoilResponse, WriteSingleRegisterRequest,
-    WriteSingleRegisterResponse,
+    WriteMultipleCoilsRequest, WriteMultipleCoilsResponse, WriteMultipleRegistersRequest,
+    WriteMultipleRegistersResponse, WriteSingleCoilRequest, WriteSingleCoilResponse,
+    WriteSingleRegisterRequest, WriteSingleRegisterResponse,
 };
 use std::sync::{Mutex, PoisonError};
 
@@ -52,8 +58,12 @@ pub fn handle_request(
     match function_code {
         FUNCTION_CODE_READ_HOLDING_REGISTERS => handle_read(pdu, registers, store),
         FUNCTION_CODE_WRITE_SINGLE_REGISTER => handle_write_single(pdu, registers, store),
+        FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS => {
+            handle_write_multiple_registers(pdu, registers, store)
+        }
         FUNCTION_CODE_READ_COILS => handle_read_coils(pdu, coils, coil_store),
         FUNCTION_CODE_WRITE_SINGLE_COIL => handle_write_single_coil(pdu, coils, coil_store),
+        FUNCTION_CODE_WRITE_MULTIPLE_COILS => handle_write_multiple_coils(pdu, coils, coil_store),
         FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT => {
             handle_encapsulated_interface_transport(pdu, toml_source)
         }
@@ -170,6 +180,49 @@ fn handle_write_single(
     }
 }
 
+fn handle_write_multiple_registers(
+    pdu: &[u8],
+    registers: &[RegisterDescription],
+    store: &Mutex<RegisterStore>,
+) -> Vec<u8> {
+    let Ok(request) = WriteMultipleRegistersRequest::decode(pdu) else {
+        return ExceptionResponse {
+            function_code: FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
+            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+        }
+        .encode();
+    };
+
+    let mut resolved = Vec::with_capacity(request.register_values.len());
+    for (offset, &value) in request.register_values.iter().enumerate() {
+        let address = request.starting_address.wrapping_add(offset as u16);
+        match registers.iter().find(|register| {
+            register.address == address
+                && register.data_type == DataType::U16
+                && register.access == AccessRight::ReadWrite
+        }) {
+            Some(register) => resolved.push((register, value)),
+            None => {
+                return ExceptionResponse {
+                    function_code: FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
+                    exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+                }
+                .encode();
+            }
+        }
+    }
+
+    let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
+    for (register, value) in resolved {
+        store.set(register.name.clone(), RegisterValue::U16(value));
+    }
+    WriteMultipleRegistersResponse {
+        starting_address: request.starting_address,
+        quantity: request.register_values.len() as u16,
+    }
+    .encode()
+}
+
 fn handle_read_coils(
     pdu: &[u8],
     coils: &[CoilDescription],
@@ -240,6 +293,45 @@ fn handle_write_single_coil(
     }
 }
 
+fn handle_write_multiple_coils(
+    pdu: &[u8],
+    coils: &[CoilDescription],
+    coil_store: &Mutex<CoilStore>,
+) -> Vec<u8> {
+    let Ok(request) = WriteMultipleCoilsRequest::decode(pdu) else {
+        return ExceptionResponse {
+            function_code: FUNCTION_CODE_WRITE_MULTIPLE_COILS,
+            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+        }
+        .encode();
+    };
+
+    let mut resolved = Vec::with_capacity(request.coil_values.len());
+    for (offset, &value) in request.coil_values.iter().enumerate() {
+        let address = request.starting_address.wrapping_add(offset as u16);
+        match coils.iter().find(|coil| coil.address == address) {
+            Some(coil) => resolved.push((coil, value)),
+            None => {
+                return ExceptionResponse {
+                    function_code: FUNCTION_CODE_WRITE_MULTIPLE_COILS,
+                    exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+                }
+                .encode();
+            }
+        }
+    }
+
+    let mut coil_store = coil_store.lock().unwrap_or_else(PoisonError::into_inner);
+    for (coil, value) in resolved {
+        coil_store.set(coil.name.clone(), CoilValue(value));
+    }
+    WriteMultipleCoilsResponse {
+        starting_address: request.starting_address,
+        quantity: request.coil_values.len() as u16,
+    }
+    .encode()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +355,18 @@ mod tests {
                 address: 40003,
                 data_type: DataType::F32,
                 access: AccessRight::ReadOnly,
+            },
+            RegisterDescription {
+                name: "Valve_1".to_string(),
+                address: 40010,
+                data_type: DataType::U16,
+                access: AccessRight::ReadWrite,
+            },
+            RegisterDescription {
+                name: "Valve_2".to_string(),
+                address: 40011,
+                data_type: DataType::U16,
+                access: AccessRight::ReadWrite,
             },
         ]
     }
@@ -408,16 +512,74 @@ mod tests {
     }
 
     #[test]
+    fn write_multiple_registers_applies_all_and_echoes_the_request() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let request = WriteMultipleRegistersRequest {
+            starting_address: 40010,
+            register_values: vec![11, 22],
+        }
+        .encode();
+
+        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+
+        assert_eq!(
+            WriteMultipleRegistersResponse::decode(&response).unwrap(),
+            WriteMultipleRegistersResponse {
+                starting_address: 40010,
+                quantity: 2,
+            }
+        );
+        assert_eq!(
+            store.lock().unwrap().get("Valve_1"),
+            Some(RegisterValue::U16(11))
+        );
+        assert_eq!(
+            store.lock().unwrap().get("Valve_2"),
+            Some(RegisterValue::U16(22))
+        );
+    }
+
+    #[test]
+    fn write_multiple_registers_rejects_the_whole_batch_without_partial_apply_on_a_bad_address() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        // First address (40001, Tank_Temperature) is read-only and should
+        // reject the whole request; the second address (40002,
+        // Stop_Process) is writable on its own, so this also proves a
+        // valid address later in the batch doesn't get applied either.
+        let request = WriteMultipleRegistersRequest {
+            starting_address: 40001,
+            register_values: vec![1, 2],
+        }
+        .encode();
+
+        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
+        // Stop_Process (40002, the second address in this batch) is
+        // writable, but nothing should have been applied since the first
+        // address (40001, Tank_Temperature) is read-only.
+        assert_eq!(store.lock().unwrap().get("Stop_Process"), None);
+    }
+
+    #[test]
     fn unimplemented_function_code_returns_illegal_function() {
         let store = Mutex::new(RegisterStore::new());
         let coil_store = Mutex::new(CoilStore::new());
-        // Write Multiple Registers (0x10) — decodable, but not handled yet.
-        let request = vec![0x10, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x01];
+        // Read Input Registers (0x04) — not implemented at all.
+        let request = vec![0x04, 0x00, 0x00, 0x00, 0x01];
         let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
             ExceptionResponse {
-                function_code: 0x10,
+                function_code: 0x04,
                 exception_code: EXCEPTION_ILLEGAL_FUNCTION,
             }
         );
@@ -568,5 +730,60 @@ mod tests {
                 exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
             }
         );
+    }
+
+    #[test]
+    fn write_multiple_coils_applies_all_and_echoes_the_request() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let request = WriteMultipleCoilsRequest {
+            starting_address: 1,
+            coil_values: vec![true, false],
+        }
+        .encode();
+
+        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+
+        assert_eq!(
+            WriteMultipleCoilsResponse::decode(&response).unwrap(),
+            WriteMultipleCoilsResponse {
+                starting_address: 1,
+                quantity: 2,
+            }
+        );
+        assert_eq!(
+            coil_store.lock().unwrap().get("Motor_Running"),
+            Some(CoilValue(true))
+        );
+        assert_eq!(
+            coil_store.lock().unwrap().get("Alarm_Reset"),
+            Some(CoilValue(false))
+        );
+    }
+
+    #[test]
+    fn write_multiple_coils_rejects_the_whole_batch_without_partial_apply_on_a_bad_address() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        // Address 1 (Motor_Running) is valid, but address 2 doesn't exist
+        // in this fixture beyond Alarm_Reset — use an out-of-range third
+        // address instead so the batch starts valid and then rejects.
+        let request = WriteMultipleCoilsRequest {
+            starting_address: 1,
+            coil_values: vec![true, true, true],
+        }
+        .encode();
+
+        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_WRITE_MULTIPLE_COILS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
+        assert_eq!(coil_store.lock().unwrap().get("Motor_Running"), None);
+        assert_eq!(coil_store.lock().unwrap().get("Alarm_Reset"), None);
     }
 }
