@@ -23,8 +23,12 @@
 // Ctrl+C to stop; the kernel unmounts automatically once the process exits.
 
 use fuse_fs::filesystem::InfusedFilesystem;
-use fuse_fs::{RegisterStore, RegisterValue, WriteReport, WriteStatus};
-use protocol::device_description::{AccessRight, DataType, DeviceDescription, RegisterDescription};
+use fuse_fs::{
+    CoilStore, CoilValue, RegisterStore, RegisterValue, StagedValue, WriteReport, WriteStatus,
+};
+use protocol::device_description::{
+    AccessRight, CoilDescription, DataType, DeviceDescription, RegisterDescription,
+};
 use std::sync::{Arc, Mutex, mpsc};
 
 fn demo_registers() -> Vec<RegisterDescription> {
@@ -50,6 +54,13 @@ fn demo_registers() -> Vec<RegisterDescription> {
     ]
 }
 
+fn demo_coils() -> Vec<CoilDescription> {
+    vec![CoilDescription {
+        name: "Motor_Running".to_string(),
+        address: 1,
+    }]
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(mountpoint) = args.next() else {
@@ -57,15 +68,15 @@ fn main() {
         std::process::exit(1);
     };
 
-    let registers = match args.next() {
+    let (registers, coils) = match args.next() {
         Some(path) => {
             let toml_source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
-            DeviceDescription::parse(&toml_source)
-                .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
-                .registers
+            let description = DeviceDescription::parse(&toml_source)
+                .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"));
+            (description.registers, description.coils)
         }
-        None => demo_registers(),
+        None => (demo_registers(), demo_coils()),
     };
 
     let store = Arc::new(Mutex::new(RegisterStore::new()));
@@ -75,12 +86,18 @@ fn main() {
         store.set("Flow_Rate", RegisterValue::F32(3.5));
     }
 
+    let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+    {
+        let mut coil_store = coil_store.lock().unwrap();
+        coil_store.set("Motor_Running", CoilValue(true));
+    }
+
     std::fs::create_dir_all(&mountpoint).ok();
 
     let report = Arc::new(Mutex::new(WriteReport::new()));
 
     let (transaction_sender, transaction_receiver) =
-        mpsc::channel::<std::collections::HashMap<String, RegisterValue>>();
+        mpsc::channel::<std::collections::HashMap<String, StagedValue>>();
     {
         let store = Arc::clone(&store);
         let report = Arc::clone(&report);
@@ -89,9 +106,22 @@ fn main() {
                 let mut store = store.lock().unwrap();
                 let mut report = report.lock().unwrap();
                 for (name, value) in transaction {
-                    println!("(demo) confirming write: {name} = {value}");
-                    report.set(name.clone(), WriteStatus::Ok);
-                    store.set(name, value);
+                    match value {
+                        StagedValue::Register(value) => {
+                            println!("(demo) confirming write: {name} = {value}");
+                            report.set(name.clone(), WriteStatus::Ok);
+                            store.set(name, value);
+                        }
+                        StagedValue::Coil(_) => {
+                            println!("(demo) coil writes aren't wired up yet: {name}");
+                            report.set(
+                                name,
+                                WriteStatus::Failed(
+                                    "coils not supported yet in this demo".to_string(),
+                                ),
+                            );
+                        }
+                    }
                 }
             }
         });
@@ -102,6 +132,8 @@ fn main() {
     println!("Try, from another terminal:");
     println!("  ls {mountpoint}/holding-registers");
     println!("  cat {mountpoint}/holding-registers/Tank_Temperature");
+    println!("  ls {mountpoint}/coils");
+    println!("  cat {mountpoint}/coils/Motor_Running");
     println!("  echo 0xbad > {mountpoint}/transactions/Stop_Process");
     println!("  cat {mountpoint}/transactions/Stop_Process");
     println!("  ls {mountpoint}/transactions");
@@ -111,7 +143,14 @@ fn main() {
     println!();
     println!("Ctrl+C to stop (the kernel unmounts automatically on exit).");
 
-    let filesystem = InfusedFilesystem::new(registers, store, transaction_sender, report);
+    let filesystem = InfusedFilesystem::new(
+        registers,
+        coils,
+        store,
+        coil_store,
+        transaction_sender,
+        report,
+    );
     fuser::mount(filesystem, &mountpoint, &fuser::Config::default())
         .unwrap_or_else(|error| panic!("mount failed: {error}"));
 }

@@ -34,7 +34,7 @@ use client::device_identification::fetch_device_description;
 use client::polling::run_polling_loop;
 use client::transaction_consumer::run_transaction_consumer;
 use fuse_fs::filesystem::InfusedFilesystem;
-use fuse_fs::{RegisterStore, WriteReport};
+use fuse_fs::{CoilStore, RegisterStore, WriteReport};
 use protocol::device_description::DeviceDescription;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -120,9 +120,10 @@ fn main() {
             println!("Using the local device description ({device_description_path}).");
             local_toml_source
         });
-    let registers = DeviceDescription::parse(&toml_source)
-        .unwrap_or_else(|error| panic!("failed to parse device description: {error}"))
-        .registers;
+    let description = DeviceDescription::parse(&toml_source)
+        .unwrap_or_else(|error| panic!("failed to parse device description: {error}"));
+    let registers = description.registers;
+    let coils = description.coils;
 
     // Shared, not owned outright: the polling loop and the transaction
     // consumer both need to talk to the device over this same connection,
@@ -132,6 +133,7 @@ fn main() {
     let connection = Arc::new(AsyncMutex::new(connection));
 
     let store = Arc::new(Mutex::new(RegisterStore::new()));
+    let coil_store = Arc::new(Mutex::new(CoilStore::new()));
     let report = Arc::new(Mutex::new(WriteReport::new()));
     let (transaction_sender, transaction_receiver) = mpsc::channel();
 
@@ -173,7 +175,14 @@ fn main() {
         "Mounting infused_modbus at {mountpoint}, connected via {connection_string} (unit {unit_id})"
     );
 
-    let filesystem = InfusedFilesystem::new(registers, store, transaction_sender, report);
+    let filesystem = InfusedFilesystem::new(
+        registers,
+        coils,
+        store,
+        coil_store,
+        transaction_sender,
+        report,
+    );
     // spawn_mount (not the blocking mount()) so Ctrl+C/SIGTERM below can
     // unmount cleanly instead of just killing the process and leaving a
     // stale mountpoint behind.

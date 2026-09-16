@@ -1,10 +1,13 @@
-use crate::{PendingTransaction, RegisterStore, RegisterValue, WriteReport};
+use crate::{
+    CoilStore, CoilValue, PendingTransaction, RegisterStore, RegisterValue, StagedValue,
+    WriteReport,
+};
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner, OpenFlags,
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request,
     TimeOrNow,
 };
-use protocol::device_description::{DataType, RegisterDescription};
+use protocol::device_description::{CoilDescription, DataType, RegisterDescription};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::mpsc;
@@ -67,9 +70,13 @@ pub struct InfusedFilesystem {
     registers: Vec<RegisterDescription>,
     name_to_ino: HashMap<String, INodeNo>,
     store: Arc<Mutex<RegisterStore>>,
+    coils: Vec<CoilDescription>,
+    coil_name_to_ino: HashMap<String, INodeNo>,
+    coil_store: Arc<Mutex<CoilStore>>,
+    coils_ino: INodeNo,
     transactions_ino: INodeNo,
     transactions: Mutex<TransactionFsState>,
-    transaction_sender: mpsc::Sender<HashMap<String, RegisterValue>>,
+    transaction_sender: mpsc::Sender<HashMap<String, StagedValue>>,
     report_ino: INodeNo,
     report: Arc<Mutex<WriteReport>>,
 }
@@ -77,8 +84,10 @@ pub struct InfusedFilesystem {
 impl InfusedFilesystem {
     pub fn new(
         registers: Vec<RegisterDescription>,
+        coils: Vec<CoilDescription>,
         store: Arc<Mutex<RegisterStore>>,
-        transaction_sender: mpsc::Sender<HashMap<String, RegisterValue>>,
+        coil_store: Arc<Mutex<CoilStore>>,
+        transaction_sender: mpsc::Sender<HashMap<String, StagedValue>>,
         report: Arc<Mutex<WriteReport>>,
     ) -> Self {
         let name_to_ino = registers
@@ -91,17 +100,30 @@ impl InfusedFilesystem {
                 )
             })
             .collect();
-        let transactions_ino = INodeNo(FIRST_REGISTER_INO + registers.len() as u64);
+        let coils_ino = INodeNo(FIRST_REGISTER_INO + registers.len() as u64);
+        let first_coil_ino = coils_ino.0 + 1;
+        let coil_name_to_ino = coils
+            .iter()
+            .enumerate()
+            .map(|(index, coil)| (coil.name.clone(), INodeNo(first_coil_ino + index as u64)))
+            .collect();
+        let transactions_ino = INodeNo(first_coil_ino + coils.len() as u64);
         let report_ino = INodeNo(transactions_ino.0 + 1);
         let first_report_ino = report_ino.0 + 1;
+        // report/'s coil files sit right after its register files — see
+        // `first_coil_report_ino`.
         let transactions = Mutex::new(TransactionFsState {
-            next_ino: first_report_ino + registers.len() as u64,
+            next_ino: first_report_ino + registers.len() as u64 + coils.len() as u64,
             ..Default::default()
         });
         Self {
             registers,
             name_to_ino,
             store,
+            coils,
+            coil_name_to_ino,
+            coil_store,
+            coils_ino,
             transactions_ino,
             transactions,
             transaction_sender,
@@ -124,6 +146,12 @@ impl InfusedFilesystem {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn coil_store_lock(&self) -> MutexGuard<'_, CoilStore> {
+        self.coil_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn report_lock(&self) -> MutexGuard<'_, WriteReport> {
         self.report.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -140,17 +168,50 @@ impl InfusedFilesystem {
         self.registers.get(index as usize)
     }
 
+    // coils/'s file inodes sit right after the fixed coils/ directory inode
+    // itself — see `new`, where `coils_ino` is computed the same way
+    // `transactions_ino`/`report_ino` already were.
+    fn first_coil_ino(&self) -> u64 {
+        self.coils_ino.0 + 1
+    }
+
+    fn coil_by_ino(&self, ino: INodeNo) -> Option<&CoilDescription> {
+        let index = ino.0.checked_sub(self.first_coil_ino())?;
+        self.coils.get(index as usize)
+    }
+
     fn report_register_by_ino(&self, ino: INodeNo) -> Option<&RegisterDescription> {
         let index = ino.0.checked_sub(self.first_report_ino())?;
         self.registers.get(index as usize)
+    }
+
+    // report/'s coil files sit right after its register files — see `new`.
+    fn first_coil_report_ino(&self) -> u64 {
+        self.first_report_ino() + self.registers.len() as u64
+    }
+
+    fn report_coil_by_ino(&self, ino: INodeNo) -> Option<&CoilDescription> {
+        let index = ino.0.checked_sub(self.first_coil_report_ino())?;
+        self.coils.get(index as usize)
     }
 
     fn register_by_name(&self, name: &str) -> Option<&RegisterDescription> {
         self.registers.iter().find(|register| register.name == name)
     }
 
+    fn coil_by_name(&self, name: &str) -> Option<&CoilDescription> {
+        self.coils.iter().find(|coil| coil.name == name)
+    }
+
     fn register_content(&self, register: &RegisterDescription) -> String {
         match self.store_lock().get(&register.name) {
+            Some(value) => format!("{value}\n"),
+            None => String::new(),
+        }
+    }
+
+    fn coil_content(&self, coil: &CoilDescription) -> String {
+        match self.coil_store_lock().get(&coil.name) {
             Some(value) => format!("{value}\n"),
             None => String::new(),
         }
@@ -216,6 +277,14 @@ impl InfusedFilesystem {
         }
     }
 
+    fn parse_coil_value(text: &str) -> Option<CoilValue> {
+        match text.trim() {
+            "0" => Some(CoilValue(false)),
+            "1" => Some(CoilValue(true)),
+            _ => None,
+        }
+    }
+
     fn directory_attr(&self, ino: INodeNo, req: &Request) -> FileAttr {
         let now = SystemTime::now();
         FileAttr {
@@ -270,6 +339,13 @@ impl Filesystem for InfusedFilesystem {
                         Generation(0),
                     );
                 }
+                Some("coils") => {
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.directory_attr(self.coils_ino, req),
+                        Generation(0),
+                    );
+                }
                 Some("transactions") => {
                     reply.entry(
                         &ATTR_TTL,
@@ -308,6 +384,25 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
+        if parent == self.coils_ino {
+            let coil = name
+                .to_str()
+                .and_then(|name| self.coil_name_to_ino.get(name))
+                .and_then(|&ino| self.coil_by_ino(ino).map(|coil| (ino, coil)));
+            match coil {
+                Some((ino, coil)) => {
+                    let content = self.coil_content(coil);
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.file_attr(ino, content.len() as u64, 0o444, req),
+                        Generation(0),
+                    );
+                }
+                None => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
         if parent == self.transactions_ino {
             let Some(name) = name.to_str() else {
                 reply.error(Errno::ENOENT);
@@ -333,13 +428,20 @@ impl Filesystem for InfusedFilesystem {
                 reply.error(Errno::ENOENT);
                 return;
             };
-            let index = self
+            let ino = if let Some(index) = self
                 .registers
                 .iter()
-                .position(|register| register.name == name);
-            match index {
-                Some(index) => {
-                    let ino = INodeNo(self.first_report_ino() + index as u64);
+                .position(|register| register.name == name)
+            {
+                Some(INodeNo(self.first_report_ino() + index as u64))
+            } else {
+                self.coils
+                    .iter()
+                    .position(|coil| coil.name == name)
+                    .map(|index| INodeNo(self.first_coil_report_ino() + index as u64))
+            };
+            match ino {
+                Some(ino) => {
                     let content = self.report_content(name);
                     reply.entry(
                         &ATTR_TTL,
@@ -358,6 +460,7 @@ impl Filesystem for InfusedFilesystem {
     fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         if ino == ROOT_INO
             || ino == HOLDING_REGISTERS_INO
+            || ino == self.coils_ino
             || ino == self.transactions_ino
             || ino == self.report_ino
         {
@@ -374,8 +477,26 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
+        if let Some(coil) = self.coil_by_ino(ino) {
+            let content = self.coil_content(coil);
+            reply.attr(
+                &ATTR_TTL,
+                &self.file_attr(ino, content.len() as u64, 0o444, req),
+            );
+            return;
+        }
+
         if let Some(register) = self.report_register_by_ino(ino) {
             let content = self.report_content(&register.name);
+            reply.attr(
+                &ATTR_TTL,
+                &self.file_attr(ino, content.len() as u64, 0o444, req),
+            );
+            return;
+        }
+
+        if let Some(coil) = self.report_coil_by_ino(ino) {
+            let content = self.report_content(&coil.name);
             reply.attr(
                 &ATTR_TTL,
                 &self.file_attr(ino, content.len() as u64, 0o444, req),
@@ -462,8 +583,12 @@ impl Filesystem for InfusedFilesystem {
     ) {
         let content = if let Some(register) = self.register_by_ino(ino) {
             self.register_content(register)
+        } else if let Some(coil) = self.coil_by_ino(ino) {
+            self.coil_content(coil)
         } else if let Some(register) = self.report_register_by_ino(ino) {
             self.report_content(&register.name)
+        } else if let Some(coil) = self.report_coil_by_ino(ino) {
+            self.report_content(&coil.name)
         } else {
             // The lock must be released before `transaction_content` tries
             // to take it again — std::sync::Mutex isn't reentrant, so
@@ -506,6 +631,7 @@ impl Filesystem for InfusedFilesystem {
                     FileType::Directory,
                     "holding-registers".to_string(),
                 ),
+                (self.coils_ino, FileType::Directory, "coils".to_string()),
                 (
                     self.transactions_ino,
                     FileType::Directory,
@@ -521,6 +647,16 @@ impl Filesystem for InfusedFilesystem {
             for register in &self.registers {
                 let register_ino = self.name_to_ino[&register.name];
                 entries.push((register_ino, FileType::RegularFile, register.name.clone()));
+            }
+            entries
+        } else if ino == self.coils_ino {
+            let mut entries = vec![
+                (self.coils_ino, FileType::Directory, ".".to_string()),
+                (ROOT_INO, FileType::Directory, "..".to_string()),
+            ];
+            for coil in &self.coils {
+                let coil_ino = self.coil_name_to_ino[&coil.name];
+                entries.push((coil_ino, FileType::RegularFile, coil.name.clone()));
             }
             entries
         } else if ino == self.transactions_ino {
@@ -541,6 +677,10 @@ impl Filesystem for InfusedFilesystem {
             for (index, register) in self.registers.iter().enumerate() {
                 let register_ino = INodeNo(self.first_report_ino() + index as u64);
                 entries.push((register_ino, FileType::RegularFile, register.name.clone()));
+            }
+            for (index, coil) in self.coils.iter().enumerate() {
+                let coil_ino = INodeNo(self.first_coil_report_ino() + index as u64);
+                entries.push((coil_ino, FileType::RegularFile, coil.name.clone()));
             }
             entries
         } else {
@@ -599,8 +739,8 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
-        if self.register_by_name(name).is_none() {
-            // Staging a value only makes sense for a real register.
+        if self.register_by_name(name).is_none() && self.coil_by_name(name).is_none() {
+            // Staging a value only makes sense for a real register or coil.
             reply.error(Errno::ENOENT);
             return;
         }
@@ -678,11 +818,18 @@ impl Filesystem for InfusedFilesystem {
         let mut state = self.transactions_lock();
         if let Some(name) = state.ino_to_name.get(&ino).cloned()
             && let Some(buffer) = state.buffers.remove(&ino)
-            && let Some(register) = self.register_by_name(&name)
             && let Ok(text) = String::from_utf8(buffer)
-            && let Some(value) = Self::parse_register_value(register.data_type, &text)
         {
-            state.pending.stage(name, value);
+            let staged = if let Some(register) = self.register_by_name(&name) {
+                Self::parse_register_value(register.data_type, &text).map(StagedValue::Register)
+            } else if self.coil_by_name(&name).is_some() {
+                Self::parse_coil_value(&text).map(StagedValue::Coil)
+            } else {
+                None
+            };
+            if let Some(staged) = staged {
+                state.pending.stage(name, staged);
+            }
         }
         reply.ok();
     }
@@ -718,7 +865,7 @@ mod tests {
 
     fn test_filesystem() -> (
         InfusedFilesystem,
-        mpsc::Receiver<HashMap<String, RegisterValue>>,
+        mpsc::Receiver<HashMap<String, StagedValue>>,
     ) {
         let registers = vec![RegisterDescription {
             name: "Stop_Process".to_string(),
@@ -726,11 +873,16 @@ mod tests {
             data_type: DataType::U16,
             access: AccessRight::ReadWrite,
         }];
+        let coils = vec![CoilDescription {
+            name: "Motor_Running".to_string(),
+            address: 1,
+        }];
         let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, receiver) = mpsc::channel();
         (
-            InfusedFilesystem::new(registers, store, sender, report),
+            InfusedFilesystem::new(registers, coils, store, coil_store, sender, report),
             receiver,
         )
     }
@@ -740,7 +892,9 @@ mod tests {
         let (filesystem, receiver) = test_filesystem();
         {
             let mut state = filesystem.transactions_lock();
-            state.pending.stage("Stop_Process", RegisterValue::U16(1));
+            state
+                .pending
+                .stage("Stop_Process", StagedValue::Register(RegisterValue::U16(1)));
             state
                 .name_to_ino
                 .insert("Stop_Process".to_string(), INodeNo(100));
@@ -753,7 +907,10 @@ mod tests {
         filesystem.commit_transaction();
 
         let received = receiver.try_recv().unwrap();
-        assert_eq!(received.get("Stop_Process"), Some(&RegisterValue::U16(1)));
+        assert_eq!(
+            received.get("Stop_Process"),
+            Some(&StagedValue::Register(RegisterValue::U16(1)))
+        );
 
         let state = filesystem.transactions_lock();
         assert!(state.pending.is_empty());
@@ -771,7 +928,7 @@ mod tests {
         filesystem
             .transactions_lock()
             .pending
-            .stage("Stop_Process", RegisterValue::U16(1));
+            .stage("Stop_Process", StagedValue::Register(RegisterValue::U16(1)));
 
         filesystem.commit_transaction();
 
@@ -828,5 +985,91 @@ mod tests {
     fn report_register_by_ino_returns_none_for_unrelated_inode() {
         let (filesystem, _receiver) = test_filesystem();
         assert_eq!(filesystem.report_register_by_ino(ROOT_INO), None);
+    }
+
+    #[test]
+    fn coil_by_ino_resolves_a_coil_file_inode() {
+        let (filesystem, _receiver) = test_filesystem();
+        let coil_ino = INodeNo(filesystem.first_coil_ino());
+        assert_eq!(
+            filesystem.coil_by_ino(coil_ino).map(|c| &c.name),
+            Some(&"Motor_Running".to_string())
+        );
+    }
+
+    #[test]
+    fn coil_by_ino_returns_none_for_unrelated_inode() {
+        let (filesystem, _receiver) = test_filesystem();
+        assert_eq!(filesystem.coil_by_ino(ROOT_INO), None);
+    }
+
+    #[test]
+    fn report_coil_by_ino_resolves_a_report_file_inode() {
+        let (filesystem, _receiver) = test_filesystem();
+        let report_ino = INodeNo(filesystem.first_coil_report_ino());
+        assert_eq!(
+            filesystem.report_coil_by_ino(report_ino).map(|c| &c.name),
+            Some(&"Motor_Running".to_string())
+        );
+    }
+
+    #[test]
+    fn report_coil_by_ino_returns_none_for_unrelated_inode() {
+        let (filesystem, _receiver) = test_filesystem();
+        assert_eq!(filesystem.report_coil_by_ino(ROOT_INO), None);
+    }
+
+    #[test]
+    fn report_coil_by_ino_does_not_collide_with_register_report_range() {
+        let (filesystem, _receiver) = test_filesystem();
+        // The one register's report file sits at first_report_ino(); the
+        // coil report range starts right after it. Neither lookup should
+        // claim the other's inode.
+        let register_report_ino = INodeNo(filesystem.first_report_ino());
+        assert_eq!(filesystem.report_coil_by_ino(register_report_ino), None);
+    }
+
+    #[test]
+    fn coil_content_is_empty_when_the_coil_store_has_no_value_yet() {
+        let (filesystem, _receiver) = test_filesystem();
+        let coil = &filesystem.coils[0];
+        assert_eq!(filesystem.coil_content(coil), "");
+    }
+
+    #[test]
+    fn coil_content_reflects_the_coil_store_value() {
+        let (filesystem, _receiver) = test_filesystem();
+        filesystem
+            .coil_store_lock()
+            .set("Motor_Running", crate::CoilValue(true));
+        let coil = &filesystem.coils[0];
+        assert_eq!(filesystem.coil_content(coil), "1\n");
+    }
+
+    #[test]
+    fn parse_coil_value_accepts_zero_and_one() {
+        assert_eq!(
+            InfusedFilesystem::parse_coil_value("0"),
+            Some(CoilValue(false))
+        );
+        assert_eq!(
+            InfusedFilesystem::parse_coil_value("1"),
+            Some(CoilValue(true))
+        );
+    }
+
+    #[test]
+    fn parse_coil_value_trims_whitespace() {
+        assert_eq!(
+            InfusedFilesystem::parse_coil_value(" 1\n"),
+            Some(CoilValue(true))
+        );
+    }
+
+    #[test]
+    fn parse_coil_value_rejects_anything_else() {
+        assert_eq!(InfusedFilesystem::parse_coil_value("true"), None);
+        assert_eq!(InfusedFilesystem::parse_coil_value("2"), None);
+        assert_eq!(InfusedFilesystem::parse_coil_value(""), None);
     }
 }

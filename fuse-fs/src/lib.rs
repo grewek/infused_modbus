@@ -45,15 +45,74 @@ impl RegisterStore {
     }
 }
 
+// A coil's value. Always exactly one bit — unlike RegisterValue there's only
+// ever one shape, since protocol::device_description::CoilDescription has no
+// data_type — but still a newtype rather than a bare `bool`, so its FUSE file
+// rendering ("0"/"1", not Rust's "true"/"false" — see CLAUDE.md's FUSE
+// layout section) has one canonical place to live, same as RegisterValue's
+// Display below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoilValue(pub bool);
+
+impl fmt::Display for CoilValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", if self.0 { "1" } else { "0" })
+    }
+}
+
+// Mirrors RegisterStore exactly, keyed by coil name instead of register
+// name. Kept as its own store rather than folded into RegisterStore, since
+// the two are keyed from separate DeviceDescription fields (registers vs.
+// coils) and there's no concrete need yet for a single lookup spanning both.
+#[derive(Debug, Default)]
+pub struct CoilStore {
+    values: HashMap<String, CoilValue>,
+}
+
+impl CoilStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, name: &str) -> Option<CoilValue> {
+        self.values.get(name).copied()
+    }
+
+    pub fn set(&mut self, name: impl Into<String>, value: CoilValue) {
+        self.values.insert(name.into(), value);
+    }
+}
+
+// A value staged in `transactions/`, before TRANSACTION_END hands it off to
+// be confirmed against the real device. Wraps whichever of RegisterValue or
+// CoilValue matches the name being staged — CLAUDE.md's transactions design
+// describes one directory shared across Modbus data types, not one per
+// type, so PendingTransaction (and the TRANSACTION_END hand-off channel)
+// need one value type that can hold either.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StagedValue {
+    Register(RegisterValue),
+    Coil(CoilValue),
+}
+
+impl fmt::Display for StagedValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StagedValue::Register(value) => write!(formatter, "{value}"),
+            StagedValue::Coil(value) => write!(formatter, "{value}"),
+        }
+    }
+}
+
 // Staged writes for one in-progress transaction: creating a file in
 // `transactions/` and writing a value to it stages a name=value entry here;
 // creating `TRANSACTION_END` (Milestone H2, not implemented yet) drains this
-// and applies it to a RegisterStore. Plain data structure, no FUSE
+// and applies it to a RegisterStore/CoilStore. Plain data structure, no FUSE
 // awareness — mirrors how RegisterStore (F1) preceded its own FUSE wiring
 // (G1).
 #[derive(Debug, Default)]
 pub struct PendingTransaction {
-    staged: HashMap<String, RegisterValue>,
+    staged: HashMap<String, StagedValue>,
 }
 
 impl PendingTransaction {
@@ -61,15 +120,15 @@ impl PendingTransaction {
         Self::default()
     }
 
-    pub fn stage(&mut self, name: impl Into<String>, value: RegisterValue) {
+    pub fn stage(&mut self, name: impl Into<String>, value: StagedValue) {
         self.staged.insert(name.into(), value);
     }
 
-    pub fn get(&self, name: &str) -> Option<RegisterValue> {
+    pub fn get(&self, name: &str) -> Option<StagedValue> {
         self.staged.get(name).copied()
     }
 
-    pub fn unstage(&mut self, name: &str) -> Option<RegisterValue> {
+    pub fn unstage(&mut self, name: &str) -> Option<StagedValue> {
         self.staged.remove(name)
     }
 
@@ -79,8 +138,8 @@ impl PendingTransaction {
 
     // Takes every staged value out at once, leaving the transaction empty —
     // what `TRANSACTION_END` needs to atomically hand off everything staged
-    // so far to be applied to a RegisterStore.
-    pub fn drain(&mut self) -> HashMap<String, RegisterValue> {
+    // so far to be applied to a RegisterStore/CoilStore.
+    pub fn drain(&mut self) -> HashMap<String, StagedValue> {
         std::mem::take(&mut self.staged)
     }
 }
@@ -176,6 +235,37 @@ mod tests {
     }
 
     #[test]
+    fn coil_store_get_returns_none_for_unknown_coil() {
+        let store = CoilStore::new();
+        assert_eq!(store.get("Motor_Running"), None);
+    }
+
+    #[test]
+    fn coil_store_set_then_get_returns_the_value() {
+        let mut store = CoilStore::new();
+        store.set("Motor_Running", CoilValue(true));
+        assert_eq!(store.get("Motor_Running"), Some(CoilValue(true)));
+    }
+
+    #[test]
+    fn coil_store_set_overwrites_previous_value() {
+        let mut store = CoilStore::new();
+        store.set("Motor_Running", CoilValue(true));
+        store.set("Motor_Running", CoilValue(false));
+        assert_eq!(store.get("Motor_Running"), Some(CoilValue(false)));
+    }
+
+    #[test]
+    fn coil_value_true_displays_as_one() {
+        assert_eq!(CoilValue(true).to_string(), "1");
+    }
+
+    #[test]
+    fn coil_value_false_displays_as_zero() {
+        assert_eq!(CoilValue(false).to_string(), "0");
+    }
+
+    #[test]
     fn pending_transaction_get_returns_none_for_unstaged_register() {
         let transaction = PendingTransaction::new();
         assert_eq!(transaction.get("Stop_Process"), None);
@@ -184,25 +274,31 @@ mod tests {
     #[test]
     fn pending_transaction_stage_then_get_returns_the_value() {
         let mut transaction = PendingTransaction::new();
-        transaction.stage("Stop_Process", RegisterValue::U16(1));
-        assert_eq!(transaction.get("Stop_Process"), Some(RegisterValue::U16(1)));
+        transaction.stage("Stop_Process", StagedValue::Register(RegisterValue::U16(1)));
+        assert_eq!(
+            transaction.get("Stop_Process"),
+            Some(StagedValue::Register(RegisterValue::U16(1)))
+        );
     }
 
     #[test]
     fn pending_transaction_stage_overwrites_previous_value() {
         let mut transaction = PendingTransaction::new();
-        transaction.stage("Stop_Process", RegisterValue::U16(1));
-        transaction.stage("Stop_Process", RegisterValue::U16(0));
-        assert_eq!(transaction.get("Stop_Process"), Some(RegisterValue::U16(0)));
+        transaction.stage("Stop_Process", StagedValue::Register(RegisterValue::U16(1)));
+        transaction.stage("Stop_Process", StagedValue::Register(RegisterValue::U16(0)));
+        assert_eq!(
+            transaction.get("Stop_Process"),
+            Some(StagedValue::Register(RegisterValue::U16(0)))
+        );
     }
 
     #[test]
     fn pending_transaction_unstage_removes_a_staged_value() {
         let mut transaction = PendingTransaction::new();
-        transaction.stage("Stop_Process", RegisterValue::U16(1));
+        transaction.stage("Stop_Process", StagedValue::Register(RegisterValue::U16(1)));
         assert_eq!(
             transaction.unstage("Stop_Process"),
-            Some(RegisterValue::U16(1))
+            Some(StagedValue::Register(RegisterValue::U16(1)))
         );
         assert_eq!(transaction.get("Stop_Process"), None);
     }
@@ -211,24 +307,53 @@ mod tests {
     fn pending_transaction_is_empty_reflects_staged_state() {
         let mut transaction = PendingTransaction::new();
         assert!(transaction.is_empty());
-        transaction.stage("Stop_Process", RegisterValue::U16(1));
+        transaction.stage("Stop_Process", StagedValue::Register(RegisterValue::U16(1)));
         assert!(!transaction.is_empty());
         transaction.unstage("Stop_Process");
         assert!(transaction.is_empty());
     }
 
     #[test]
+    fn pending_transaction_stage_accepts_a_coil_value_too() {
+        let mut transaction = PendingTransaction::new();
+        transaction.stage("Motor_Running", StagedValue::Coil(CoilValue(true)));
+        assert_eq!(
+            transaction.get("Motor_Running"),
+            Some(StagedValue::Coil(CoilValue(true)))
+        );
+    }
+
+    #[test]
     fn pending_transaction_drain_returns_staged_values_and_empties_transaction() {
         let mut transaction = PendingTransaction::new();
-        transaction.stage("Stop_Process", RegisterValue::U16(1));
-        transaction.stage("Flow_Rate", RegisterValue::F32(3.5));
+        transaction.stage("Stop_Process", StagedValue::Register(RegisterValue::U16(1)));
+        transaction.stage("Flow_Rate", StagedValue::Register(RegisterValue::F32(3.5)));
 
         let drained = transaction.drain();
 
-        assert_eq!(drained.get("Stop_Process"), Some(&RegisterValue::U16(1)));
-        assert_eq!(drained.get("Flow_Rate"), Some(&RegisterValue::F32(3.5)));
+        assert_eq!(
+            drained.get("Stop_Process"),
+            Some(&StagedValue::Register(RegisterValue::U16(1)))
+        );
+        assert_eq!(
+            drained.get("Flow_Rate"),
+            Some(&StagedValue::Register(RegisterValue::F32(3.5)))
+        );
         assert_eq!(drained.len(), 2);
         assert!(transaction.is_empty());
+    }
+
+    #[test]
+    fn staged_value_register_displays_like_the_wrapped_register_value() {
+        assert_eq!(
+            StagedValue::Register(RegisterValue::U16(42)).to_string(),
+            "42"
+        );
+    }
+
+    #[test]
+    fn staged_value_coil_displays_like_the_wrapped_coil_value() {
+        assert_eq!(StagedValue::Coil(CoilValue(true)).to_string(), "1");
     }
 
     #[test]

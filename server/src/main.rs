@@ -27,7 +27,7 @@
 // device_identification.rs for the object layout.
 
 use fuse_fs::filesystem::InfusedFilesystem;
-use fuse_fs::{RegisterStore, WriteReport};
+use fuse_fs::{CoilStore, RegisterStore, WriteReport};
 use protocol::device_description::{DeviceDescription, RegisterDescription};
 use server::connection::{serve_rtu_connection, serve_tcp_connection};
 use server::transaction_consumer::run_transaction_consumer;
@@ -125,11 +125,13 @@ fn main() {
 
     let toml_source = std::fs::read_to_string(&device_description_path)
         .unwrap_or_else(|error| panic!("failed to read {device_description_path}: {error}"));
-    let registers = DeviceDescription::parse(&toml_source)
-        .unwrap_or_else(|error| panic!("failed to parse {device_description_path}: {error}"))
-        .registers;
+    let description = DeviceDescription::parse(&toml_source)
+        .unwrap_or_else(|error| panic!("failed to parse {device_description_path}: {error}"));
+    let registers = description.registers;
+    let coils = description.coils;
 
     let store = Arc::new(Mutex::new(RegisterStore::new()));
+    let coil_store = Arc::new(Mutex::new(CoilStore::new()));
     let report = Arc::new(Mutex::new(WriteReport::new()));
     let (transaction_sender, transaction_receiver) = mpsc::channel();
 
@@ -151,7 +153,14 @@ fn main() {
     std::fs::create_dir_all(&mountpoint).ok();
     println!("Mounting infused_modbus server at {mountpoint}, serving via {connection_string}");
 
-    let filesystem = InfusedFilesystem::new(registers, store, transaction_sender, report);
+    let filesystem = InfusedFilesystem::new(
+        registers,
+        coils,
+        store,
+        coil_store,
+        transaction_sender,
+        report,
+    );
     let session = fuser::spawn_mount(filesystem, &mountpoint, &fuser::Config::default())
         .unwrap_or_else(|error| panic!("mount failed: {error}"));
 

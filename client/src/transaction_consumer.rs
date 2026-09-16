@@ -20,7 +20,7 @@
 
 use crate::connection::Connection;
 use crate::write_confirmation::confirm_write;
-use fuse_fs::{RegisterStore, RegisterValue, WriteReport, WriteStatus};
+use fuse_fs::{RegisterStore, StagedValue, WriteReport, WriteStatus};
 use protocol::device_description::RegisterDescription;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
@@ -35,12 +35,23 @@ pub fn run_transaction_consumer(
     registers: &[RegisterDescription],
     store: &Arc<Mutex<RegisterStore>>,
     report: &Arc<Mutex<WriteReport>>,
-    transaction_receiver: mpsc::Receiver<HashMap<String, RegisterValue>>,
+    transaction_receiver: mpsc::Receiver<HashMap<String, StagedValue>>,
     unit_id: u8,
     timeout: Duration,
 ) {
     for transaction in transaction_receiver {
         for (name, value) in transaction {
+            // Coils have no wire write path yet (see fuse-fs's `coils/`
+            // milestone this is waiting on) — report and move on without
+            // touching the connection.
+            let StagedValue::Register(value) = value else {
+                report.lock().unwrap().set(
+                    name,
+                    WriteStatus::Failed("coil writes not yet supported".to_string()),
+                );
+                continue;
+            };
+
             let status = match registers.iter().find(|register| register.name == name) {
                 Some(register) => handle.block_on(async {
                     let mut connection = connection.lock().await;
@@ -60,6 +71,7 @@ pub fn run_transaction_consumer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fuse_fs::RegisterValue;
     use protocol::device_description::{AccessRight, DataType};
 
     fn u16_register() -> RegisterDescription {
@@ -121,7 +133,10 @@ mod tests {
         });
 
         let mut transaction = HashMap::new();
-        transaction.insert("Stop_Process".to_string(), RegisterValue::U16(1));
+        transaction.insert(
+            "Stop_Process".to_string(),
+            StagedValue::Register(RegisterValue::U16(1)),
+        );
         transaction_sender.send(transaction).unwrap();
         // Dropping the sender closes the channel, so the consumer's
         // `for transaction in transaction_receiver` loop ends once drained.
@@ -189,7 +204,10 @@ mod tests {
         });
 
         let mut transaction = HashMap::new();
-        transaction.insert("Stop_Process".to_string(), RegisterValue::U16(1));
+        transaction.insert(
+            "Stop_Process".to_string(),
+            StagedValue::Register(RegisterValue::U16(1)),
+        );
         transaction_sender.send(transaction).unwrap();
         drop(transaction_sender);
 
@@ -229,7 +247,10 @@ mod tests {
         });
 
         let mut transaction = HashMap::new();
-        transaction.insert("Unknown_Register".to_string(), RegisterValue::U16(1));
+        transaction.insert(
+            "Unknown_Register".to_string(),
+            StagedValue::Register(RegisterValue::U16(1)),
+        );
         transaction_sender.send(transaction).unwrap();
         drop(transaction_sender);
 
