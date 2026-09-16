@@ -8,7 +8,7 @@ use fuser::{
     TimeOrNow,
 };
 use protocol::device_description::{CoilDescription, DataType, RegisterDescription};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -70,13 +70,18 @@ struct TransactionFsState {
     ino_to_name: HashMap<INodeNo, String>,
     buffers: HashMap<INodeNo, Vec<u8>>,
     next_ino: u64,
-    // The inode handed back by the most recent TRANSACTION_END `create()`
-    // call. It's deliberately untracked everywhere else (see `create`), but
-    // tools like `touch` immediately follow their create() with a
-    // setattr(times) call on the same inode as one logical operation — see
-    // `setattr`'s doc comment for why that one follow-up call still needs
-    // to succeed.
-    last_transaction_end_ino: Option<INodeNo>,
+    // Inodes handed back by TRANSACTION_END `create()` calls that haven't
+    // had their matching setattr() follow-up yet. Deliberately untracked
+    // everywhere else (see `create`), but tools like `touch` immediately
+    // follow their create() with a setattr(times) call on the same inode as
+    // one logical operation — see `setattr`'s doc comment for why that one
+    // follow-up call still needs to succeed. A set rather than a single
+    // `Option` because two concurrent `touch transactions/TRANSACTION_END`
+    // calls interleave their create()/setattr() pairs across FUSE's worker
+    // threads — a single most-recent-inode field would let the second
+    // create() overwrite the first's entry before its setattr() arrives,
+    // wrongly reporting ENOENT for a commit that actually succeeded.
+    last_transaction_end_inos: HashSet<INodeNo>,
 }
 
 /// A minimal FUSE projection: root -> `holding-registers` -> one read-only
@@ -618,8 +623,7 @@ impl Filesystem for InfusedFilesystem {
         // on use — a *later*, unrelated setattr on the same stale inode
         // number correctly falls through to ENOENT below.
         let mut state = self.transactions_lock();
-        if state.last_transaction_end_ino == Some(ino) {
-            state.last_transaction_end_ino = None;
+        if state.last_transaction_end_inos.remove(&ino) {
             drop(state);
             reply.attr(&ATTR_TTL, &self.file_attr(ino, 0, 0o644, req));
             return;
@@ -786,7 +790,7 @@ impl Filesystem for InfusedFilesystem {
             let mut state = self.transactions_lock();
             let ino = INodeNo(state.next_ino);
             state.next_ino += 1;
-            state.last_transaction_end_ino = Some(ino);
+            state.last_transaction_end_inos.insert(ino);
             drop(state);
             reply.created(
                 &ATTR_TTL,
@@ -1003,6 +1007,30 @@ mod tests {
         let (filesystem, receiver) = test_filesystem();
         filesystem.commit_transaction();
         assert!(receiver.try_recv().is_err());
+    }
+
+    // Simulates two concurrent `touch transactions/TRANSACTION_END` calls:
+    // each gets its own create()d inode inserted here before its setattr()
+    // follow-up arrives. A `HashSet` (rather than the single most-recent
+    // `Option` this replaced) means the second insert can't clobber the
+    // first — each inode is only removed by its own matching setattr().
+    #[test]
+    fn last_transaction_end_inos_tracks_concurrent_touches_independently() {
+        let (filesystem, _receiver) = test_filesystem();
+        {
+            let mut state = filesystem.transactions_lock();
+            state.last_transaction_end_inos.insert(INodeNo(100));
+            state.last_transaction_end_inos.insert(INodeNo(101));
+        }
+
+        {
+            let mut state = filesystem.transactions_lock();
+            assert!(state.last_transaction_end_inos.remove(&INodeNo(100)));
+        }
+
+        let state = filesystem.transactions_lock();
+        assert!(state.last_transaction_end_inos.contains(&INodeNo(101)));
+        assert!(!state.last_transaction_end_inos.contains(&INodeNo(100)));
     }
 
     #[test]
