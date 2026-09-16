@@ -46,8 +46,8 @@ This lists every public function code defined by the Modbus Application Protocol
 | 0x08 | Diagnostics | Not implemented yet |
 | 0x0B | Get Comm Event Counter | Not implemented yet |
 | 0x0C | Get Comm Event Log | Not implemented yet |
-| 0x0F | Write Multiple Coils | Decoded, not wired |
-| 0x10 | Write Multiple Registers | Decoded, not wired |
+| 0x0F | Write Multiple Coils | Supported |
+| 0x10 | Write Multiple Registers | Supported |
 | 0x11 | Report Server ID | Not implemented yet |
 | 0x14 | Read File Record | Not implemented yet |
 | 0x15 | Write File Record | Not implemented yet |
@@ -183,8 +183,8 @@ access = "read_write"
 
 This project is under active development. As of now:
 
-- Only `u16` registers can be read or written over the wire (Read Holding Registers / Write Single Register). `f32` registers are modeled in the TOML schema and supported by the local filesystem/store, but writing them over Modbus is deliberately not yet implemented — a 32-bit value spans two 16-bit registers, and which one carries the high vs. low word is a real, device-dependent convention that hasn't been decided yet. Guessing it would risk silently sending the wrong value to real hardware.
-- `Write Multiple Registers` isn't implemented yet; only single-register writes are.
+- Only `u16` registers can be read or written over the wire. `f32` registers are modeled in the TOML schema and supported by the local filesystem/store, but writing them over Modbus is deliberately not yet implemented — a 32-bit value spans two 16-bit registers, and which one carries the high vs. low word is a real, device-dependent convention that hasn't been decided yet. Guessing it would risk silently sending the wrong value to real hardware.
+- Read Discrete Inputs (FC 0x02) is decoded by `protocol` but not wired into `client`/`server` yet — there's no discrete-input device model in the TOML schema (see the function code table above).
 - FC 43 (device identification) only supports "Extended" access serving custom private objects (the mechanism used for description discovery above) — the standard VendorName/ProductCode/etc. objects and Basic/Regular/Individual access aren't implemented yet.
 - RTU serial parameters beyond baud rate (data bits, parity, stop bits) aren't configurable yet; fixed defaults (8 data bits, no parity, 1 stop bit) are used.
 
