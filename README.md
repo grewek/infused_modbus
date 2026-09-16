@@ -30,6 +30,32 @@ Nothing here shipped without a human decision behind it, but essentially all of 
 - **Modbus implemented from scratch.** The `protocol` crate implements Modbus TCP/RTU framing, CRC16, and PDU encode/decode directly, rather than wrapping an existing crate like `tokio-modbus`. Some individual inputs read from the wire (declared lengths/counts) are checked against the actual remaining buffer before being used for allocation or indexing — this reduces a few specific classes of bugs, but is not a substitute for a real security review, which this project has not had (see the warning above).
 - **Polling batches register reads.** The client keeps its local mirror fresh by polling, grouping contiguous register addresses into a single `Read Holding Registers` request (up to Modbus's 125-register limit) instead of one request per register. Standard Modbus has no mechanism for a device to push updates on its own — polling is the only option the protocol allows.
 
+## Supported Modbus function codes
+
+This lists every public function code defined by the Modbus Application Protocol specification, not just the ones this project implements — so the gaps are visible rather than silently omitted. "Decoded, not wired" means `protocol` can encode/decode the PDU, but `client`/`server` don't call it yet; support for everything else marked "Not implemented yet" will be added later.
+
+| Code | Name | Status |
+| ---- | ---- | ------ |
+| 0x01 | Read Coils | Supported |
+| 0x02 | Read Discrete Inputs | Decoded, not wired |
+| 0x03 | Read Holding Registers | Supported |
+| 0x04 | Read Input Registers | Not implemented yet |
+| 0x05 | Write Single Coil | Supported |
+| 0x06 | Write Single Register | Supported |
+| 0x07 | Read Exception Status | Not implemented yet |
+| 0x08 | Diagnostics | Not implemented yet |
+| 0x0B | Get Comm Event Counter | Not implemented yet |
+| 0x0C | Get Comm Event Log | Not implemented yet |
+| 0x0F | Write Multiple Coils | Decoded, not wired |
+| 0x10 | Write Multiple Registers | Decoded, not wired |
+| 0x11 | Report Server ID | Not implemented yet |
+| 0x14 | Read File Record | Not implemented yet |
+| 0x15 | Write File Record | Not implemented yet |
+| 0x16 | Mask Write Register | Not implemented yet |
+| 0x17 | Read/Write Multiple Registers | Not implemented yet |
+| 0x18 | Read FIFO Queue | Not implemented yet |
+| 0x2B / MEI 0x0E | Encapsulated Interface Transport — Read Device Identification | Supported (Extended access only — see [Device description discovery](#device-description-discovery-fc-43)) |
+
 ## Client vs. server
 
 - **`client`** acts as a Modbus master against a connected device. It polls the device to keep `holding-registers/` fresh, and turns `transactions/` commits into Modbus writes, updating the local mirror only once the device confirms them.
