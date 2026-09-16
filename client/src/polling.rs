@@ -18,6 +18,7 @@
 // standard Modbus (the master always has to initiate), so this is as
 // close to "efficient" as the protocol allows.
 
+use crate::batching::{Batch, build_batches};
 use crate::connection::Connection;
 use fuse_fs::{CoilStore, CoilValue, RegisterStore, RegisterValue};
 use protocol::device_description::{CoilDescription, DataType, RegisterDescription};
@@ -37,90 +38,33 @@ const MAX_READ_BATCH_SIZE: u16 = 125;
 // 8-to-a-byte on the wire instead of 2 bytes each.
 const MAX_COIL_READ_BATCH_SIZE: u16 = 2000;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct RegisterBatch {
-    pub starting_address: u16,
-    pub registers: Vec<RegisterDescription>,
-}
-
-impl RegisterBatch {
-    pub fn quantity(&self) -> u16 {
-        self.registers.len() as u16
-    }
-}
+pub type RegisterBatch = Batch<RegisterDescription>;
+pub type CoilBatch = Batch<CoilDescription>;
 
 /// Groups `registers` (U16 only — see module doc comment) into the fewest
-/// Read Holding Registers requests needed to cover them all: registers at
-/// consecutive addresses share one batch, capped at Modbus's 125-register
-/// limit per request; any gap in the address range starts a new batch
-/// rather than reading (and discarding) addresses nothing here describes.
+/// Read Holding Registers requests needed to cover them all — see
+/// `crate::batching` for the grouping algorithm itself.
 pub fn build_read_batches(registers: &[RegisterDescription]) -> Vec<RegisterBatch> {
-    let mut sorted: Vec<&RegisterDescription> = registers
+    let u16_registers: Vec<RegisterDescription> = registers
         .iter()
         .filter(|register| register.data_type == DataType::U16)
+        .cloned()
         .collect();
-    sorted.sort_by_key(|register| register.address);
-
-    let mut batches: Vec<RegisterBatch> = Vec::new();
-    for register in sorted {
-        let extends_last_batch = match batches.last() {
-            Some(batch) => {
-                let expected_next_address = batch.starting_address.wrapping_add(batch.quantity());
-                register.address == expected_next_address && batch.quantity() < MAX_READ_BATCH_SIZE
-            }
-            None => false,
-        };
-        if extends_last_batch {
-            batches.last_mut().unwrap().registers.push(register.clone());
-        } else {
-            batches.push(RegisterBatch {
-                starting_address: register.address,
-                registers: vec![register.clone()],
-            });
-        }
-    }
-    batches
+    build_batches(
+        u16_registers,
+        |register| register.address,
+        MAX_READ_BATCH_SIZE,
+    )
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct CoilBatch {
-    pub starting_address: u16,
-    pub coils: Vec<CoilDescription>,
-}
-
-impl CoilBatch {
-    pub fn quantity(&self) -> u16 {
-        self.coils.len() as u16
-    }
-}
-
-/// Coil counterpart of `build_read_batches` — identical grouping logic
-/// (consecutive addresses share a batch, a gap starts a new one), just
-/// capped at Modbus's much higher per-request coil limit instead of the
-/// register one.
+/// Coil counterpart of `build_read_batches`, capped at Modbus's much
+/// higher per-request coil limit instead of the register one.
 pub fn build_coil_read_batches(coils: &[CoilDescription]) -> Vec<CoilBatch> {
-    let mut sorted: Vec<&CoilDescription> = coils.iter().collect();
-    sorted.sort_by_key(|coil| coil.address);
-
-    let mut batches: Vec<CoilBatch> = Vec::new();
-    for coil in sorted {
-        let extends_last_batch = match batches.last() {
-            Some(batch) => {
-                let expected_next_address = batch.starting_address.wrapping_add(batch.quantity());
-                coil.address == expected_next_address && batch.quantity() < MAX_COIL_READ_BATCH_SIZE
-            }
-            None => false,
-        };
-        if extends_last_batch {
-            batches.last_mut().unwrap().coils.push(coil.clone());
-        } else {
-            batches.push(CoilBatch {
-                starting_address: coil.address,
-                coils: vec![coil.clone()],
-            });
-        }
-    }
-    batches
+    build_batches(
+        coils.to_vec(),
+        |coil| coil.address,
+        MAX_COIL_READ_BATCH_SIZE,
+    )
 }
 
 /// Coil counterpart of `poll_once`: the same "apply successes, log and
@@ -161,9 +105,9 @@ pub async fn poll_coils_once(
         };
 
         match ReadCoilsResponse::decode(&response_pdu) {
-            Ok(decoded) if decoded.coil_values.len() >= batch.coils.len() => {
+            Ok(decoded) if decoded.coil_values.len() >= batch.items.len() => {
                 let mut coil_store = coil_store.lock().unwrap_or_else(PoisonError::into_inner);
-                for (coil, value) in batch.coils.iter().zip(decoded.coil_values) {
+                for (coil, value) in batch.items.iter().zip(decoded.coil_values) {
                     coil_store.set(coil.name.clone(), CoilValue(value));
                 }
             }
@@ -215,9 +159,9 @@ pub async fn poll_once(
         };
 
         match ReadHoldingRegistersResponse::decode(&response_pdu) {
-            Ok(decoded) if decoded.register_values.len() == batch.registers.len() => {
+            Ok(decoded) if decoded.register_values.len() == batch.items.len() => {
                 let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
-                for (register, value) in batch.registers.iter().zip(decoded.register_values) {
+                for (register, value) in batch.items.iter().zip(decoded.register_values) {
                     store.set(register.name.clone(), RegisterValue::U16(value));
                 }
             }
@@ -312,8 +256,8 @@ mod tests {
         ];
         let batches = build_read_batches(&registers);
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].registers.len(), 1);
-        assert_eq!(batches[0].registers[0].name, "A");
+        assert_eq!(batches[0].items.len(), 1);
+        assert_eq!(batches[0].items[0].name, "A");
     }
 
     #[test]
@@ -327,7 +271,7 @@ mod tests {
         assert_eq!(batches[0].starting_address, 40001);
         assert_eq!(
             batches[0]
-                .registers
+                .items
                 .iter()
                 .map(|r| r.name.as_str())
                 .collect::<Vec<_>>(),

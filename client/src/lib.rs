@@ -1,3 +1,4 @@
+pub mod batching;
 pub mod connection;
 pub mod device_identification;
 pub mod polling;

@@ -33,6 +33,7 @@
 // in a failed batch is reported `Failed` alike (confirmed with the project
 // owner rather than guessed at).
 
+use crate::batching::{Batch, build_batches};
 use crate::connection::Connection;
 use crate::write_confirmation::{
     confirm_coil_write, confirm_coil_write_multiple, confirm_write, confirm_write_multiple,
@@ -51,79 +52,31 @@ use tokio::sync::Mutex as AsyncMutex;
 // request may carry (function code 0x10) — lower than Read Holding
 // Registers' 125, since the request PDU spends bytes on a byte-count field
 // the read request doesn't need.
-const MAX_REGISTER_WRITE_BATCH_SIZE: usize = 123;
+const MAX_REGISTER_WRITE_BATCH_SIZE: u16 = 123;
 
 // Modbus's own limit on how many coils one Write Multiple Coils request
 // may carry (function code 0x0F).
-const MAX_COIL_WRITE_BATCH_SIZE: usize = 1968;
+const MAX_COIL_WRITE_BATCH_SIZE: u16 = 1968;
 
-struct RegisterWriteBatch {
-    starting_address: u16,
-    entries: Vec<(RegisterDescription, u16)>,
-}
+type RegisterWriteBatch = Batch<(RegisterDescription, u16)>;
+type CoilWriteBatch = Batch<(CoilDescription, bool)>;
 
-/// Groups staged (register, value) pairs by contiguous address, the same
-/// way `client::polling::build_read_batches` groups reads — a gap in
-/// addresses starts a new batch, and no batch exceeds Modbus's write
-/// limit.
+/// Groups staged (register, value) pairs by contiguous address — see
+/// `crate::batching` for the grouping algorithm itself, shared with
+/// `client::polling`'s read batching.
 fn build_register_write_batches(
-    mut entries: Vec<(RegisterDescription, u16)>,
+    entries: Vec<(RegisterDescription, u16)>,
 ) -> Vec<RegisterWriteBatch> {
-    entries.sort_by_key(|(register, _)| register.address);
-    let mut batches: Vec<RegisterWriteBatch> = Vec::new();
-    for (register, value) in entries {
-        let extends_last_batch = match batches.last() {
-            Some(batch) => {
-                let expected_next_address = batch
-                    .starting_address
-                    .wrapping_add(batch.entries.len() as u16);
-                register.address == expected_next_address
-                    && batch.entries.len() < MAX_REGISTER_WRITE_BATCH_SIZE
-            }
-            None => false,
-        };
-        if extends_last_batch {
-            batches.last_mut().unwrap().entries.push((register, value));
-        } else {
-            batches.push(RegisterWriteBatch {
-                starting_address: register.address,
-                entries: vec![(register, value)],
-            });
-        }
-    }
-    batches
-}
-
-struct CoilWriteBatch {
-    starting_address: u16,
-    entries: Vec<(CoilDescription, bool)>,
+    build_batches(
+        entries,
+        |(register, _)| register.address,
+        MAX_REGISTER_WRITE_BATCH_SIZE,
+    )
 }
 
 /// Coil counterpart of `build_register_write_batches`.
-fn build_coil_write_batches(mut entries: Vec<(CoilDescription, bool)>) -> Vec<CoilWriteBatch> {
-    entries.sort_by_key(|(coil, _)| coil.address);
-    let mut batches: Vec<CoilWriteBatch> = Vec::new();
-    for (coil, value) in entries {
-        let extends_last_batch = match batches.last() {
-            Some(batch) => {
-                let expected_next_address = batch
-                    .starting_address
-                    .wrapping_add(batch.entries.len() as u16);
-                coil.address == expected_next_address
-                    && batch.entries.len() < MAX_COIL_WRITE_BATCH_SIZE
-            }
-            None => false,
-        };
-        if extends_last_batch {
-            batches.last_mut().unwrap().entries.push((coil, value));
-        } else {
-            batches.push(CoilWriteBatch {
-                starting_address: coil.address,
-                entries: vec![(coil, value)],
-            });
-        }
-    }
-    batches
+fn build_coil_write_batches(entries: Vec<(CoilDescription, bool)>) -> Vec<CoilWriteBatch> {
+    build_batches(entries, |(coil, _)| coil.address, MAX_COIL_WRITE_BATCH_SIZE)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -183,7 +136,7 @@ pub fn run_transaction_consumer(
         }
 
         for batch in build_register_write_batches(register_entries) {
-            let status = if let [(register, value)] = batch.entries.as_slice() {
+            let status = if let [(register, value)] = batch.items.as_slice() {
                 handle.block_on(async {
                     let mut connection = connection.lock().await;
                     confirm_write(
@@ -196,7 +149,7 @@ pub fn run_transaction_consumer(
                     .await
                 })
             } else {
-                let values: Vec<u16> = batch.entries.iter().map(|(_, value)| *value).collect();
+                let values: Vec<u16> = batch.items.iter().map(|(_, value)| *value).collect();
                 handle.block_on(async {
                     let mut connection = connection.lock().await;
                     confirm_write_multiple(
@@ -210,7 +163,7 @@ pub fn run_transaction_consumer(
                 })
             };
 
-            for (register, value) in &batch.entries {
+            for (register, value) in &batch.items {
                 if status == WriteStatus::Ok {
                     store
                         .lock()
@@ -225,14 +178,14 @@ pub fn run_transaction_consumer(
         }
 
         for batch in build_coil_write_batches(coil_entries) {
-            let status = if let [(coil, value)] = batch.entries.as_slice() {
+            let status = if let [(coil, value)] = batch.items.as_slice() {
                 handle.block_on(async {
                     let mut connection = connection.lock().await;
                     confirm_coil_write(&mut connection, coil, CoilValue(*value), unit_id, timeout)
                         .await
                 })
             } else {
-                let values: Vec<bool> = batch.entries.iter().map(|(_, value)| *value).collect();
+                let values: Vec<bool> = batch.items.iter().map(|(_, value)| *value).collect();
                 handle.block_on(async {
                     let mut connection = connection.lock().await;
                     confirm_coil_write_multiple(
@@ -246,7 +199,7 @@ pub fn run_transaction_consumer(
                 })
             };
 
-            for (coil, value) in &batch.entries {
+            for (coil, value) in &batch.items {
                 if status == WriteStatus::Ok {
                     coil_store
                         .lock()
