@@ -19,9 +19,11 @@
 // close to "efficient" as the protocol allows.
 
 use crate::connection::Connection;
-use fuse_fs::{RegisterStore, RegisterValue};
-use protocol::device_description::{DataType, RegisterDescription};
-use protocol::pdu::{ReadHoldingRegistersRequest, ReadHoldingRegistersResponse};
+use fuse_fs::{CoilStore, CoilValue, RegisterStore, RegisterValue};
+use protocol::device_description::{CoilDescription, DataType, RegisterDescription};
+use protocol::pdu::{
+    ReadCoilsRequest, ReadCoilsResponse, ReadHoldingRegistersRequest, ReadHoldingRegistersResponse,
+};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -29,6 +31,11 @@ use tokio::sync::Mutex as AsyncMutex;
 // Modbus's own limit on how many registers one Read Holding Registers
 // request may ask for (function code 0x03).
 const MAX_READ_BATCH_SIZE: u16 = 125;
+
+// Modbus's own limit on how many coils one Read Coils request may ask for
+// (function code 0x01) — much higher than registers since coils are packed
+// 8-to-a-byte on the wire instead of 2 bytes each.
+const MAX_COIL_READ_BATCH_SIZE: u16 = 2000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegisterBatch {
@@ -73,6 +80,103 @@ pub fn build_read_batches(registers: &[RegisterDescription]) -> Vec<RegisterBatc
         }
     }
     batches
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoilBatch {
+    pub starting_address: u16,
+    pub coils: Vec<CoilDescription>,
+}
+
+impl CoilBatch {
+    pub fn quantity(&self) -> u16 {
+        self.coils.len() as u16
+    }
+}
+
+/// Coil counterpart of `build_read_batches` — identical grouping logic
+/// (consecutive addresses share a batch, a gap starts a new one), just
+/// capped at Modbus's much higher per-request coil limit instead of the
+/// register one.
+pub fn build_coil_read_batches(coils: &[CoilDescription]) -> Vec<CoilBatch> {
+    let mut sorted: Vec<&CoilDescription> = coils.iter().collect();
+    sorted.sort_by_key(|coil| coil.address);
+
+    let mut batches: Vec<CoilBatch> = Vec::new();
+    for coil in sorted {
+        let extends_last_batch = match batches.last() {
+            Some(batch) => {
+                let expected_next_address = batch.starting_address.wrapping_add(batch.quantity());
+                coil.address == expected_next_address && batch.quantity() < MAX_COIL_READ_BATCH_SIZE
+            }
+            None => false,
+        };
+        if extends_last_batch {
+            batches.last_mut().unwrap().coils.push(coil.clone());
+        } else {
+            batches.push(CoilBatch {
+                starting_address: coil.address,
+                coils: vec![coil.clone()],
+            });
+        }
+    }
+    batches
+}
+
+/// Coil counterpart of `poll_once`: the same "apply successes, log and
+/// skip failures" shape. The one real difference is the length check
+/// against the decoded response — Read Coils packs bits 8-to-a-byte, so a
+/// coil count that isn't a multiple of 8 comes back padded with extra
+/// trailing bits (see `ReadCoilsResponse`'s own doc comment), hence `>=`
+/// here instead of the exact `==` the register version can use.
+pub async fn poll_coils_once(
+    connection: &Arc<AsyncMutex<Connection>>,
+    batches: &[CoilBatch],
+    coil_store: &Arc<Mutex<CoilStore>>,
+    unit_id: u8,
+    timeout: Duration,
+) {
+    for batch in batches {
+        let request_pdu = ReadCoilsRequest {
+            starting_address: batch.starting_address,
+            quantity: batch.quantity(),
+        }
+        .encode();
+
+        let result = {
+            let mut connection = connection.lock().await;
+            connection.request(unit_id, request_pdu, timeout).await
+        };
+
+        let response_pdu = match result {
+            Ok(response_pdu) => response_pdu,
+            Err(error) => {
+                eprintln!(
+                    "poll: read of {} coil(s) at {} failed: {error}",
+                    batch.quantity(),
+                    batch.starting_address
+                );
+                continue;
+            }
+        };
+
+        match ReadCoilsResponse::decode(&response_pdu) {
+            Ok(decoded) if decoded.coil_values.len() >= batch.coils.len() => {
+                let mut coil_store = coil_store.lock().unwrap_or_else(PoisonError::into_inner);
+                for (coil, value) in batch.coils.iter().zip(decoded.coil_values) {
+                    coil_store.set(coil.name.clone(), CoilValue(value));
+                }
+            }
+            Ok(_) | Err(_) => {
+                eprintln!(
+                    "poll: unexpected response reading {} coil(s) at {}: {:02X?}",
+                    batch.quantity(),
+                    batch.starting_address,
+                    response_pdu
+                );
+            }
+        }
+    }
 }
 
 /// Reads every batch once and applies successful results directly to
@@ -129,22 +233,27 @@ pub async fn poll_once(
     }
 }
 
-/// Polls every batch on a fixed interval, forever — meant to run as its
-/// own tokio task alongside the transaction consumer, sharing the same
-/// connection (`stream`).
+/// Polls every register and coil batch on a fixed interval, forever —
+/// meant to run as its own tokio task alongside the transaction consumer,
+/// sharing the same connection (`stream`).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_polling_loop(
     connection: Arc<AsyncMutex<Connection>>,
     registers: &[RegisterDescription],
     store: Arc<Mutex<RegisterStore>>,
+    coils: &[CoilDescription],
+    coil_store: Arc<Mutex<CoilStore>>,
     unit_id: u8,
     poll_interval: Duration,
     timeout: Duration,
 ) {
-    let batches = build_read_batches(registers);
+    let register_batches = build_read_batches(registers);
+    let coil_batches = build_coil_read_batches(coils);
     let mut ticker = tokio::time::interval(poll_interval);
     loop {
         ticker.tick().await;
-        poll_once(&connection, &batches, &store, unit_id, timeout).await;
+        poll_once(&connection, &register_batches, &store, unit_id, timeout).await;
+        poll_coils_once(&connection, &coil_batches, &coil_store, unit_id, timeout).await;
     }
 }
 
@@ -160,6 +269,13 @@ mod tests {
             address,
             data_type,
             access: AccessRight::ReadOnly,
+        }
+    }
+
+    fn coil(name: &str, address: u16) -> CoilDescription {
+        CoilDescription {
+            name: name.to_string(),
+            address,
         }
     }
 
@@ -230,6 +346,35 @@ mod tests {
         assert_eq!(batches[1].quantity(), 5);
     }
 
+    #[test]
+    fn contiguous_coils_are_grouped_into_one_batch() {
+        let coils = vec![coil("A", 1), coil("B", 2), coil("C", 3)];
+        let batches = build_coil_read_batches(&coils);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].starting_address, 1);
+        assert_eq!(batches[0].quantity(), 3);
+    }
+
+    #[test]
+    fn a_gap_in_coil_addresses_starts_a_new_batch() {
+        let coils = vec![coil("A", 1), coil("B", 10)];
+        let batches = build_coil_read_batches(&coils);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].starting_address, 1);
+        assert_eq!(batches[1].starting_address, 10);
+    }
+
+    #[test]
+    fn a_coil_batch_never_exceeds_the_modbus_read_limit() {
+        let coils: Vec<CoilDescription> = (0..2005)
+            .map(|offset| coil(&format!("C{offset}"), 1 + offset as u16))
+            .collect();
+        let batches = build_coil_read_batches(&coils);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].quantity(), 2000);
+        assert_eq!(batches[1].quantity(), 5);
+    }
+
     async fn connected_pair() -> (Connection, tokio::net::TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -289,5 +434,62 @@ mod tests {
         .await;
 
         assert_eq!(store.lock().unwrap().get("A"), None);
+    }
+
+    #[tokio::test]
+    async fn poll_coils_once_applies_a_successful_batch_to_the_store() {
+        let (connection, mut device) = connected_pair().await;
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let batches = build_coil_read_batches(&[coil("A", 1), coil("B", 2)]);
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            device.read_exact(&mut header).await.unwrap();
+            let mut pdu = vec![0u8; 5];
+            device.read_exact(&mut pdu).await.unwrap();
+
+            let response_pdu = ReadCoilsResponse {
+                coil_values: vec![true, false],
+            }
+            .encode();
+            let mut response = header;
+            let length = (response_pdu.len() + 1) as u16;
+            response[4..6].copy_from_slice(&length.to_be_bytes());
+            response.extend_from_slice(&response_pdu);
+            device.write_all(&response).await.unwrap();
+        });
+
+        poll_coils_once(
+            &connection,
+            &batches,
+            &coil_store,
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        device_task.await.unwrap();
+        assert_eq!(coil_store.lock().unwrap().get("A"), Some(CoilValue(true)));
+        assert_eq!(coil_store.lock().unwrap().get("B"), Some(CoilValue(false)));
+    }
+
+    #[tokio::test]
+    async fn poll_coils_once_leaves_the_store_untouched_when_the_device_times_out() {
+        let (connection, _device) = connected_pair().await;
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let batches = build_coil_read_batches(&[coil("A", 1)]);
+
+        poll_coils_once(
+            &connection,
+            &batches,
+            &coil_store,
+            0x01,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert_eq!(coil_store.lock().unwrap().get("A"), None);
     }
 }

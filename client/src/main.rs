@@ -141,6 +141,8 @@ fn main() {
     let consumer_connection = Arc::clone(&connection);
     let consumer_registers = registers.clone();
     let consumer_store = Arc::clone(&store);
+    let consumer_coils = coils.clone();
+    let consumer_coil_store = Arc::clone(&coil_store);
     let consumer_report = Arc::clone(&report);
     std::thread::spawn(move || {
         run_transaction_consumer(
@@ -148,6 +150,8 @@ fn main() {
             &consumer_connection,
             &consumer_registers,
             &consumer_store,
+            &consumer_coils,
+            &consumer_coil_store,
             &consumer_report,
             transaction_receiver,
             unit_id,
@@ -158,11 +162,15 @@ fn main() {
     let polling_connection = Arc::clone(&connection);
     let polling_store = Arc::clone(&store);
     let polling_registers = registers.clone();
+    let polling_coils = coils.clone();
+    let polling_coil_store = Arc::clone(&coil_store);
     runtime.spawn(async move {
         run_polling_loop(
             polling_connection,
             &polling_registers,
             polling_store,
+            &polling_coils,
+            polling_coil_store,
             unit_id,
             poll_interval,
             POLL_TIMEOUT,

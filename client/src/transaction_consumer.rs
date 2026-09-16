@@ -19,9 +19,9 @@
 // actually TCP or RTU underneath.
 
 use crate::connection::Connection;
-use crate::write_confirmation::confirm_write;
-use fuse_fs::{RegisterStore, StagedValue, WriteReport, WriteStatus};
-use protocol::device_description::RegisterDescription;
+use crate::write_confirmation::{confirm_coil_write, confirm_write};
+use fuse_fs::{CoilStore, RegisterStore, StagedValue, WriteReport, WriteStatus};
+use protocol::device_description::{CoilDescription, RegisterDescription};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -34,6 +34,8 @@ pub fn run_transaction_consumer(
     connection: &Arc<AsyncMutex<Connection>>,
     registers: &[RegisterDescription],
     store: &Arc<Mutex<RegisterStore>>,
+    coils: &[CoilDescription],
+    coil_store: &Arc<Mutex<CoilStore>>,
     report: &Arc<Mutex<WriteReport>>,
     transaction_receiver: mpsc::Receiver<HashMap<String, StagedValue>>,
     unit_id: u8,
@@ -41,29 +43,36 @@ pub fn run_transaction_consumer(
 ) {
     for transaction in transaction_receiver {
         for (name, value) in transaction {
-            // Coils have no wire write path yet (see fuse-fs's `coils/`
-            // milestone this is waiting on) — report and move on without
-            // touching the connection.
-            let StagedValue::Register(value) = value else {
-                report.lock().unwrap().set(
-                    name,
-                    WriteStatus::Failed("coil writes not yet supported".to_string()),
-                );
-                continue;
-            };
+            match value {
+                StagedValue::Register(value) => {
+                    let status = match registers.iter().find(|register| register.name == name) {
+                        Some(register) => handle.block_on(async {
+                            let mut connection = connection.lock().await;
+                            confirm_write(&mut connection, register, value, unit_id, timeout).await
+                        }),
+                        None => WriteStatus::Failed(format!("unknown register: {name}")),
+                    };
 
-            let status = match registers.iter().find(|register| register.name == name) {
-                Some(register) => handle.block_on(async {
-                    let mut connection = connection.lock().await;
-                    confirm_write(&mut connection, register, value, unit_id, timeout).await
-                }),
-                None => WriteStatus::Failed(format!("unknown register: {name}")),
-            };
+                    if status == WriteStatus::Ok {
+                        store.lock().unwrap().set(name.clone(), value);
+                    }
+                    report.lock().unwrap().set(name, status);
+                }
+                StagedValue::Coil(value) => {
+                    let status = match coils.iter().find(|coil| coil.name == name) {
+                        Some(coil) => handle.block_on(async {
+                            let mut connection = connection.lock().await;
+                            confirm_coil_write(&mut connection, coil, value, unit_id, timeout).await
+                        }),
+                        None => WriteStatus::Failed(format!("unknown coil: {name}")),
+                    };
 
-            if status == WriteStatus::Ok {
-                store.lock().unwrap().set(name.clone(), value);
+                    if status == WriteStatus::Ok {
+                        coil_store.lock().unwrap().set(name.clone(), value);
+                    }
+                    report.lock().unwrap().set(name, status);
+                }
             }
-            report.lock().unwrap().set(name, status);
         }
     }
 }
@@ -71,7 +80,7 @@ pub fn run_transaction_consumer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuse_fs::RegisterValue;
+    use fuse_fs::{CoilValue, RegisterValue};
     use protocol::device_description::{AccessRight, DataType};
 
     fn u16_register() -> RegisterDescription {
@@ -80,6 +89,13 @@ mod tests {
             address: 40001,
             data_type: DataType::U16,
             access: AccessRight::ReadWrite,
+        }
+    }
+
+    fn a_coil() -> CoilDescription {
+        CoilDescription {
+            name: "Motor_Running".to_string(),
+            address: 1,
         }
     }
 
@@ -96,8 +112,10 @@ mod tests {
         let (connection, mut device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
         let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let registers = vec![u16_register()];
+        let coils: Vec<CoilDescription> = vec![];
 
         let device_task = tokio::spawn(async move {
             let mut header = vec![0u8; 7];
@@ -118,6 +136,7 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_store = Arc::clone(&store);
+        let consumer_coil_store = Arc::clone(&coil_store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
@@ -125,6 +144,8 @@ mod tests {
                 &connection,
                 &registers,
                 &consumer_store,
+                &coils,
+                &consumer_coil_store,
                 &consumer_report,
                 transaction_receiver,
                 0x01,
@@ -160,8 +181,10 @@ mod tests {
         let (connection, mut device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
         let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let registers = vec![u16_register()];
+        let coils: Vec<CoilDescription> = vec![];
 
         let device_task = tokio::spawn(async move {
             let mut header = vec![0u8; 7];
@@ -189,6 +212,7 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_store = Arc::clone(&store);
+        let consumer_coil_store = Arc::clone(&coil_store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
@@ -196,6 +220,8 @@ mod tests {
                 &connection,
                 &registers,
                 &consumer_store,
+                &coils,
+                &consumer_coil_store,
                 &consumer_report,
                 transaction_receiver,
                 0x01,
@@ -226,12 +252,15 @@ mod tests {
         let (connection, device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
         let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let registers = vec![u16_register()];
+        let coils: Vec<CoilDescription> = vec![];
 
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_store = Arc::clone(&store);
+        let consumer_coil_store = Arc::clone(&coil_store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
@@ -239,6 +268,8 @@ mod tests {
                 &connection,
                 &registers,
                 &consumer_store,
+                &coils,
+                &consumer_coil_store,
                 &consumer_report,
                 transaction_receiver,
                 0x01,
@@ -264,5 +295,72 @@ mod tests {
         // Nothing was ever sent to the "device" — dropping it without a
         // pending read (which would panic on EOF) confirms that.
         drop(device);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn confirms_a_coil_write_and_updates_store_and_report() {
+        let (connection, mut device) = connected_pair().await;
+        let (transaction_sender, transaction_receiver) = mpsc::channel();
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let registers: Vec<RegisterDescription> = vec![];
+        let coils = vec![a_coil()];
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut header)
+                .await
+                .unwrap();
+            let mut pdu = vec![0u8; 5];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut pdu)
+                .await
+                .unwrap();
+            let mut response = header;
+            response.extend_from_slice(&pdu);
+            tokio::io::AsyncWriteExt::write_all(&mut device, &response)
+                .await
+                .unwrap();
+        });
+
+        let handle = Handle::current();
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let consumer_store = Arc::clone(&store);
+        let consumer_coil_store = Arc::clone(&coil_store);
+        let consumer_report = Arc::clone(&report);
+        let consumer_thread = std::thread::spawn(move || {
+            run_transaction_consumer(
+                &handle,
+                &connection,
+                &registers,
+                &consumer_store,
+                &coils,
+                &consumer_coil_store,
+                &consumer_report,
+                transaction_receiver,
+                0x01,
+                Duration::from_secs(1),
+            );
+        });
+
+        let mut transaction = HashMap::new();
+        transaction.insert(
+            "Motor_Running".to_string(),
+            StagedValue::Coil(CoilValue(true)),
+        );
+        transaction_sender.send(transaction).unwrap();
+        drop(transaction_sender);
+
+        device_task.await.unwrap();
+        consumer_thread.join().unwrap();
+
+        assert_eq!(
+            coil_store.lock().unwrap().get("Motor_Running"),
+            Some(CoilValue(true))
+        );
+        assert_eq!(
+            report.lock().unwrap().get("Motor_Running"),
+            Some(&WriteStatus::Ok)
+        );
     }
 }

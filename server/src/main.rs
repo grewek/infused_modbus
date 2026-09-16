@@ -28,7 +28,7 @@
 
 use fuse_fs::filesystem::InfusedFilesystem;
 use fuse_fs::{CoilStore, RegisterStore, WriteReport};
-use protocol::device_description::{DeviceDescription, RegisterDescription};
+use protocol::device_description::{CoilDescription, DeviceDescription, RegisterDescription};
 use server::connection::{serve_rtu_connection, serve_tcp_connection};
 use server::transaction_consumer::run_transaction_consumer;
 use std::sync::{Arc, Mutex, mpsc};
@@ -46,11 +46,14 @@ fn usage() -> ! {
     std::process::exit(1);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_serving(
     runtime: &tokio::runtime::Runtime,
     connection_string: &str,
     registers: Arc<Vec<RegisterDescription>>,
     store: Arc<Mutex<RegisterStore>>,
+    coils: Arc<Vec<CoilDescription>>,
+    coil_store: Arc<Mutex<CoilStore>>,
     toml_source: Arc<String>,
 ) {
     if let Some(bind_address) = connection_string.strip_prefix("tcp://") {
@@ -67,10 +70,20 @@ fn start_serving(
                 };
                 let registers = Arc::clone(&registers);
                 let store = Arc::clone(&store);
+                let coils = Arc::clone(&coils);
+                let coil_store = Arc::clone(&coil_store);
                 let toml_source = Arc::clone(&toml_source);
                 tokio::spawn(async move {
-                    serve_tcp_connection(stream, registers, store, toml_source, REQUEST_TIMEOUT)
-                        .await;
+                    serve_tcp_connection(
+                        stream,
+                        registers,
+                        store,
+                        coils,
+                        coil_store,
+                        toml_source,
+                        REQUEST_TIMEOUT,
+                    )
+                    .await;
                 });
             }
         });
@@ -100,6 +113,8 @@ fn start_serving(
                 stream,
                 registers,
                 store,
+                coils,
+                coil_store,
                 toml_source,
                 frame_silence,
                 REQUEST_TIMEOUT,
@@ -136,9 +151,15 @@ fn main() {
     let (transaction_sender, transaction_receiver) = mpsc::channel();
 
     let consumer_store = Arc::clone(&store);
+    let consumer_coil_store = Arc::clone(&coil_store);
     let consumer_report = Arc::clone(&report);
     std::thread::spawn(move || {
-        run_transaction_consumer(&consumer_store, &consumer_report, transaction_receiver);
+        run_transaction_consumer(
+            &consumer_store,
+            &consumer_coil_store,
+            &consumer_report,
+            transaction_receiver,
+        );
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");
@@ -147,6 +168,8 @@ fn main() {
         &connection_string,
         Arc::new(registers.clone()),
         Arc::clone(&store),
+        Arc::new(coils.clone()),
+        Arc::clone(&coil_store),
         Arc::new(toml_source.clone()),
     );
 

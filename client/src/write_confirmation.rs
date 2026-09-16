@@ -2,10 +2,10 @@
 // turning the device's response back into a WriteStatus.
 
 use crate::connection::Connection;
-use fuse_fs::{RegisterValue, WriteStatus};
+use fuse_fs::{CoilValue, RegisterValue, WriteStatus};
 use protocol::DecodeError;
-use protocol::device_description::{DataType, RegisterDescription};
-use protocol::pdu::{ExceptionResponse, WriteSingleRegisterRequest};
+use protocol::device_description::{CoilDescription, DataType, RegisterDescription};
+use protocol::pdu::{ExceptionResponse, WriteSingleCoilRequest, WriteSingleRegisterRequest};
 use std::time::Duration;
 
 /// Encodes the Modbus request PDU for writing `value` to `register`.
@@ -33,6 +33,17 @@ pub fn encode_write_request(
             register.name
         )),
     }
+}
+
+/// Encodes the Modbus request PDU for writing `value` to `coil`. Unlike
+/// `encode_write_request`, this can't fail: a coil is always exactly one
+/// bit, so there's no F32-style word-order ambiguity to reject.
+pub fn encode_coil_write_request(coil: &CoilDescription, value: CoilValue) -> Vec<u8> {
+    WriteSingleCoilRequest {
+        coil_address: coil.address,
+        coil_value: value.0,
+    }
+    .encode()
 }
 
 /// Interprets a write response PDU: a Modbus exception response means the
@@ -75,6 +86,23 @@ pub async fn confirm_write(
     }
 }
 
+/// Coil counterpart of `confirm_write` — same round trip and the same
+/// `interpret_write_response` interpretation of the result, since a
+/// successful Write Single Coil response also just echoes the request.
+pub async fn confirm_coil_write(
+    connection: &mut Connection,
+    coil: &CoilDescription,
+    value: CoilValue,
+    unit_id: u8,
+    timeout: Duration,
+) -> WriteStatus {
+    let pdu = encode_coil_write_request(coil, value);
+    match connection.request(unit_id, pdu, timeout).await {
+        Ok(response_pdu) => interpret_write_response(&response_pdu),
+        Err(error) => WriteStatus::Failed(format!("write failed: {error}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +115,19 @@ mod tests {
             data_type: DataType::U16,
             access: AccessRight::ReadWrite,
         }
+    }
+
+    fn a_coil() -> CoilDescription {
+        CoilDescription {
+            name: "Motor_Running".to_string(),
+            address: 1,
+        }
+    }
+
+    #[test]
+    fn encode_coil_write_request_builds_write_single_coil_pdu() {
+        let pdu = encode_coil_write_request(&a_coil(), CoilValue(true));
+        assert_eq!(pdu, vec![0x05, 0x00, 0x01, 0xFF, 0x00]);
     }
 
     fn f32_register() -> RegisterDescription {
@@ -263,6 +304,95 @@ mod tests {
             RegisterValue::F32(3.5),
             0x01,
             Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(status, WriteStatus::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn confirm_coil_write_returns_ok_when_device_echoes_the_write() {
+        let (mut connection, mut device) = connected_pair().await;
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut header)
+                .await
+                .unwrap();
+            let mut pdu = vec![0u8; 5];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut pdu)
+                .await
+                .unwrap();
+            let mut response = header;
+            response.extend_from_slice(&pdu);
+            tokio::io::AsyncWriteExt::write_all(&mut device, &response)
+                .await
+                .unwrap();
+        });
+
+        let status = confirm_coil_write(
+            &mut connection,
+            &a_coil(),
+            CoilValue(true),
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(status, WriteStatus::Ok);
+        device_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirm_coil_write_returns_failed_when_device_returns_an_exception() {
+        let (mut connection, mut device) = connected_pair().await;
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut header)
+                .await
+                .unwrap();
+            let mut pdu = vec![0u8; 5];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut pdu)
+                .await
+                .unwrap();
+            let exception = ExceptionResponse {
+                function_code: 0x05,
+                exception_code: 0x02,
+            }
+            .encode();
+            let mut response = header;
+            let length = (exception.len() + 1) as u16;
+            response[4..6].copy_from_slice(&length.to_be_bytes());
+            response.extend_from_slice(&exception);
+            tokio::io::AsyncWriteExt::write_all(&mut device, &response)
+                .await
+                .unwrap();
+        });
+
+        let status = confirm_coil_write(
+            &mut connection,
+            &a_coil(),
+            CoilValue(true),
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(status, WriteStatus::Failed(_)));
+        device_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirm_coil_write_returns_failed_when_the_device_never_responds() {
+        let (mut connection, _device) = connected_pair().await;
+
+        let status = confirm_coil_write(
+            &mut connection,
+            &a_coil(),
+            CoilValue(true),
+            0x01,
+            Duration::from_millis(50),
         )
         .await;
 

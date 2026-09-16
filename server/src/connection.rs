@@ -4,8 +4,8 @@
 // its own spawned tokio task, which needs 'static ownership.
 
 use crate::handler::handle_request;
-use fuse_fs::RegisterStore;
-use protocol::device_description::RegisterDescription;
+use fuse_fs::{CoilStore, RegisterStore};
+use protocol::device_description::{CoilDescription, RegisterDescription};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -16,10 +16,13 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// hardening — a stalled peer can't hang this forever). Ending the loop
 /// here just means this one connection is done — the accept loop that
 /// spawned this task keeps accepting new ones.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_tcp_connection<S>(
     mut stream: S,
     registers: Arc<Vec<RegisterDescription>>,
     store: Arc<Mutex<RegisterStore>>,
+    coils: Arc<Vec<CoilDescription>>,
+    coil_store: Arc<Mutex<CoilStore>>,
     toml_source: Arc<String>,
     timeout: Duration,
 ) where
@@ -34,6 +37,8 @@ pub async fn serve_tcp_connection<S>(
         // owned clones sidestep it entirely, and Arc::clone is cheap.
         let handler_registers = Arc::clone(&registers);
         let handler_store = Arc::clone(&store);
+        let handler_coils = Arc::clone(&coils);
+        let handler_coil_store = Arc::clone(&coil_store);
         let handler_toml_source = Arc::clone(&toml_source);
         let result = protocol::tcp::serve_request(
             &mut stream,
@@ -42,6 +47,8 @@ pub async fn serve_tcp_connection<S>(
                     pdu,
                     &handler_registers,
                     &handler_store,
+                    &handler_coils,
+                    &handler_coil_store,
                     &handler_toml_source,
                 )
             },
@@ -67,6 +74,8 @@ pub async fn serve_rtu_connection<S>(
     mut stream: S,
     registers: Arc<Vec<RegisterDescription>>,
     store: Arc<Mutex<RegisterStore>>,
+    coils: Arc<Vec<CoilDescription>>,
+    coil_store: Arc<Mutex<CoilStore>>,
     toml_source: Arc<String>,
     frame_silence: Duration,
     timeout: Duration,
@@ -76,6 +85,8 @@ pub async fn serve_rtu_connection<S>(
     loop {
         let handler_registers = Arc::clone(&registers);
         let handler_store = Arc::clone(&store);
+        let handler_coils = Arc::clone(&coils);
+        let handler_coil_store = Arc::clone(&coil_store);
         let handler_toml_source = Arc::clone(&toml_source);
         let result = protocol::rtu::serve_request(
             &mut stream,
@@ -84,6 +95,8 @@ pub async fn serve_rtu_connection<S>(
                     pdu,
                     &handler_registers,
                     &handler_store,
+                    &handler_coils,
+                    &handler_coil_store,
                     &handler_toml_source,
                 )
             },
@@ -126,6 +139,14 @@ mod tests {
         ])
     }
 
+    fn coils() -> Arc<Vec<CoilDescription>> {
+        Arc::new(Vec::new())
+    }
+
+    fn coil_store() -> Arc<Mutex<CoilStore>> {
+        Arc::new(Mutex::new(CoilStore::new()))
+    }
+
     #[tokio::test]
     async fn serves_a_read_request_from_the_current_store_value() {
         let (mut master, server_stream) = tokio::io::duplex(1024);
@@ -139,6 +160,8 @@ mod tests {
             server_stream,
             registers(),
             Arc::clone(&store),
+            coils(),
+            coil_store(),
             Arc::new(String::new()),
             Duration::from_secs(1),
         ));
@@ -177,6 +200,8 @@ mod tests {
             server_stream,
             registers(),
             Arc::clone(&store),
+            coils(),
+            coil_store(),
             Arc::new(String::new()),
             Duration::from_secs(1),
         ));
@@ -221,6 +246,8 @@ mod tests {
             server_stream,
             registers(),
             Arc::clone(&store),
+            coils(),
+            coil_store(),
             Arc::new(String::new()),
             Duration::from_secs(1),
         ));
@@ -267,6 +294,8 @@ mod tests {
             server_stream,
             registers(),
             Arc::clone(&store),
+            coils(),
+            coil_store(),
             Arc::new(String::new()),
             Duration::from_millis(20),
             Duration::from_secs(1),
@@ -306,6 +335,8 @@ mod tests {
             server_stream,
             registers(),
             Arc::clone(&store),
+            coils(),
+            coil_store(),
             Arc::new(String::new()),
             Duration::from_millis(20),
             Duration::from_secs(1),
