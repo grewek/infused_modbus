@@ -98,7 +98,8 @@ pub fn run_transaction_consumer(
 
         // Resolve every staged name against the known registers/coils
         // first, reporting anything unknown or not yet writable over the
-        // wire (F32) immediately — only what's left gets batched below.
+        // wire (anything but U16 registers, for now) immediately — only
+        // what's left gets batched below.
         for (name, value) in transaction {
             match value {
                 StagedValue::Register(RegisterValue::U16(value)) => {
@@ -113,11 +114,14 @@ pub fn run_transaction_consumer(
                         }
                     }
                 }
-                StagedValue::Register(RegisterValue::F32(_)) => {
+                // Every other RegisterValue type (F32 and the wider set
+                // added alongside it) has no wire write path yet — see
+                // write_confirmation.rs's own scope note.
+                StagedValue::Register(_) => {
                     report.lock().unwrap().set(
                         name,
                         WriteStatus::Failed(
-                            "F32 writes not yet supported (32-bit word order over two registers hasn't been decided)"
+                            "only u16 register writes are supported over the wire so far"
                                 .to_string(),
                         ),
                     );

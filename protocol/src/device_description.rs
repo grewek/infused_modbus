@@ -6,11 +6,53 @@ use std::fmt;
 // nothing concretely needs them yet (per Extraction-Based Programming) — add
 // them once a real consumer, like the in-memory register store, needs to
 // apply a scale factor.
+//
+// U24/I24 exist because some real devices use them (audio-style 24-bit
+// values), even though Modbus has no native 24-bit register — they occupy
+// two registers (32 bits) with the most-significant byte always zero/unused
+// padding, same as if they were a 32-bit value with a restricted range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DataType {
+    U8,
+    I8,
     U16,
+    I16,
+    U24,
+    I24,
+    U32,
+    I32,
+    U64,
+    I64,
     F32,
+    F64,
+}
+
+// How a device lays a multi-register value's bytes out on the wire before
+// Modbus's own (fixed, non-configurable) big-endian-per-register framing
+// takes over. Real devices vary along two independent axes — which
+// register holds the more significant half of the value ("word order"),
+// and whether each register's own two bytes are in their natural order or
+// swapped ("byte order") — and the four combinations of those two axes are
+// conventionally named after which of a 32-bit value's four bytes (A =
+// most significant .. D = least significant) ends up where on the wire:
+// ABCD (big-endian, both axes "natural"), DCBA (little-endian, both
+// swapped), and the two mixed conventions BADC/CDAB that real devices
+// (e.g. some Schneider/Modicon PLCs, for CDAB) also use. Only meaningful
+// for values spanning more than one register (U24 and up) — U8/I8/U16/I16
+// fit in a single register, whose own byte order Modbus already fixes.
+// `Default` exists only so `RawRegisterSection` (below) can derive its own
+// `Default`, used solely when the whole `[registers]` section is absent —
+// same as `base_address`'s meaningless-when-unused default of 0, `Abcd`
+// here is never actually applied to a real register.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemLayout {
+    #[default]
+    Abcd,
+    Badc,
+    Cdab,
+    Dcba,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -50,6 +92,10 @@ pub struct CoilDescription {
 pub struct DeviceDescription {
     pub registers: Vec<RegisterDescription>,
     pub coils: Vec<CoilDescription>,
+    // Global for the whole device, not per-register: real devices bake
+    // their word/byte order into firmware once, not per data point — see
+    // MemLayout's own doc comment. Meaningless when `registers` is empty.
+    pub mem_layout: MemLayout,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +109,8 @@ struct RawRegisterEntry {
 #[derive(Debug, Default, Deserialize)]
 struct RawRegisterSection {
     base_address: u16,
+    #[serde(rename = "mem-layout")]
+    mem_layout: MemLayout,
     entries: Vec<RawRegisterEntry>,
 }
 
@@ -153,6 +201,7 @@ fn resolve_addresses<Entry>(
 impl DeviceDescription {
     pub fn parse(toml_source: &str) -> Result<Self, DeviceDescriptionError> {
         let raw: RawDeviceDescription = toml::from_str(toml_source)?;
+        let mem_layout = raw.registers.mem_layout;
 
         let registers = resolve_addresses(
             raw.registers.base_address,
@@ -182,7 +231,11 @@ impl DeviceDescription {
         })
         .collect();
 
-        Ok(DeviceDescription { registers, coils })
+        Ok(DeviceDescription {
+            registers,
+            coils,
+            mem_layout,
+        })
     }
 }
 
@@ -195,6 +248,7 @@ mod tests {
         let toml_source = r#"
             [registers]
             base_address = 40000
+            mem-layout = "abcd"
 
             [[registers.entries]]
             name = "Tank_Temperature"
@@ -249,8 +303,175 @@ mod tests {
                         address: 2,
                     },
                 ],
+                mem_layout: MemLayout::Abcd,
             }
         );
+    }
+
+    #[test]
+    fn parse_reads_every_data_type() {
+        let toml_source = r#"
+            [registers]
+            base_address = 0
+            mem-layout = "abcd"
+
+            [[registers.entries]]
+            name = "A"
+            offset = 0
+            data_type = "u8"
+            access = "read_only"
+
+            [[registers.entries]]
+            name = "B"
+            offset = 1
+            data_type = "i8"
+            access = "read_only"
+
+            [[registers.entries]]
+            name = "C"
+            offset = 2
+            data_type = "u16"
+            access = "read_only"
+
+            [[registers.entries]]
+            name = "D"
+            offset = 3
+            data_type = "i16"
+            access = "read_only"
+
+            [[registers.entries]]
+            name = "E"
+            offset = 4
+            data_type = "u24"
+            access = "read_only"
+
+            [[registers.entries]]
+            name = "F"
+            offset = 5
+            data_type = "i24"
+            access = "read_only"
+
+            [[registers.entries]]
+            name = "G"
+            offset = 6
+            data_type = "u32"
+            access = "read_only"
+
+            [[registers.entries]]
+            name = "H"
+            offset = 7
+            data_type = "i32"
+            access = "read_only"
+
+            [[registers.entries]]
+            name = "I"
+            offset = 8
+            data_type = "u64"
+            access = "read_only"
+
+            [[registers.entries]]
+            name = "J"
+            offset = 9
+            data_type = "i64"
+            access = "read_only"
+
+            [[registers.entries]]
+            name = "K"
+            offset = 10
+            data_type = "f32"
+            access = "read_only"
+
+            [[registers.entries]]
+            name = "L"
+            offset = 11
+            data_type = "f64"
+            access = "read_only"
+        "#;
+
+        let description = DeviceDescription::parse(toml_source).unwrap();
+
+        let data_types: Vec<DataType> = description
+            .registers
+            .iter()
+            .map(|register| register.data_type)
+            .collect();
+        assert_eq!(
+            data_types,
+            vec![
+                DataType::U8,
+                DataType::I8,
+                DataType::U16,
+                DataType::I16,
+                DataType::U24,
+                DataType::I24,
+                DataType::U32,
+                DataType::I32,
+                DataType::U64,
+                DataType::I64,
+                DataType::F32,
+                DataType::F64,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_reads_every_mem_layout() {
+        for (tag, expected) in [
+            ("abcd", MemLayout::Abcd),
+            ("badc", MemLayout::Badc),
+            ("cdab", MemLayout::Cdab),
+            ("dcba", MemLayout::Dcba),
+        ] {
+            let toml_source = format!(
+                r#"
+                    [registers]
+                    base_address = 0
+                    mem-layout = "{tag}"
+
+                    [[registers.entries]]
+                    name = "A"
+                    offset = 0
+                    data_type = "u16"
+                    access = "read_only"
+                "#
+            );
+
+            let description = DeviceDescription::parse(&toml_source).unwrap();
+            assert_eq!(description.mem_layout, expected);
+        }
+    }
+
+    #[test]
+    fn parse_rejects_missing_mem_layout() {
+        let toml_source = r#"
+            [registers]
+            base_address = 40000
+
+            [[registers.entries]]
+            name = "Tank_Temperature"
+            offset = 1
+            data_type = "u16"
+            access = "read_only"
+        "#;
+
+        assert!(DeviceDescription::parse(toml_source).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_unknown_mem_layout() {
+        let toml_source = r#"
+            [registers]
+            base_address = 40000
+            mem-layout = "wxyz"
+
+            [[registers.entries]]
+            name = "Tank_Temperature"
+            offset = 1
+            data_type = "u16"
+            access = "read_only"
+        "#;
+
+        assert!(DeviceDescription::parse(toml_source).is_err());
     }
 
     #[test]
@@ -258,6 +479,7 @@ mod tests {
         let toml_source = r#"
             [registers]
             base_address = 40000
+            mem-layout = "abcd"
 
             [[registers.entries]]
             name = "Tank_Temperature"
@@ -293,6 +515,7 @@ mod tests {
         let toml_source = r#"
             [registers]
             base_address = 40000
+            mem-layout = "abcd"
 
             [[registers.entries]]
             name = "Tank_Temperature"
@@ -345,11 +568,12 @@ mod tests {
         let toml_source = r#"
             [registers]
             base_address = 40000
+            mem-layout = "abcd"
 
             [[registers.entries]]
             name = "Tank_Temperature"
             offset = 1
-            data_type = "u32"
+            data_type = "u128"
             access = "read_only"
         "#;
 
@@ -361,6 +585,7 @@ mod tests {
         let toml_source = r#"
             [registers]
             base_address = 40000
+            mem-layout = "abcd"
 
             [[registers.entries]]
             name = "Tank_Temperature"
@@ -384,6 +609,7 @@ mod tests {
         let toml_source = r#"
             [registers]
             base_address = 65535
+            mem-layout = "abcd"
 
             [[registers.entries]]
             name = "Tank_Temperature"

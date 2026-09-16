@@ -4,19 +4,44 @@ use std::collections::HashMap;
 use std::fmt;
 
 // Mirrors protocol::device_description::DataType — a register's value is
-// whichever of these its TOML description declares it to be.
+// whichever of these its TOML description declares it to be. U24/I24 have
+// no native Rust type, so they're stored in the next-larger native integer
+// (u32/i32) with the value always kept within the 24-bit range — see
+// fuse_fs::filesystem::InfusedFilesystem::parse_register_value, the one
+// place that constructs a RegisterValue from user/text input and enforces
+// that range.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RegisterValue {
+    U8(u8),
+    I8(i8),
     U16(u16),
+    I16(i16),
+    U24(u32),
+    I24(i32),
+    U32(u32),
+    I32(i32),
+    U64(u64),
+    I64(i64),
     F32(f32),
+    F64(f64),
 }
 
 // How a register's value is rendered as the content of its FUSE file.
 impl fmt::Display for RegisterValue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            RegisterValue::U8(value) => write!(formatter, "{value}"),
+            RegisterValue::I8(value) => write!(formatter, "{value}"),
             RegisterValue::U16(value) => write!(formatter, "{value}"),
+            RegisterValue::I16(value) => write!(formatter, "{value}"),
+            RegisterValue::U24(value) => write!(formatter, "{value}"),
+            RegisterValue::I24(value) => write!(formatter, "{value}"),
+            RegisterValue::U32(value) => write!(formatter, "{value}"),
+            RegisterValue::I32(value) => write!(formatter, "{value}"),
+            RegisterValue::U64(value) => write!(formatter, "{value}"),
+            RegisterValue::I64(value) => write!(formatter, "{value}"),
             RegisterValue::F32(value) => write!(formatter, "{value}"),
+            RegisterValue::F64(value) => write!(formatter, "{value}"),
         }
     }
 }
@@ -232,6 +257,29 @@ mod tests {
     #[test]
     fn f32_value_displays_as_plain_decimal() {
         assert_eq!(RegisterValue::F32(3.5).to_string(), "3.5");
+    }
+
+    #[test]
+    fn every_new_register_value_variant_displays_as_plain_decimal() {
+        assert_eq!(RegisterValue::U8(255).to_string(), "255");
+        assert_eq!(RegisterValue::I8(-128).to_string(), "-128");
+        assert_eq!(RegisterValue::I16(-1234).to_string(), "-1234");
+        assert_eq!(RegisterValue::U24(0x00FF_FFFF).to_string(), "16777215");
+        assert_eq!(RegisterValue::I24(-8_388_608).to_string(), "-8388608");
+        assert_eq!(RegisterValue::U32(4_000_000_000).to_string(), "4000000000");
+        assert_eq!(
+            RegisterValue::I32(-2_000_000_000).to_string(),
+            "-2000000000"
+        );
+        assert_eq!(
+            RegisterValue::U64(18_000_000_000_000_000_000).to_string(),
+            "18000000000000000000"
+        );
+        assert_eq!(
+            RegisterValue::I64(-9_000_000_000_000_000_000).to_string(),
+            "-9000000000000000000"
+        );
+        assert_eq!(RegisterValue::F64(3.5).to_string(), "3.5");
     }
 
     #[test]
