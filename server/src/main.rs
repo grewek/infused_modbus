@@ -15,11 +15,10 @@
 //   tcp://<bind-address:port>          e.g. tcp://0.0.0.0:502
 //   rtu://<serial-path>:<baud-rate>    e.g. rtu:///dev/ttyUSB0:9600
 //
-// Scope of this first pass (see handler.rs/connection.rs for detail): only
-// U16 registers over Read Holding Registers / Write Single Register are
-// served; F32 registers and Write Multiple Registers requests get a
-// Modbus exception rather than a guessed wire format, matching the same
-// boundary drawn on the client side.
+// Scope (see handler.rs for detail): every register DataType can be read
+// (Read Holding Registers), but only U16 registers can be *written* over
+// the wire (Write Single/Multiple Register) — writing anything else still
+// gets a Modbus exception rather than a guessed wire format.
 //
 // Also serves FC 43 / MEI 0x0E (Read Device Identification, Extended
 // access only) so a client can fetch this server's device-description.toml
@@ -28,7 +27,9 @@
 
 use fuse_fs::filesystem::InfusedFilesystem;
 use fuse_fs::{CoilStore, RegisterStore, WriteReport};
-use protocol::device_description::{CoilDescription, DeviceDescription, RegisterDescription};
+use protocol::device_description::{
+    CoilDescription, DeviceDescription, MemLayout, RegisterDescription,
+};
 use server::connection::{serve_rtu_connection, serve_tcp_connection};
 use server::transaction_consumer::run_transaction_consumer;
 use std::sync::{Arc, Mutex, mpsc};
@@ -54,6 +55,7 @@ fn start_serving(
     store: Arc<Mutex<RegisterStore>>,
     coils: Arc<Vec<CoilDescription>>,
     coil_store: Arc<Mutex<CoilStore>>,
+    mem_layout: MemLayout,
     toml_source: Arc<String>,
 ) {
     if let Some(bind_address) = connection_string.strip_prefix("tcp://") {
@@ -80,6 +82,7 @@ fn start_serving(
                         store,
                         coils,
                         coil_store,
+                        mem_layout,
                         toml_source,
                         REQUEST_TIMEOUT,
                     )
@@ -115,6 +118,7 @@ fn start_serving(
                 store,
                 coils,
                 coil_store,
+                mem_layout,
                 toml_source,
                 frame_silence,
                 REQUEST_TIMEOUT,
@@ -144,6 +148,7 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed to parse {device_description_path}: {error}"));
     let registers = description.registers;
     let coils = description.coils;
+    let mem_layout = description.mem_layout;
 
     let store = Arc::new(Mutex::new(RegisterStore::new()));
     let coil_store = Arc::new(Mutex::new(CoilStore::new()));
@@ -170,6 +175,7 @@ fn main() {
         Arc::clone(&store),
         Arc::new(coils.clone()),
         Arc::clone(&coil_store),
+        mem_layout,
         Arc::new(toml_source.clone()),
     );
 

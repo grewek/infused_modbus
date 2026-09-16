@@ -10,9 +10,14 @@
 // talking to a real external device).
 //
 // Scope of this first pass, matching the client's write_confirmation.rs:
-// only U16 registers are supported for reads/writes. Coils get the same
-// Read/Write treatment (Read Coils / Write Single Coil / Write Multiple
-// Coils); a coil is always read/write (see
+// only U16 registers are supported for *writes*. Reads now serve every
+// DataType (see handle_read) — the register store already holds properly
+// typed RegisterValues regardless of how they got there (locally staged or,
+// once wired, a future confirmed external write), so reading them back out
+// doesn't have the write side's word-order-hasn't-been-decided problem;
+// that problem was actually mem_layout, and it's decided now. Coils get the
+// same Read/Write treatment (Read Coils / Write Single Coil / Write
+// Multiple Coils); a coil is always read/write (see
 // protocol::device_description::CoilDescription's own doc comment), so
 // unlike registers there's no access-right check on the write side.
 //
@@ -23,8 +28,11 @@
 // old or the fully-requested new one.
 
 use crate::device_identification::{build_objects, handle_read_device_identification};
+use fuse_fs::register_encoding::register_value_to_words;
 use fuse_fs::{CoilStore, CoilValue, RegisterStore, RegisterValue};
-use protocol::device_description::{AccessRight, CoilDescription, DataType, RegisterDescription};
+use protocol::device_description::{
+    AccessRight, CoilDescription, DataType, MemLayout, RegisterDescription,
+};
 use protocol::pdu::{
     EXCEPTION_ILLEGAL_DATA_ADDRESS, EXCEPTION_ILLEGAL_DATA_VALUE, EXCEPTION_ILLEGAL_FUNCTION,
     ExceptionResponse, FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT, FUNCTION_CODE_READ_COILS,
@@ -45,6 +53,7 @@ pub fn handle_request(
     store: &Mutex<RegisterStore>,
     coils: &[CoilDescription],
     coil_store: &Mutex<CoilStore>,
+    mem_layout: MemLayout,
     toml_source: &str,
 ) -> Vec<u8> {
     let Some(&function_code) = pdu.first() else {
@@ -56,7 +65,7 @@ pub fn handle_request(
     };
 
     match function_code {
-        FUNCTION_CODE_READ_HOLDING_REGISTERS => handle_read(pdu, registers, store),
+        FUNCTION_CODE_READ_HOLDING_REGISTERS => handle_read(pdu, registers, store, mem_layout),
         FUNCTION_CODE_WRITE_SINGLE_REGISTER => handle_write_single(pdu, registers, store),
         FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS => {
             handle_write_multiple_registers(pdu, registers, store)
@@ -95,10 +104,30 @@ fn handle_encapsulated_interface_transport(pdu: &[u8], toml_source: &str) -> Vec
     handle_read_device_identification(&request, &objects)
 }
 
+// Zero (or 0.0) for every DataType — what an unset register reads back as,
+// same meaning "no value staged/confirmed yet" as U16's old bare `0` did.
+fn default_register_value(data_type: DataType) -> RegisterValue {
+    match data_type {
+        DataType::U8 => RegisterValue::U8(0),
+        DataType::I8 => RegisterValue::I8(0),
+        DataType::U16 => RegisterValue::U16(0),
+        DataType::I16 => RegisterValue::I16(0),
+        DataType::U24 => RegisterValue::U24(0),
+        DataType::I24 => RegisterValue::I24(0),
+        DataType::U32 => RegisterValue::U32(0),
+        DataType::I32 => RegisterValue::I32(0),
+        DataType::U64 => RegisterValue::U64(0),
+        DataType::I64 => RegisterValue::I64(0),
+        DataType::F32 => RegisterValue::F32(0.0),
+        DataType::F64 => RegisterValue::F64(0.0),
+    }
+}
+
 fn handle_read(
     pdu: &[u8],
     registers: &[RegisterDescription],
     store: &Mutex<RegisterStore>,
+    mem_layout: MemLayout,
 ) -> Vec<u8> {
     let Ok(request) = ReadHoldingRegistersRequest::decode(pdu) else {
         return ExceptionResponse {
@@ -110,31 +139,40 @@ fn handle_read(
 
     let store = store.lock().unwrap_or_else(PoisonError::into_inner);
     let mut register_values = Vec::with_capacity(request.quantity as usize);
-    for offset in 0..request.quantity {
-        let address = request.starting_address.wrapping_add(offset);
-        // Only a register that exists at this exact address and is a
-        // (currently the only supported) U16 register can be served; a gap
-        // in the address range or an F32 register both report "illegal
-        // data address" rather than guessing a value or a wire format.
-        match registers
+    let mut address = request.starting_address;
+    let end_address = request.starting_address.wrapping_add(request.quantity);
+    // Walk register-by-register (not address-by-address): a register only
+    // exists at its own starting address, so a request that lands mid-way
+    // through a multi-register value, spans past one register into an
+    // address gap, or doesn't end exactly on a register boundary has no
+    // well-defined answer and is rejected rather than guessed at.
+    while address != end_address {
+        let Some(register) = registers
             .iter()
-            .find(|register| register.address == address && register.data_type == DataType::U16)
-        {
-            Some(register) => {
-                let value = match store.get(&register.name) {
-                    Some(RegisterValue::U16(value)) => value,
-                    _ => 0,
-                };
-                register_values.push(value);
+            .find(|register| register.address == address)
+        else {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_HOLDING_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
             }
-            None => {
-                return ExceptionResponse {
-                    function_code: FUNCTION_CODE_READ_HOLDING_REGISTERS,
-                    exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-                }
-                .encode();
+            .encode();
+        };
+
+        let value = match store.get(&register.name) {
+            Some(value) if value.data_type() == register.data_type => value,
+            _ => default_register_value(register.data_type),
+        };
+        let words = register_value_to_words(value, mem_layout);
+
+        if register_values.len() + words.len() > request.quantity as usize {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_HOLDING_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
             }
+            .encode();
         }
+        register_values.extend(words);
+        address = address.wrapping_add(register.data_type.register_count());
     }
     ReadHoldingRegistersResponse { register_values }.encode()
 }
@@ -398,7 +436,15 @@ mod tests {
             quantity: 1,
         }
         .encode();
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
 
         assert_eq!(
             ReadHoldingRegistersResponse::decode(&response).unwrap(),
@@ -417,7 +463,15 @@ mod tests {
             quantity: 1,
         }
         .encode();
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
         assert_eq!(
             ReadHoldingRegistersResponse::decode(&response).unwrap(),
             ReadHoldingRegistersResponse {
@@ -435,7 +489,15 @@ mod tests {
             quantity: 1,
         }
         .encode();
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
             ExceptionResponse {
@@ -446,15 +508,26 @@ mod tests {
     }
 
     #[test]
-    fn read_of_an_f32_register_returns_an_exception() {
+    fn read_with_a_quantity_smaller_than_the_register_s_width_returns_an_exception() {
         let store = Mutex::new(RegisterStore::new());
         let coil_store = Mutex::new(CoilStore::new());
+        // Flow_Rate is F32 (2 registers wide) — asking for only 1 register
+        // starting at its address can't be answered, since the value
+        // doesn't fit in what was actually requested.
         let request = ReadHoldingRegistersRequest {
             starting_address: 40003,
             quantity: 1,
         }
         .encode();
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
             ExceptionResponse {
@@ -462,6 +535,69 @@ mod tests {
                 exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
             }
         );
+    }
+
+    #[test]
+    fn read_starting_mid_way_through_a_multi_register_value_returns_an_exception() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        // 40004 is Flow_Rate's second word (F32 spans 40003-40004), not a
+        // register's own starting address — nothing is described as
+        // starting there.
+        let request = ReadHoldingRegistersRequest {
+            starting_address: 40004,
+            quantity: 1,
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_HOLDING_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
+    }
+
+    #[test]
+    fn read_returns_a_correctly_assembled_multi_register_value() {
+        use fuse_fs::register_encoding::register_value_from_words;
+
+        let store = Mutex::new(RegisterStore::new());
+        store
+            .lock()
+            .unwrap()
+            .set("Flow_Rate", RegisterValue::F32(3.5));
+        let coil_store = Mutex::new(CoilStore::new());
+        let request = ReadHoldingRegistersRequest {
+            starting_address: 40003,
+            quantity: 2,
+        }
+        .encode();
+
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Cdab,
+            "",
+        );
+
+        let decoded = ReadHoldingRegistersResponse::decode(&response).unwrap();
+        let value =
+            register_value_from_words(DataType::F32, &decoded.register_values, MemLayout::Cdab)
+                .unwrap();
+        assert_eq!(value, RegisterValue::F32(3.5));
     }
 
     #[test]
@@ -474,7 +610,15 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
 
         assert_eq!(
             WriteSingleRegisterResponse::decode(&response).unwrap(),
@@ -499,7 +643,15 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
 
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
@@ -521,7 +673,15 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
 
         assert_eq!(
             WriteMultipleRegistersResponse::decode(&response).unwrap(),
@@ -554,7 +714,15 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
 
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
@@ -575,7 +743,15 @@ mod tests {
         let coil_store = Mutex::new(CoilStore::new());
         // Read Input Registers (0x04) — not implemented at all.
         let request = vec![0x04, 0x00, 0x00, 0x00, 0x01];
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
             ExceptionResponse {
@@ -589,7 +765,15 @@ mod tests {
     fn empty_pdu_returns_illegal_function_without_panicking() {
         let store = Mutex::new(RegisterStore::new());
         let coil_store = Mutex::new(CoilStore::new());
-        let response = handle_request(&[], &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &[],
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap().exception_code,
             EXCEPTION_ILLEGAL_FUNCTION
@@ -617,6 +801,7 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            MemLayout::Abcd,
             "name = \"X\"",
         );
 
@@ -639,7 +824,15 @@ mod tests {
             quantity: 2,
         }
         .encode();
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
 
         assert_eq!(
             ReadCoilsResponse::decode(&response).unwrap(),
@@ -658,7 +851,15 @@ mod tests {
             quantity: 1,
         }
         .encode();
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
         assert_eq!(
             ReadCoilsResponse::decode(&response).unwrap(),
             ReadCoilsResponse {
@@ -676,7 +877,15 @@ mod tests {
             quantity: 1,
         }
         .encode();
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
             ExceptionResponse {
@@ -696,7 +905,15 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
 
         assert_eq!(
             WriteSingleCoilResponse::decode(&response).unwrap(),
@@ -721,7 +938,15 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
 
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
@@ -742,7 +967,15 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
 
         assert_eq!(
             WriteMultipleCoilsResponse::decode(&response).unwrap(),
@@ -774,7 +1007,15 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(&request, &registers(), &store, &coils(), &coil_store, "");
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            MemLayout::Abcd,
+            "",
+        );
 
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),

@@ -5,7 +5,7 @@
 
 use crate::handler::handle_request;
 use fuse_fs::{CoilStore, RegisterStore};
-use protocol::device_description::{CoilDescription, RegisterDescription};
+use protocol::device_description::{CoilDescription, MemLayout, RegisterDescription};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -23,6 +23,7 @@ pub async fn serve_tcp_connection<S>(
     store: Arc<Mutex<RegisterStore>>,
     coils: Arc<Vec<CoilDescription>>,
     coil_store: Arc<Mutex<CoilStore>>,
+    mem_layout: MemLayout,
     toml_source: Arc<String>,
     timeout: Duration,
 ) where
@@ -35,6 +36,7 @@ pub async fn serve_tcp_connection<S>(
         // Send inference issue ("implementation of Send is not general
         // enough") once this whole function is spawned as its own task —
         // owned clones sidestep it entirely, and Arc::clone is cheap.
+        // `mem_layout` is plain Copy data, no Arc needed.
         let handler_registers = Arc::clone(&registers);
         let handler_store = Arc::clone(&store);
         let handler_coils = Arc::clone(&coils);
@@ -49,6 +51,7 @@ pub async fn serve_tcp_connection<S>(
                     &handler_store,
                     &handler_coils,
                     &handler_coil_store,
+                    mem_layout,
                     &handler_toml_source,
                 )
             },
@@ -76,6 +79,7 @@ pub async fn serve_rtu_connection<S>(
     store: Arc<Mutex<RegisterStore>>,
     coils: Arc<Vec<CoilDescription>>,
     coil_store: Arc<Mutex<CoilStore>>,
+    mem_layout: MemLayout,
     toml_source: Arc<String>,
     frame_silence: Duration,
     timeout: Duration,
@@ -97,6 +101,7 @@ pub async fn serve_rtu_connection<S>(
                     &handler_store,
                     &handler_coils,
                     &handler_coil_store,
+                    mem_layout,
                     &handler_toml_source,
                 )
             },
@@ -162,6 +167,7 @@ mod tests {
             Arc::clone(&store),
             coils(),
             coil_store(),
+            MemLayout::Abcd,
             Arc::new(String::new()),
             Duration::from_secs(1),
         ));
@@ -202,6 +208,7 @@ mod tests {
             Arc::clone(&store),
             coils(),
             coil_store(),
+            MemLayout::Abcd,
             Arc::new(String::new()),
             Duration::from_secs(1),
         ));
@@ -248,6 +255,7 @@ mod tests {
             Arc::clone(&store),
             coils(),
             coil_store(),
+            MemLayout::Abcd,
             Arc::new(String::new()),
             Duration::from_secs(1),
         ));
@@ -296,6 +304,7 @@ mod tests {
             Arc::clone(&store),
             coils(),
             coil_store(),
+            MemLayout::Abcd,
             Arc::new(String::new()),
             Duration::from_millis(20),
             Duration::from_secs(1),
@@ -337,6 +346,7 @@ mod tests {
             Arc::clone(&store),
             coils(),
             coil_store(),
+            MemLayout::Abcd,
             Arc::new(String::new()),
             Duration::from_millis(20),
             Duration::from_secs(1),

@@ -6,10 +6,13 @@
 // "did this actually happen" step — whatever the device reports in the
 // response IS the current value, so `poll_once` updates `store` directly.
 //
-// Scope, matching write_confirmation.rs's boundary: only U16 registers are
-// polled. F32 would need the same two-register word-order decision that's
-// deferred on the write side — reading has the identical problem, so it's
-// deferred here too rather than guessing.
+// Every DataType is polled — a register batch's `quantity()` is the sum of
+// each register's own `DataType::register_count()` wire-word width (see
+// `crate::batching`), not just how many registers are in the batch, and
+// `poll_once` walks the decoded response the same number of words at a
+// time per register, reassembling each one via
+// `fuse_fs::register_encoding::register_value_from_words` (which needs the
+// device's `mem_layout` for anything wider than one register).
 //
 // Traffic is reduced by batching contiguous register addresses into a
 // single Read Holding Registers request instead of one request per
@@ -20,8 +23,9 @@
 
 use crate::batching::{Batch, build_batches};
 use crate::connection::Connection;
-use fuse_fs::{CoilStore, CoilValue, RegisterStore, RegisterValue};
-use protocol::device_description::{CoilDescription, DataType, RegisterDescription};
+use fuse_fs::register_encoding::register_value_from_words;
+use fuse_fs::{CoilStore, CoilValue, RegisterStore};
+use protocol::device_description::{CoilDescription, MemLayout, RegisterDescription};
 use protocol::pdu::{
     ReadCoilsRequest, ReadCoilsResponse, ReadHoldingRegistersRequest, ReadHoldingRegistersResponse,
 };
@@ -41,28 +45,27 @@ const MAX_COIL_READ_BATCH_SIZE: u16 = 2000;
 pub type RegisterBatch = Batch<RegisterDescription>;
 pub type CoilBatch = Batch<CoilDescription>;
 
-/// Groups `registers` (U16 only — see module doc comment) into the fewest
-/// Read Holding Registers requests needed to cover them all — see
-/// `crate::batching` for the grouping algorithm itself.
+/// Groups `registers` into the fewest Read Holding Registers requests
+/// needed to cover them all, each register counting as its own
+/// `DataType::register_count()` wire words — see `crate::batching` for the
+/// grouping algorithm itself.
 pub fn build_read_batches(registers: &[RegisterDescription]) -> Vec<RegisterBatch> {
-    let u16_registers: Vec<RegisterDescription> = registers
-        .iter()
-        .filter(|register| register.data_type == DataType::U16)
-        .cloned()
-        .collect();
     build_batches(
-        u16_registers,
+        registers.to_vec(),
         |register| register.address,
+        |register| register.data_type.register_count(),
         MAX_READ_BATCH_SIZE,
     )
 }
 
 /// Coil counterpart of `build_read_batches`, capped at Modbus's much
-/// higher per-request coil limit instead of the register one.
+/// higher per-request coil limit instead of the register one — every coil
+/// is exactly one wire slot, unlike registers.
 pub fn build_coil_read_batches(coils: &[CoilDescription]) -> Vec<CoilBatch> {
     build_batches(
         coils.to_vec(),
         |coil| coil.address,
+        |_| 1,
         MAX_COIL_READ_BATCH_SIZE,
     )
 }
@@ -126,11 +129,14 @@ pub async fn poll_coils_once(
 /// Reads every batch once and applies successful results directly to
 /// `store`. A failed batch (I/O error, timeout, Modbus exception, or a
 /// malformed/short response) is logged and skipped — it'll be retried on
-/// the next poll tick rather than treated as fatal.
+/// the next poll tick rather than treated as fatal. A decoded response is
+/// split back into one register's worth of words at a time, in address
+/// order, since a batch can now mix registers of different widths.
 pub async fn poll_once(
     connection: &Arc<AsyncMutex<Connection>>,
     batches: &[RegisterBatch],
     store: &Arc<Mutex<RegisterStore>>,
+    mem_layout: MemLayout,
     unit_id: u8,
     timeout: Duration,
 ) {
@@ -159,10 +165,18 @@ pub async fn poll_once(
         };
 
         match ReadHoldingRegistersResponse::decode(&response_pdu) {
-            Ok(decoded) if decoded.register_values.len() == batch.items.len() => {
+            Ok(decoded) if decoded.register_values.len() == batch.quantity() as usize => {
                 let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
-                for (register, value) in batch.items.iter().zip(decoded.register_values) {
-                    store.set(register.name.clone(), RegisterValue::U16(value));
+                let mut offset = 0usize;
+                for register in &batch.items {
+                    let register_count = register.data_type.register_count() as usize;
+                    let words = &decoded.register_values[offset..offset + register_count];
+                    if let Some(value) =
+                        register_value_from_words(register.data_type, words, mem_layout)
+                    {
+                        store.set(register.name.clone(), value);
+                    }
+                    offset += register_count;
                 }
             }
             Ok(_) | Err(_) => {
@@ -187,6 +201,7 @@ pub async fn run_polling_loop(
     store: Arc<Mutex<RegisterStore>>,
     coils: &[CoilDescription],
     coil_store: Arc<Mutex<CoilStore>>,
+    mem_layout: MemLayout,
     unit_id: u8,
     poll_interval: Duration,
     timeout: Duration,
@@ -196,7 +211,15 @@ pub async fn run_polling_loop(
     let mut ticker = tokio::time::interval(poll_interval);
     loop {
         ticker.tick().await;
-        poll_once(&connection, &register_batches, &store, unit_id, timeout).await;
+        poll_once(
+            &connection,
+            &register_batches,
+            &store,
+            mem_layout,
+            unit_id,
+            timeout,
+        )
+        .await;
         poll_coils_once(&connection, &coil_batches, &coil_store, unit_id, timeout).await;
     }
 }
@@ -204,7 +227,8 @@ pub async fn run_polling_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::device_description::AccessRight;
+    use fuse_fs::RegisterValue;
+    use protocol::device_description::{AccessRight, DataType};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn register(name: &str, address: u16, data_type: DataType) -> RegisterDescription {
@@ -249,15 +273,29 @@ mod tests {
     }
 
     #[test]
-    fn f32_registers_are_excluded_entirely() {
+    fn multi_register_types_occupy_more_than_one_wire_slot() {
         let registers = vec![
             register("A", 40001, DataType::U16),
             register("B", 40002, DataType::F32),
+            register("C", 40004, DataType::U16),
         ];
         let batches = build_read_batches(&registers);
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].items.len(), 1);
-        assert_eq!(batches[0].items[0].name, "A");
+        assert_eq!(batches[0].items.len(), 3);
+        assert_eq!(batches[0].quantity(), 4);
+    }
+
+    #[test]
+    fn a_type_wider_than_one_register_can_still_start_a_new_batch_after_a_gap() {
+        let registers = vec![
+            register("A", 40001, DataType::F64),
+            register("B", 40010, DataType::U16),
+        ];
+        let batches = build_read_batches(&registers);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].starting_address, 40001);
+        assert_eq!(batches[0].quantity(), 4);
+        assert_eq!(batches[1].starting_address, 40010);
     }
 
     #[test]
@@ -354,7 +392,15 @@ mod tests {
             device.write_all(&response).await.unwrap();
         });
 
-        poll_once(&connection, &batches, &store, 0x01, Duration::from_secs(1)).await;
+        poll_once(
+            &connection,
+            &batches,
+            &store,
+            MemLayout::Abcd,
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
 
         device_task.await.unwrap();
         assert_eq!(store.lock().unwrap().get("A"), Some(RegisterValue::U16(11)));
@@ -372,12 +418,57 @@ mod tests {
             &connection,
             &batches,
             &store,
+            MemLayout::Abcd,
             0x01,
             Duration::from_millis(50),
         )
         .await;
 
         assert_eq!(store.lock().unwrap().get("A"), None);
+    }
+
+    #[tokio::test]
+    async fn poll_once_reassembles_a_multi_register_value_using_mem_layout() {
+        let (connection, mut device) = connected_pair().await;
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let batches = build_read_batches(&[register("A", 40001, DataType::U32)]);
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            device.read_exact(&mut header).await.unwrap();
+            let mut pdu = vec![0u8; 5];
+            device.read_exact(&mut pdu).await.unwrap();
+
+            // 0x1234_5678 in CDAB order: word order swapped, each word's
+            // own bytes left alone — see register_encoding's own tests for
+            // the full byte-order mapping.
+            let response_pdu = ReadHoldingRegistersResponse {
+                register_values: vec![0x5678, 0x1234],
+            }
+            .encode();
+            let mut response = header;
+            let length = (response_pdu.len() + 1) as u16;
+            response[4..6].copy_from_slice(&length.to_be_bytes());
+            response.extend_from_slice(&response_pdu);
+            device.write_all(&response).await.unwrap();
+        });
+
+        poll_once(
+            &connection,
+            &batches,
+            &store,
+            MemLayout::Cdab,
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        device_task.await.unwrap();
+        assert_eq!(
+            store.lock().unwrap().get("A"),
+            Some(RegisterValue::U32(0x1234_5678))
+        );
     }
 
     #[tokio::test]

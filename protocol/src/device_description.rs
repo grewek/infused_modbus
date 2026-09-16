@@ -28,6 +28,18 @@ pub enum DataType {
     F64,
 }
 
+impl DataType {
+    /// How many consecutive 16-bit Modbus registers a value of this type
+    /// spans on the wire.
+    pub fn register_count(self) -> u16 {
+        match self {
+            DataType::U8 | DataType::I8 | DataType::U16 | DataType::I16 => 1,
+            DataType::U24 | DataType::I24 | DataType::U32 | DataType::I32 | DataType::F32 => 2,
+            DataType::U64 | DataType::I64 | DataType::F64 => 4,
+        }
+    }
+}
+
 // How a device lays a multi-register value's bytes out on the wire before
 // Modbus's own (fixed, non-configurable) big-endian-per-register framing
 // takes over. Real devices vary along two independent axes — which
@@ -242,6 +254,25 @@ impl DeviceDescription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_count_matches_each_type_s_wire_width() {
+        for data_type in [DataType::U8, DataType::I8, DataType::U16, DataType::I16] {
+            assert_eq!(data_type.register_count(), 1);
+        }
+        for data_type in [
+            DataType::U24,
+            DataType::I24,
+            DataType::U32,
+            DataType::I32,
+            DataType::F32,
+        ] {
+            assert_eq!(data_type.register_count(), 2);
+        }
+        for data_type in [DataType::U64, DataType::I64, DataType::F64] {
+            assert_eq!(data_type.register_count(), 4);
+        }
+    }
 
     #[test]
     fn parse_reads_valid_device_description() {

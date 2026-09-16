@@ -124,6 +124,7 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed to parse device description: {error}"));
     let registers = description.registers;
     let coils = description.coils;
+    let mem_layout = description.mem_layout;
 
     // Shared, not owned outright: the polling loop and the transaction
     // consumer both need to talk to the device over this same connection,
@@ -171,6 +172,7 @@ fn main() {
             polling_store,
             &polling_coils,
             polling_coil_store,
+            mem_layout,
             unit_id,
             poll_interval,
             POLL_TIMEOUT,

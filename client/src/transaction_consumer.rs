@@ -63,20 +63,28 @@ type CoilWriteBatch = Batch<(CoilDescription, bool)>;
 
 /// Groups staged (register, value) pairs by contiguous address — see
 /// `crate::batching` for the grouping algorithm itself, shared with
-/// `client::polling`'s read batching.
+/// `client::polling`'s read batching. Every entry here is U16 (the write
+/// path's only supported type so far — see the module doc comment), so
+/// each one is always exactly one wire slot wide.
 fn build_register_write_batches(
     entries: Vec<(RegisterDescription, u16)>,
 ) -> Vec<RegisterWriteBatch> {
     build_batches(
         entries,
         |(register, _)| register.address,
+        |_| 1,
         MAX_REGISTER_WRITE_BATCH_SIZE,
     )
 }
 
 /// Coil counterpart of `build_register_write_batches`.
 fn build_coil_write_batches(entries: Vec<(CoilDescription, bool)>) -> Vec<CoilWriteBatch> {
-    build_batches(entries, |(coil, _)| coil.address, MAX_COIL_WRITE_BATCH_SIZE)
+    build_batches(
+        entries,
+        |(coil, _)| coil.address,
+        |_| 1,
+        MAX_COIL_WRITE_BATCH_SIZE,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

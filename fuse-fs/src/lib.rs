@@ -1,5 +1,7 @@
 pub mod filesystem;
+pub mod register_encoding;
 
+use protocol::device_description::DataType;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -24,6 +26,31 @@ pub enum RegisterValue {
     I64(i64),
     F32(f32),
     F64(f64),
+}
+
+impl RegisterValue {
+    /// The DataType this value was decoded/parsed as — the inverse of
+    /// looking a value up by a register's own declared `data_type`, useful
+    /// wherever a value needs to be checked against what its register
+    /// actually declares rather than trusted blindly (e.g. a stored value
+    /// that should always match its register's type, but is worth
+    /// verifying rather than assuming).
+    pub fn data_type(&self) -> DataType {
+        match self {
+            RegisterValue::U8(_) => DataType::U8,
+            RegisterValue::I8(_) => DataType::I8,
+            RegisterValue::U16(_) => DataType::U16,
+            RegisterValue::I16(_) => DataType::I16,
+            RegisterValue::U24(_) => DataType::U24,
+            RegisterValue::I24(_) => DataType::I24,
+            RegisterValue::U32(_) => DataType::U32,
+            RegisterValue::I32(_) => DataType::I32,
+            RegisterValue::U64(_) => DataType::U64,
+            RegisterValue::I64(_) => DataType::I64,
+            RegisterValue::F32(_) => DataType::F32,
+            RegisterValue::F64(_) => DataType::F64,
+        }
+    }
 }
 
 // How a register's value is rendered as the content of its FUSE file.
@@ -257,6 +284,22 @@ mod tests {
     #[test]
     fn f32_value_displays_as_plain_decimal() {
         assert_eq!(RegisterValue::F32(3.5).to_string(), "3.5");
+    }
+
+    #[test]
+    fn data_type_returns_the_matching_variant_for_every_type() {
+        assert_eq!(RegisterValue::U8(0).data_type(), DataType::U8);
+        assert_eq!(RegisterValue::I8(0).data_type(), DataType::I8);
+        assert_eq!(RegisterValue::U16(0).data_type(), DataType::U16);
+        assert_eq!(RegisterValue::I16(0).data_type(), DataType::I16);
+        assert_eq!(RegisterValue::U24(0).data_type(), DataType::U24);
+        assert_eq!(RegisterValue::I24(0).data_type(), DataType::I24);
+        assert_eq!(RegisterValue::U32(0).data_type(), DataType::U32);
+        assert_eq!(RegisterValue::I32(0).data_type(), DataType::I32);
+        assert_eq!(RegisterValue::U64(0).data_type(), DataType::U64);
+        assert_eq!(RegisterValue::I64(0).data_type(), DataType::I64);
+        assert_eq!(RegisterValue::F32(0.0).data_type(), DataType::F32);
+        assert_eq!(RegisterValue::F64(0.0).data_type(), DataType::F64);
     }
 
     #[test]
