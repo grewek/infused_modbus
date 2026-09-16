@@ -1,9 +1,23 @@
 // Owns the receiving end of InfusedFilesystem's transaction_sender channel
 // and is where CLAUDE.md's "TRANSACTION_END confirmation semantics" are
 // actually fulfilled: for every register/coil in a drained transaction,
-// attempt the real write and only then update `store`/`coil_store`/
-// `report`. `fuse-fs` itself never does this — see the module doc comment
-// on InfusedFilesystem.
+// attempt the real write and update `report` with the outcome. `fuse-fs`
+// itself never does this — see the module doc comment on
+// InfusedFilesystem.
+//
+// Deliberately does *not* update `store`/`coil_store` itself on a
+// confirmed write, even though it has the just-written value in hand —
+// `client::polling` is the only writer of those stores (confirmed with the
+// project owner 2026-09-16, after finding a real race: the shared
+// connection only serializes requests on the wire, not the store-update
+// step after each one, so a poll response already in flight before a
+// commit could still land *after* it and overwrite the freshly-confirmed
+// value with a stale one). Keeping exactly one writer removes that race
+// entirely. The tradeoff: `holding-registers/<name>` can lag up to one
+// poll interval behind `report/<name>` showing `OK` — accepted as simpler
+// than either a full or a targeted re-poll-on-commit, both of which would
+// add traffic and connection contention for a race that a single-writer
+// design avoids for free.
 //
 // The channel is `std::sync::mpsc` (see H2), so receiving is a blocking
 // call — this is meant to run on its own dedicated OS thread (not as a
@@ -43,9 +57,7 @@ use crate::write_confirmation::{
     confirm_coil_write, confirm_coil_write_multiple, confirm_write, confirm_write_multiple,
 };
 use fuse_fs::register_encoding::register_value_to_words;
-use fuse_fs::{
-    CoilStore, CoilValue, RegisterStore, RegisterValue, StagedValue, WriteReport, WriteStatus,
-};
+use fuse_fs::{CoilValue, RegisterValue, StagedValue, WriteReport, WriteStatus};
 use protocol::device_description::{CoilDescription, MemLayout, RegisterDescription};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
@@ -96,9 +108,7 @@ pub fn run_transaction_consumer(
     handle: &Handle,
     connection: &Arc<AsyncMutex<Connection>>,
     registers: &[RegisterDescription],
-    store: &Arc<Mutex<RegisterStore>>,
     coils: &[CoilDescription],
-    coil_store: &Arc<Mutex<CoilStore>>,
     report: &Arc<Mutex<WriteReport>>,
     mem_layout: MemLayout,
     transaction_receiver: mpsc::Receiver<HashMap<String, StagedValue>>,
@@ -194,10 +204,7 @@ pub fn run_transaction_consumer(
                 })
             };
 
-            for (register, value) in &batch.items {
-                if status == WriteStatus::Ok {
-                    store.lock().unwrap().set(register.name.clone(), *value);
-                }
+            for (register, _value) in &batch.items {
                 report
                     .lock()
                     .unwrap()
@@ -227,13 +234,7 @@ pub fn run_transaction_consumer(
                 })
             };
 
-            for (coil, value) in &batch.items {
-                if status == WriteStatus::Ok {
-                    coil_store
-                        .lock()
-                        .unwrap()
-                        .set(coil.name.clone(), CoilValue(*value));
-                }
+            for (coil, _value) in &batch.items {
                 report
                     .lock()
                     .unwrap()
@@ -299,11 +300,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn confirms_a_write_and_updates_store_and_report() {
+    async fn confirms_a_write_and_updates_report() {
         let (connection, mut device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let registers = vec![u16_register()];
         let coils: Vec<CoilDescription> = vec![];
@@ -326,17 +325,13 @@ mod tests {
 
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
-        let consumer_store = Arc::clone(&store);
-        let consumer_coil_store = Arc::clone(&coil_store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
                 &registers,
-                &consumer_store,
                 &coils,
-                &consumer_coil_store,
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -359,21 +354,15 @@ mod tests {
         consumer_thread.join().unwrap();
 
         assert_eq!(
-            store.lock().unwrap().get("Stop_Process"),
-            Some(RegisterValue::U16(1))
-        );
-        assert_eq!(
             report.lock().unwrap().get("Stop_Process"),
             Some(&WriteStatus::Ok)
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_failed_write_updates_report_but_not_store() {
+    async fn a_failed_write_updates_report_as_failed() {
         let (connection, mut device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let registers = vec![u16_register()];
         let coils: Vec<CoilDescription> = vec![];
@@ -403,17 +392,13 @@ mod tests {
 
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
-        let consumer_store = Arc::clone(&store);
-        let consumer_coil_store = Arc::clone(&coil_store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
                 &registers,
-                &consumer_store,
                 &coils,
-                &consumer_coil_store,
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -433,7 +418,6 @@ mod tests {
         device_task.await.unwrap();
         consumer_thread.join().unwrap();
 
-        assert_eq!(store.lock().unwrap().get("Stop_Process"), None);
         assert!(matches!(
             report.lock().unwrap().get("Stop_Process"),
             Some(WriteStatus::Failed(_))
@@ -444,25 +428,19 @@ mod tests {
     async fn an_unknown_register_is_reported_as_failed_without_sending_anything() {
         let (connection, device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let registers = vec![u16_register()];
         let coils: Vec<CoilDescription> = vec![];
 
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
-        let consumer_store = Arc::clone(&store);
-        let consumer_coil_store = Arc::clone(&coil_store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
                 &registers,
-                &consumer_store,
                 &coils,
-                &consumer_coil_store,
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -492,11 +470,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn confirms_a_coil_write_and_updates_store_and_report() {
+    async fn confirms_a_coil_write_and_updates_report() {
         let (connection, mut device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let registers: Vec<RegisterDescription> = vec![];
         let coils = vec![a_coil()];
@@ -519,17 +495,13 @@ mod tests {
 
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
-        let consumer_store = Arc::clone(&store);
-        let consumer_coil_store = Arc::clone(&coil_store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
                 &registers,
-                &consumer_store,
                 &coils,
-                &consumer_coil_store,
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -550,10 +522,6 @@ mod tests {
         consumer_thread.join().unwrap();
 
         assert_eq!(
-            coil_store.lock().unwrap().get("Motor_Running"),
-            Some(CoilValue(true))
-        );
-        assert_eq!(
             report.lock().unwrap().get("Motor_Running"),
             Some(&WriteStatus::Ok)
         );
@@ -563,8 +531,6 @@ mod tests {
     async fn batches_two_contiguous_registers_into_one_write_multiple_request() {
         let (connection, mut device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let registers = vec![u16_register(), second_u16_register()];
         let coils: Vec<CoilDescription> = vec![];
@@ -599,17 +565,13 @@ mod tests {
 
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
-        let consumer_store = Arc::clone(&store);
-        let consumer_coil_store = Arc::clone(&coil_store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
                 &registers,
-                &consumer_store,
                 &coils,
-                &consumer_coil_store,
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -634,14 +596,6 @@ mod tests {
         consumer_thread.join().unwrap();
 
         assert_eq!(
-            store.lock().unwrap().get("Stop_Process"),
-            Some(RegisterValue::U16(1))
-        );
-        assert_eq!(
-            store.lock().unwrap().get("Setpoint"),
-            Some(RegisterValue::U16(2))
-        );
-        assert_eq!(
             report.lock().unwrap().get("Stop_Process"),
             Some(&WriteStatus::Ok)
         );
@@ -652,12 +606,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_failed_register_batch_marks_every_register_in_it_as_failed_and_leaves_the_store_untouched()
-     {
+    async fn a_failed_register_batch_marks_every_register_in_it_as_failed() {
         let (connection, mut device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let registers = vec![u16_register(), second_u16_register()];
         let coils: Vec<CoilDescription> = vec![];
@@ -687,17 +638,13 @@ mod tests {
 
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
-        let consumer_store = Arc::clone(&store);
-        let consumer_coil_store = Arc::clone(&coil_store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
                 &registers,
-                &consumer_store,
                 &coils,
-                &consumer_coil_store,
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -721,8 +668,6 @@ mod tests {
         device_task.await.unwrap();
         consumer_thread.join().unwrap();
 
-        assert_eq!(store.lock().unwrap().get("Stop_Process"), None);
-        assert_eq!(store.lock().unwrap().get("Setpoint"), None);
         assert!(matches!(
             report.lock().unwrap().get("Stop_Process"),
             Some(WriteStatus::Failed(_))
@@ -737,8 +682,6 @@ mod tests {
     async fn batches_two_contiguous_coils_into_one_write_multiple_request() {
         let (connection, mut device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let registers: Vec<RegisterDescription> = vec![];
         let coils = vec![a_coil(), second_coil()];
@@ -770,17 +713,13 @@ mod tests {
 
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
-        let consumer_store = Arc::clone(&store);
-        let consumer_coil_store = Arc::clone(&coil_store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
                 &registers,
-                &consumer_store,
                 &coils,
-                &consumer_coil_store,
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -805,14 +744,6 @@ mod tests {
         consumer_thread.join().unwrap();
 
         assert_eq!(
-            coil_store.lock().unwrap().get("Motor_Running"),
-            Some(CoilValue(true))
-        );
-        assert_eq!(
-            coil_store.lock().unwrap().get("Alarm_Reset"),
-            Some(CoilValue(false))
-        );
-        assert_eq!(
             report.lock().unwrap().get("Motor_Running"),
             Some(&WriteStatus::Ok)
         );
@@ -823,11 +754,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_failed_coil_batch_marks_every_coil_in_it_as_failed_and_leaves_the_store_untouched() {
+    async fn a_failed_coil_batch_marks_every_coil_in_it_as_failed() {
         let (connection, mut device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let registers: Vec<RegisterDescription> = vec![];
         let coils = vec![a_coil(), second_coil()];
@@ -857,17 +786,13 @@ mod tests {
 
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
-        let consumer_store = Arc::clone(&store);
-        let consumer_coil_store = Arc::clone(&coil_store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
                 &registers,
-                &consumer_store,
                 &coils,
-                &consumer_coil_store,
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -891,8 +816,6 @@ mod tests {
         device_task.await.unwrap();
         consumer_thread.join().unwrap();
 
-        assert_eq!(coil_store.lock().unwrap().get("Motor_Running"), None);
-        assert_eq!(coil_store.lock().unwrap().get("Alarm_Reset"), None);
         assert!(matches!(
             report.lock().unwrap().get("Motor_Running"),
             Some(WriteStatus::Failed(_))
@@ -907,8 +830,6 @@ mod tests {
     async fn a_lone_wide_register_is_written_via_write_multiple_registers_not_write_single() {
         let (connection, mut device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let registers = vec![f32_register()];
         let coils: Vec<CoilDescription> = vec![];
@@ -944,17 +865,13 @@ mod tests {
 
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
-        let consumer_store = Arc::clone(&store);
-        let consumer_coil_store = Arc::clone(&coil_store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
                 &registers,
-                &consumer_store,
                 &coils,
-                &consumer_coil_store,
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -975,10 +892,6 @@ mod tests {
         consumer_thread.join().unwrap();
 
         assert_eq!(
-            store.lock().unwrap().get("Flow_Rate"),
-            Some(RegisterValue::F32(3.5))
-        );
-        assert_eq!(
             report.lock().unwrap().get("Flow_Rate"),
             Some(&WriteStatus::Ok)
         );
@@ -988,8 +901,6 @@ mod tests {
     async fn a_type_mismatched_register_is_reported_as_failed_without_sending_anything() {
         let (connection, device) = connected_pair().await;
         let (transaction_sender, transaction_receiver) = mpsc::channel();
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         // Stop_Process is declared U16, but the staged value is F32 — this
         // shouldn't happen via real FUSE staging (which always parses
@@ -1000,17 +911,13 @@ mod tests {
 
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
-        let consumer_store = Arc::clone(&store);
-        let consumer_coil_store = Arc::clone(&coil_store);
         let consumer_report = Arc::clone(&report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
                 &registers,
-                &consumer_store,
                 &coils,
-                &consumer_coil_store,
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -1029,7 +936,6 @@ mod tests {
 
         consumer_thread.join().unwrap();
 
-        assert_eq!(store.lock().unwrap().get("Stop_Process"), None);
         assert!(matches!(
             report.lock().unwrap().get("Stop_Process"),
             Some(WriteStatus::Failed(_))

@@ -140,18 +140,14 @@ fn main() {
     let handle = runtime.handle().clone();
     let consumer_connection = Arc::clone(&connection);
     let consumer_registers = registers.clone();
-    let consumer_store = Arc::clone(&store);
     let consumer_coils = coils.clone();
-    let consumer_coil_store = Arc::clone(&coil_store);
     let consumer_report = Arc::clone(&report);
     std::thread::spawn(move || {
         run_transaction_consumer(
             &handle,
             &consumer_connection,
             &consumer_registers,
-            &consumer_store,
             &consumer_coils,
-            &consumer_coil_store,
             &consumer_report,
             mem_layout,
             transaction_receiver,
