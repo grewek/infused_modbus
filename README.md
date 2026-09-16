@@ -29,6 +29,7 @@ Nothing here shipped without a human decision behind it, but essentially all of 
 - **The server can advertise its own register description.** Instead of the client needing a hand-maintained copy of the server's register description, the client can fetch it at startup over Modbus function code 43 (Read Device Identification) — see [Device description discovery](#device-description-discovery-fc-43) below. A local fallback file is still required in case the server doesn't support this.
 - **Modbus implemented from scratch.** The `protocol` crate implements Modbus TCP/RTU framing, CRC16, and PDU encode/decode directly, rather than wrapping an existing crate like `tokio-modbus`. Some individual inputs read from the wire (declared lengths/counts) are checked against the actual remaining buffer before being used for allocation or indexing — this reduces a few specific classes of bugs, but is not a substitute for a real security review, which this project has not had (see the warning above).
 - **Polling batches register reads.** The client keeps its local mirror fresh by polling, grouping contiguous register addresses into a single `Read Holding Registers` request (up to Modbus's 125-register limit) instead of one request per register. Standard Modbus has no mechanism for a device to push updates on its own — polling is the only option the protocol allows.
+- **Every register data type is read and written over the wire**, including ones spanning more than one 16-bit Modbus register (`u32`, `f64`, ...) — see [Device description TOML format](#device-description-toml-format) for the full type list and how `mem-layout` controls their byte order.
 
 ## Supported Modbus function codes
 
@@ -122,6 +123,14 @@ touch transactions/TRANSACTION_END          # commit everything staged
 cat report/Stop_Process                     # OK, or FAILED: <reason>
 ```
 
+Coils work the same way, under `coils/` instead of `holding-registers/` — `transactions/` and `report/` are shared across both (one register and one coil can even be staged in the same commit). A coil's value is `0` or `1`:
+
+```sh
+cat coils/Motor_Running                     # 0 or 1
+echo 1 > transactions/Motor_Running         # stage turning it on
+touch transactions/TRANSACTION_END
+```
+
 Unmount with Ctrl+C or `SIGTERM` — both `client` and `server` unmount cleanly on shutdown.
 
 ### Device description discovery (FC 43)
@@ -130,61 +139,104 @@ The client always requires a local `device-description.toml` path on the command
 
 ## Device description TOML format
 
-Each register is described by one `[[registers]]` table:
+Registers live in a `[registers]` table with a required `base_address`, a required `mem-layout` (see below), and one `[[registers.entries]]` array entry per register:
 
 ```toml
-[[registers]]
+[registers]
+base_address = 40000
+mem-layout = "abcd"
+
+[[registers.entries]]
 name = "Tank_Temperature"
-address = 40001
+offset = 1
 data_type = "u16"
 access = "read_only"
 
-[[registers]]
+[[registers.entries]]
 name = "Stop_Process"
-address = 40002
+offset = 2
 data_type = "u16"
 access = "read_write"
 ```
 
+Each entry's actual Modbus address is `base_address + offset` — `Tank_Temperature` above lives at 40001.
+
 - `name` — the human-readable name used as the filename under `holding-registers/`, `transactions/`, and `report/`.
-- `address` — the Modbus register address.
-- `data_type` — `"u16"` or `"f32"`. (Note: `f32` registers are currently read-only over the wire — see [Current limitations](#current-limitations).)
+- `offset` — added to the section's `base_address` to get the register's real Modbus address.
+- `data_type` — one of `u8`, `i8`, `u16`, `i16`, `u24`, `i24`, `u32`, `i32`, `u64`, `i64`, `f32`, `f64`. Anything wider than one 16-bit register (`u24` and up) spans consecutive registers, in the byte order `mem-layout` describes. `u24`/`i24` have no native Modbus width — they occupy two registers (32 bits) with the top byte always zero (`u24`) or sign-extended (`i24`).
 - `access` — `"read_only"` or `"read_write"`.
+
+`mem-layout` describes how a device lays a multi-register value's bytes across the wire — real devices vary, and getting this wrong silently produces the wrong number rather than an error. It's one setting for the whole `[registers]` section (a device doesn't mix conventions internally), using the industry-standard four-letter names for a value's bytes A (most significant) through D (least significant):
+
+| `mem-layout` | Byte order on the wire | Also known as |
+| ------------- | ----------------------- | -------------- |
+| `"abcd"` | A B C D | big-endian |
+| `"dcba"` | D C B A | little-endian |
+| `"badc"` | B A D C | byte-swapped |
+| `"cdab"` | C D A B | word-swapped (e.g. some Schneider/Modicon PLCs) |
+
+Coils use the same `base_address` + `offset` shape, but have no `data_type` or `access` (a coil is always exactly 1 bit and always read/write):
+
+```toml
+[coils]
+base_address = 0
+
+[[coils.entries]]
+name = "Motor_Running"
+offset = 1
+```
+
+Both `[registers]` and `[coils]` are optional — a device with only one kind doesn't need to declare an empty section for the other.
 
 A complete example with a mix of types and access rights:
 
 ```toml
-[[registers]]
+[registers]
+base_address = 40000
+mem-layout = "abcd"
+
+[[registers.entries]]
 name = "Tank_Temperature"
-address = 40001
+offset = 1
 data_type = "u16"
 access = "read_only"
 
-[[registers]]
+[[registers.entries]]
 name = "Flow_Rate"
-address = 40002
+offset = 2
 data_type = "f32"
 access = "read_only"
 
-[[registers]]
+[[registers.entries]]
 name = "Stop_Process"
-address = 40003
+offset = 4
 data_type = "u16"
 access = "read_write"
 
-[[registers]]
+[[registers.entries]]
 name = "Setpoint"
-address = 40004
+offset = 5
 data_type = "u16"
 access = "read_write"
+
+[coils]
+base_address = 0
+
+[[coils.entries]]
+name = "Motor_Running"
+offset = 1
+
+[[coils.entries]]
+name = "Alarm_Reset"
+offset = 2
 ```
 
 ## Current limitations
 
 This project is under active development. As of now:
 
-- Only `u16` registers can be read or written over the wire. `f32` registers are modeled in the TOML schema and supported by the local filesystem/store, but writing them over Modbus is deliberately not yet implemented — a 32-bit value spans two 16-bit registers, and which one carries the high vs. low word is a real, device-dependent convention that hasn't been decided yet. Guessing it would risk silently sending the wrong value to real hardware.
-- Read Discrete Inputs (FC 0x02) is decoded by `protocol` but not wired into `client`/`server` yet — there's no discrete-input device model in the TOML schema (see the function code table above).
+- Read Discrete Inputs (FC 0x02) is decoded by `protocol` but not wired into `client`/`server` yet — there's no discrete-input device model in the TOML schema (see the function code table above). The same goes for Input Registers (FC 0x04), which isn't implemented at the protocol level at all yet.
+- `u8`/`i8` registers each occupy a whole 16-bit register (in the low byte) rather than two of them being packed into one — no real device was found that packs independent named values that way, so the simpler representation was kept.
 - FC 43 (device identification) only supports "Extended" access serving custom private objects (the mechanism used for description discovery above) — the standard VendorName/ProductCode/etc. objects and Basic/Regular/Individual access aren't implemented yet.
 - RTU serial parameters beyond baud rate (data bits, parity, stop bits) aren't configurable yet; fixed defaults (8 data bits, no parity, 1 stop bit) are used.
 
