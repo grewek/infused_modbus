@@ -114,10 +114,9 @@ pub struct InfusedFilesystem {
     report: Arc<Mutex<WriteReport>>,
     // Only `Some` on the server — see `ClientTrustState`'s own doc comment
     // for why this is the one asymmetric piece of state in this struct.
-    // Not read anywhere yet (Milestone O1 is pure plumbing) — O2 adds the
-    // `client-trust/approved/` directory that actually consults it.
-    #[allow(dead_code)]
     client_trust: Option<Arc<Mutex<ClientTrustState>>>,
+    client_trust_ino: INodeNo,
+    client_trust_approved_ino: INodeNo,
 }
 
 impl InfusedFilesystem {
@@ -156,6 +155,20 @@ impl InfusedFilesystem {
             next_ino: first_report_ino + registers.len() as u64 + coils.len() as u64,
             ..Default::default()
         });
+        // client-trust/'s two fixed directory inodes sit right after every
+        // other fixed inode this filesystem hands out — computed the same
+        // way regardless of whether `client_trust` is `Some` (client-side
+        // `None` just never exposes them), so the numbering stays
+        // deterministic and independent of which fields happen to be used.
+        let client_trust_ino =
+            INodeNo(first_report_ino + registers.len() as u64 + coils.len() as u64);
+        let client_trust_approved_ino = INodeNo(client_trust_ino.0 + 1);
+        if let Some(client_trust) = &client_trust {
+            client_trust
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .set_next_ino(client_trust_approved_ino.0 + 1);
+        }
         Self {
             registers,
             name_to_ino,
@@ -170,6 +183,8 @@ impl InfusedFilesystem {
             report_ino,
             report,
             client_trust,
+            client_trust_ino,
+            client_trust_approved_ino,
         }
     }
 
@@ -195,6 +210,15 @@ impl InfusedFilesystem {
 
     fn report_lock(&self) -> MutexGuard<'_, WriteReport> {
         self.report.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // `None` on the client (see `ClientTrustState`'s doc comment) — callers
+    // must handle that case themselves; there is no sensible "empty lock"
+    // to hand back.
+    fn client_trust_lock(&self) -> Option<MutexGuard<'_, ClientTrustState>> {
+        self.client_trust
+            .as_ref()
+            .map(|client_trust| client_trust.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     // report/'s file inodes sit right after the fixed report/ directory
@@ -433,7 +457,59 @@ impl Filesystem for InfusedFilesystem {
                         Generation(0),
                     );
                 }
+                // Only exists on the server (`client_trust.is_some()`) —
+                // on the client this falls through to the same ENOENT as
+                // any other unknown name, so the directory genuinely
+                // doesn't exist there, not just "exists but empty".
+                Some("client-trust") if self.client_trust.is_some() => {
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.directory_attr(self.client_trust_ino, req),
+                        Generation(0),
+                    );
+                }
                 _ => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
+        if parent == self.client_trust_ino && self.client_trust.is_some() {
+            match name.to_str() {
+                Some("approved") => {
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.directory_attr(self.client_trust_approved_ino, req),
+                        Generation(0),
+                    );
+                }
+                _ => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
+        if parent == self.client_trust_approved_ino {
+            let Some(name) = name.to_str() else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            let ino = self
+                .client_trust_lock()
+                .and_then(|state| state.ino_by_fingerprint(name));
+            match ino {
+                Some(ino) => {
+                    // The file's content is just its own name again (the
+                    // fingerprint) — matches CLAUDE.md's "read-only mirror
+                    // of the currently approved fingerprint set": presence
+                    // in the directory listing already *is* the meaningful
+                    // information, the content is there so `cat` alone
+                    // (without `ls`) also shows something recognizable.
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.file_attr(ino, name.len() as u64 + 1, 0o444, req),
+                        Generation(0),
+                    );
+                }
+                None => reply.error(Errno::ENOENT),
             }
             return;
         }
@@ -536,8 +612,22 @@ impl Filesystem for InfusedFilesystem {
             || ino == self.coils_ino
             || ino == self.transactions_ino
             || ino == self.report_ino
+            || (ino == self.client_trust_ino && self.client_trust.is_some())
+            || (ino == self.client_trust_approved_ino && self.client_trust.is_some())
         {
             reply.attr(&ATTR_TTL, &self.directory_attr(ino, req));
+            return;
+        }
+
+        if let Some(fingerprint) = self
+            .client_trust_lock()
+            .and_then(|state| state.fingerprint_by_ino(ino).map(str::to_string))
+        {
+            let content = format!("{fingerprint}\n");
+            reply.attr(
+                &ATTR_TTL,
+                &self.file_attr(ino, content.len() as u64, 0o444, req),
+            );
             return;
         }
 
@@ -661,19 +751,22 @@ impl Filesystem for InfusedFilesystem {
             self.report_content(&register.name)
         } else if let Some(coil) = self.report_coil_by_ino(ino) {
             self.report_content(&coil.name)
-        } else {
+        } else if let Some(name) = self.transaction_name_by_ino(ino) {
             // The lock must be released before `transaction_content` tries
             // to take it again — std::sync::Mutex isn't reentrant, so
             // holding this guard through that call (as a direct `if let`
             // condition would, since its temporary lives for the whole
-            // `if let` body) deadlocks.
-            match self.transaction_name_by_ino(ino) {
-                Some(name) => self.transaction_content(&name),
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
+            // `if let` body) deadlocks. `transaction_name_by_ino` already
+            // resolves to an owned `String` for exactly this reason.
+            self.transaction_content(&name)
+        } else if let Some(fingerprint) = self
+            .client_trust_lock()
+            .and_then(|state| state.fingerprint_by_ino(ino).map(str::to_string))
+        {
+            format!("{fingerprint}\n")
+        } else {
+            reply.error(Errno::ENOENT);
+            return;
         };
 
         let bytes = content.as_bytes();
@@ -711,6 +804,38 @@ impl Filesystem for InfusedFilesystem {
                 ),
                 (self.report_ino, FileType::Directory, "report".to_string()),
             ]
+            .into_iter()
+            .chain(self.client_trust.is_some().then_some((
+                self.client_trust_ino,
+                FileType::Directory,
+                "client-trust".to_string(),
+            )))
+            .collect()
+        } else if ino == self.client_trust_ino && self.client_trust.is_some() {
+            vec![
+                (self.client_trust_ino, FileType::Directory, ".".to_string()),
+                (ROOT_INO, FileType::Directory, "..".to_string()),
+                (
+                    self.client_trust_approved_ino,
+                    FileType::Directory,
+                    "approved".to_string(),
+                ),
+            ]
+        } else if ino == self.client_trust_approved_ino {
+            let mut entries = vec![
+                (
+                    self.client_trust_approved_ino,
+                    FileType::Directory,
+                    ".".to_string(),
+                ),
+                (self.client_trust_ino, FileType::Directory, "..".to_string()),
+            ];
+            if let Some(state) = self.client_trust_lock() {
+                for (fingerprint, ino) in state.approved_entries() {
+                    entries.push((ino, FileType::RegularFile, fingerprint.to_string()));
+                }
+            }
+            entries
         } else if ino == HOLDING_REGISTERS_INO {
             let mut entries = vec![
                 (HOLDING_REGISTERS_INO, FileType::Directory, ".".to_string()),
@@ -956,6 +1081,23 @@ mod tests {
         (
             InfusedFilesystem::new(registers, coils, store, coil_store, sender, report, None),
             receiver,
+        )
+    }
+
+    fn test_filesystem_with_client_trust() -> InfusedFilesystem {
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let (sender, _receiver) = mpsc::channel();
+        let client_trust = Arc::new(Mutex::new(ClientTrustState::new()));
+        InfusedFilesystem::new(
+            Vec::new(),
+            Vec::new(),
+            store,
+            coil_store,
+            sender,
+            report,
+            Some(client_trust),
         )
     }
 
@@ -1307,5 +1449,50 @@ mod tests {
         assert_eq!(InfusedFilesystem::parse_coil_value("true"), None);
         assert_eq!(InfusedFilesystem::parse_coil_value("2"), None);
         assert_eq!(InfusedFilesystem::parse_coil_value(""), None);
+    }
+
+    #[test]
+    fn client_trust_is_none_when_not_constructed_with_it() {
+        let (filesystem, _receiver) = test_filesystem();
+        assert!(filesystem.client_trust_lock().is_none());
+    }
+
+    #[test]
+    fn client_trust_lock_is_some_when_constructed_with_it() {
+        let filesystem = test_filesystem_with_client_trust();
+        assert!(filesystem.client_trust_lock().is_some());
+    }
+
+    #[test]
+    fn client_trust_inodes_are_calibrated_past_every_fixed_inode() {
+        let filesystem = test_filesystem_with_client_trust();
+        assert_ne!(filesystem.client_trust_ino, filesystem.report_ino);
+        assert_ne!(filesystem.client_trust_approved_ino, filesystem.report_ino);
+        assert_ne!(
+            filesystem.client_trust_ino,
+            filesystem.client_trust_approved_ino
+        );
+
+        // The dynamic per-fingerprint inode range must start strictly
+        // after both fixed client-trust/ directory inodes, same reasoning
+        // as TransactionFsState.next_ino sitting past every fixed inode.
+        let ino = filesystem
+            .client_trust_lock()
+            .unwrap()
+            .insert_approved("aa:bb");
+        assert!(ino.0 > filesystem.client_trust_approved_ino.0);
+    }
+
+    #[test]
+    fn approved_fingerprint_is_resolvable_by_name_and_by_ino() {
+        let filesystem = test_filesystem_with_client_trust();
+        let ino = filesystem
+            .client_trust_lock()
+            .unwrap()
+            .insert_approved("aa:bb:cc");
+
+        let state = filesystem.client_trust_lock().unwrap();
+        assert_eq!(state.ino_by_fingerprint("aa:bb:cc"), Some(ino));
+        assert_eq!(state.fingerprint_by_ino(ino), Some("aa:bb:cc"));
     }
 }
