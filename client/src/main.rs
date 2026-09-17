@@ -16,9 +16,16 @@
 // Usage:
 //   cargo run -p client -- <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms]
 //
-// <connection> is either:
+// <connection> is one of:
 //   tcp://<address:port>                e.g. tcp://127.0.0.1:502
 //   rtu://<serial-path>:<baud-rate>      e.g. rtu:///dev/ttyUSB0:9600
+//   tls+tcp://<address:port>            e.g. tls+tcp://127.0.0.1:502
+//
+// tls+tcp:// is not yet secure to use over an untrusted network: the
+// server's certificate is accepted unconditionally (see
+// client::connection::InsecureAcceptAnyServerCert) until real
+// fingerprint-based verification lands (CLAUDE.md's TLS design, milestone
+// L). It proves the transport works, nothing more, for now.
 //
 // Every register DataType is read (polling.rs) and written
 // (write_confirmation.rs/transaction_consumer.rs) over the wire now, honoring
@@ -34,6 +41,7 @@ use client::polling::run_polling_loop;
 use client::transaction_consumer::run_transaction_consumer;
 use fuse_fs::filesystem::InfusedFilesystem;
 use fuse_fs::{CoilStore, RegisterStore, WriteReport};
+use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::DeviceDescription;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -48,27 +56,25 @@ const DEVICE_DESCRIPTION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 fn usage() -> ! {
     eprintln!(
         "Usage: client <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms]\n\
-         <connection> is tcp://<address:port> or rtu://<serial-path>:<baud-rate>"
+         <connection> is tcp://<address:port>, tls+tcp://<address:port>, or rtu://<serial-path>:<baud-rate>"
     );
     std::process::exit(1);
 }
 
 fn open_connection(runtime: &tokio::runtime::Runtime, connection_string: &str) -> Connection {
-    if let Some(address) = connection_string.strip_prefix("tcp://") {
-        runtime
-            .block_on(Connection::connect_tcp(address))
-            .unwrap_or_else(|error| panic!("failed to connect to {address}: {error}"))
-    } else if let Some(rest) = connection_string.strip_prefix("rtu://") {
-        let Some((path, baud_rate)) = rest.rsplit_once(':') else {
-            panic!("rtu:// connection must be rtu://<path>:<baud-rate>, got {connection_string:?}");
-        };
-        let baud_rate: u32 = baud_rate
-            .parse()
-            .unwrap_or_else(|error| panic!("invalid baud rate {baud_rate:?}: {error}"));
-        Connection::open_rtu(runtime.handle(), path, baud_rate)
-            .unwrap_or_else(|error| panic!("failed to open serial port {path:?}: {error}"))
-    } else {
-        panic!("connection must start with tcp:// or rtu://, got {connection_string:?}");
+    let target =
+        parse_connection_string(connection_string).unwrap_or_else(|error| panic!("{error}"));
+    match target {
+        ConnectionTarget::Tcp { address } => runtime
+            .block_on(Connection::connect_tcp(&address))
+            .unwrap_or_else(|error| panic!("failed to connect to {address}: {error}")),
+        ConnectionTarget::TlsTcp { address } => runtime
+            .block_on(Connection::connect_tls(&address))
+            .unwrap_or_else(|error| panic!("failed to connect over TLS to {address}: {error}")),
+        ConnectionTarget::Rtu { path, baud_rate } => {
+            Connection::open_rtu(runtime.handle(), &path, baud_rate)
+                .unwrap_or_else(|error| panic!("failed to open serial port {path:?}: {error}"))
+        }
     }
 }
 

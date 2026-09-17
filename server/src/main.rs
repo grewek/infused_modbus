@@ -11,9 +11,18 @@
 // Usage:
 //   cargo run -p server -- <mountpoint> <device-description.toml> <connection>
 //
-// <connection> is either:
+// <connection> is one of:
 //   tcp://<bind-address:port>          e.g. tcp://0.0.0.0:502
 //   rtu://<serial-path>:<baud-rate>    e.g. rtu:///dev/ttyUSB0:9600
+//   tls+tcp://<bind-address:port>      e.g. tls+tcp://0.0.0.0:502
+//
+// tls+tcp:// is not yet secure to use over an untrusted network: this
+// server accepts any client's certificate unconditionally, and requires no
+// client certificate at all (mutual TLS is a later milestone) — see
+// server::tls::build_server_config. It proves the transport works, nothing
+// more, for now. The server's own TLS identity is generated on first run
+// and persisted under TLS_IDENTITY_DIRECTORY below (a fixed default, not
+// yet CLI-configurable).
 //
 // Every register DataType can be read and written over the wire now (see
 // handler.rs) — Write Single Register only ever carries one register
@@ -26,22 +35,25 @@
 
 use fuse_fs::filesystem::InfusedFilesystem;
 use fuse_fs::{CoilStore, RegisterStore, WriteReport};
+use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::{
     CoilDescription, DeviceDescription, MemLayout, RegisterDescription,
 };
 use server::connection::{serve_rtu_connection, serve_tcp_connection};
 use server::transaction_consumer::run_transaction_consumer;
+use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_serial::SerialPortBuilderExt;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const TLS_IDENTITY_DIRECTORY: &str = "server-tls-identity";
 
 fn usage() -> ! {
     eprintln!(
         "Usage: server <mountpoint> <device-description.toml> <connection>\n\
-         <connection> is tcp://<bind-address:port> or rtu://<serial-path>:<baud-rate>"
+         <connection> is tcp://<bind-address:port>, tls+tcp://<bind-address:port>, or rtu://<serial-path>:<baud-rate>"
     );
     std::process::exit(1);
 }
@@ -57,75 +69,124 @@ fn start_serving(
     mem_layout: MemLayout,
     toml_source: Arc<String>,
 ) {
-    if let Some(bind_address) = connection_string.strip_prefix("tcp://") {
-        let listener = runtime
-            .block_on(TcpListener::bind(bind_address))
-            .unwrap_or_else(|error| panic!("failed to bind {bind_address}: {error}"));
-        runtime.spawn(async move {
-            loop {
-                let (stream, _peer_address) = match listener.accept().await {
-                    Ok(accepted) => accepted,
-                    // A single failed accept (e.g. a transient resource
-                    // limit) shouldn't take the whole server down.
-                    Err(_) => continue,
-                };
-                let registers = Arc::clone(&registers);
-                let store = Arc::clone(&store);
-                let coils = Arc::clone(&coils);
-                let coil_store = Arc::clone(&coil_store);
-                let toml_source = Arc::clone(&toml_source);
-                tokio::spawn(async move {
-                    serve_tcp_connection(
-                        stream,
-                        registers,
-                        store,
-                        coils,
-                        coil_store,
-                        mem_layout,
-                        toml_source,
-                        REQUEST_TIMEOUT,
-                    )
-                    .await;
-                });
-            }
-        });
-    } else if let Some(rest) = connection_string.strip_prefix("rtu://") {
-        let Some((path, baud_rate)) = rest.rsplit_once(':') else {
-            panic!("rtu:// connection must be rtu://<path>:<baud-rate>, got {connection_string:?}");
-        };
-        let baud_rate: u32 = baud_rate
-            .parse()
-            .unwrap_or_else(|error| panic!("invalid baud rate {baud_rate:?}: {error}"));
-        let frame_silence = protocol::rtu::frame_silence_for_baud_rate(baud_rate);
-        // See client::connection::Connection::open_rtu: tokio-serial
-        // registers the file descriptor with the reactor immediately at
-        // open time, so opening it needs an active runtime context even
-        // though this isn't an async call.
-        let stream = {
-            let _guard = runtime.handle().enter();
-            tokio_serial::new(path, baud_rate)
-                .open_native_async()
-                .unwrap_or_else(|error| panic!("failed to open serial port {path:?}: {error}"))
-        };
-        // Unlike TCP, there's only ever one of these — the physical
-        // serial link itself — so just one spawned task, not an
-        // accept-and-spawn-per-connection loop.
-        runtime.spawn(async move {
-            serve_rtu_connection(
-                stream,
-                registers,
-                store,
-                coils,
-                coil_store,
-                mem_layout,
-                toml_source,
-                frame_silence,
-                REQUEST_TIMEOUT,
-            )
-            .await;
-        });
-    } else {
-        panic!("connection must start with tcp:// or rtu://, got {connection_string:?}");
+    let target =
+        parse_connection_string(connection_string).unwrap_or_else(|error| panic!("{error}"));
+    match target {
+        ConnectionTarget::Tcp {
+            address: bind_address,
+        } => {
+            let listener = runtime
+                .block_on(TcpListener::bind(&bind_address))
+                .unwrap_or_else(|error| panic!("failed to bind {bind_address}: {error}"));
+            runtime.spawn(async move {
+                loop {
+                    let (stream, _peer_address) = match listener.accept().await {
+                        Ok(accepted) => accepted,
+                        // A single failed accept (e.g. a transient resource
+                        // limit) shouldn't take the whole server down.
+                        Err(_) => continue,
+                    };
+                    let registers = Arc::clone(&registers);
+                    let store = Arc::clone(&store);
+                    let coils = Arc::clone(&coils);
+                    let coil_store = Arc::clone(&coil_store);
+                    let toml_source = Arc::clone(&toml_source);
+                    tokio::spawn(async move {
+                        serve_tcp_connection(
+                            stream,
+                            registers,
+                            store,
+                            coils,
+                            coil_store,
+                            mem_layout,
+                            toml_source,
+                            REQUEST_TIMEOUT,
+                        )
+                        .await;
+                    });
+                }
+            });
+        }
+        ConnectionTarget::TlsTcp {
+            address: bind_address,
+        } => {
+            let identity =
+                protocol::tls::load_or_generate_identity(Path::new(TLS_IDENTITY_DIRECTORY))
+                    .unwrap_or_else(|error| {
+                        panic!("failed to load/generate TLS identity: {error}")
+                    });
+            let server_config = server::tls::build_server_config(&identity)
+                .unwrap_or_else(|error| panic!("failed to build TLS server config: {error}"));
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+            let listener = runtime
+                .block_on(TcpListener::bind(&bind_address))
+                .unwrap_or_else(|error| panic!("failed to bind {bind_address}: {error}"));
+            runtime.spawn(async move {
+                loop {
+                    let (tcp_stream, _peer_address) = match listener.accept().await {
+                        Ok(accepted) => accepted,
+                        Err(_) => continue,
+                    };
+                    let acceptor = acceptor.clone();
+                    let registers = Arc::clone(&registers);
+                    let store = Arc::clone(&store);
+                    let coils = Arc::clone(&coils);
+                    let coil_store = Arc::clone(&coil_store);
+                    let toml_source = Arc::clone(&toml_source);
+                    tokio::spawn(async move {
+                        let Ok(stream) = acceptor.accept(tcp_stream).await else {
+                            // A failed handshake (e.g. a peer that isn't
+                            // actually speaking TLS) shouldn't take the whole
+                            // server down, same reasoning as a failed accept
+                            // above.
+                            return;
+                        };
+                        serve_tcp_connection(
+                            stream,
+                            registers,
+                            store,
+                            coils,
+                            coil_store,
+                            mem_layout,
+                            toml_source,
+                            REQUEST_TIMEOUT,
+                        )
+                        .await;
+                    });
+                }
+            });
+        }
+        ConnectionTarget::Rtu { path, baud_rate } => {
+            let frame_silence = protocol::rtu::frame_silence_for_baud_rate(baud_rate);
+            // See client::connection::Connection::open_rtu: tokio-serial
+            // registers the file descriptor with the reactor immediately at
+            // open time, so opening it needs an active runtime context even
+            // though this isn't an async call.
+            let stream = {
+                let _guard = runtime.handle().enter();
+                tokio_serial::new(&path, baud_rate)
+                    .open_native_async()
+                    .unwrap_or_else(|error| panic!("failed to open serial port {path:?}: {error}"))
+            };
+            // Unlike TCP, there's only ever one of these — the physical
+            // serial link itself — so just one spawned task, not an
+            // accept-and-spawn-per-connection loop.
+            runtime.spawn(async move {
+                serve_rtu_connection(
+                    stream,
+                    registers,
+                    store,
+                    coils,
+                    coil_store,
+                    mem_layout,
+                    toml_source,
+                    frame_silence,
+                    REQUEST_TIMEOUT,
+                )
+                .await;
+            });
+        }
     }
 }
 
