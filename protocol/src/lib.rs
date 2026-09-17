@@ -3,6 +3,7 @@ pub mod device_description;
 pub mod pdu;
 pub mod rtu;
 pub mod tcp;
+pub mod tls;
 
 use std::future::Future;
 use std::io;
