@@ -223,9 +223,17 @@ impl Connection {
     /// it doesn't match. If not given, falls back to the insecure K6a
     /// placeholder (`InsecureAcceptAnyServerCert`) — useful for local
     /// testing, but does not check the server's identity at all.
+    ///
+    /// If `client_identity` is given, it is presented as this client's own
+    /// certificate if the server asks for one (mutual TLS, milestone M2) —
+    /// the server doesn't yet police *which* client identity it accepts
+    /// (that's milestone N), so presenting one here only matters once the
+    /// server actually requires it. If not given, no client certificate is
+    /// offered at all, same as before M2 existed.
     pub async fn connect_tls(
         address: &str,
         expected_server_fingerprint: Option<protocol::tls::Fingerprint>,
+        client_identity: Option<protocol::tls::Identity>,
     ) -> io::Result<Self> {
         let tcp_stream = TcpStream::connect(address).await?;
 
@@ -233,10 +241,21 @@ impl Connection {
             Some(fingerprint) => Arc::new(PinnedFingerprintServerCertVerifier::new(fingerprint)),
             None => Arc::new(InsecureAcceptAnyServerCert::new()),
         };
-        let config = ClientConfig::builder()
+        let config_builder = ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
+            .with_custom_certificate_verifier(verifier);
+        let config = match client_identity {
+            Some(identity) => {
+                let certificate = CertificateDer::from(identity.certificate_der);
+                let private_key =
+                    rustls::pki_types::PrivateKeyDer::try_from(identity.private_key_der)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                config_builder
+                    .with_client_auth_cert(vec![certificate], private_key)
+                    .map_err(io::Error::other)?
+            }
+            None => config_builder.with_no_client_auth(),
+        };
         let connector = TlsConnector::from(Arc::new(config));
 
         // Sent as the TLS ClientHello's SNI value. Never consulted for trust
@@ -427,7 +446,7 @@ mod tests {
             stream.write_all(&response).await.unwrap();
         });
 
-        let mut connection = Connection::connect_tls(&address, None).await.unwrap();
+        let mut connection = Connection::connect_tls(&address, None, None).await.unwrap();
         let request_pdu = ReadHoldingRegistersRequest {
             starting_address: 40001,
             quantity: 1,
@@ -461,7 +480,7 @@ mod tests {
             let _stream = acceptor.accept(tcp_stream).await.unwrap();
         });
 
-        let result = Connection::connect_tls(&address, Some(fingerprint)).await;
+        let result = Connection::connect_tls(&address, Some(fingerprint), None).await;
         assert!(result.is_ok());
     }
 
@@ -481,7 +500,84 @@ mod tests {
             let _ = acceptor.accept(tcp_stream).await;
         });
 
-        let result = Connection::connect_tls(&address, Some(wrong_fingerprint)).await;
+        let result = Connection::connect_tls(&address, Some(wrong_fingerprint), None).await;
         assert!(result.is_err());
+    }
+
+    // Minimal in-test verifier requiring but not policing a client
+    // certificate — mirrors `server::tls::InsecureAcceptAnyClientCert`
+    // (can't reuse it directly, different crate) — just enough to prove
+    // `connect_tls`'s `client_identity` parameter actually gets presented
+    // on the wire, not silently dropped.
+    #[derive(Debug)]
+    struct AcceptAnyClientCert {
+        supported_algorithms: WebPkiSupportedAlgorithms,
+    }
+
+    impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCert {
+        fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+            &[]
+        }
+
+        fn verify_client_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _now: UnixTime,
+        ) -> Result<rustls::server::danger::ClientCertVerified, TlsError> {
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_algorithms)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_algorithms)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.supported_algorithms.supported_schemes()
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_connection_succeeds_when_the_server_requires_a_client_certificate() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let client_cert_verifier = AcceptAnyClientCert {
+            supported_algorithms: rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms,
+        };
+        let identity = protocol::tls::generate_self_signed_identity().unwrap();
+        let certificate = CertificateDer::from(identity.certificate_der);
+        let private_key = rustls::pki_types::PrivateKeyDer::try_from(identity.private_key_der)
+            .expect("rcgen produces a valid PKCS#8 private key");
+        let server_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(Arc::new(client_cert_verifier))
+            .with_single_cert(vec![certificate], private_key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        tokio::spawn(async move {
+            let (tcp_stream, _peer) = listener.accept().await.unwrap();
+            // Completing the handshake at all proves the client presented a
+            // certificate the mandatory-client-auth server accepted.
+            let _stream = acceptor.accept(tcp_stream).await.unwrap();
+        });
+
+        let client_identity = protocol::tls::generate_self_signed_identity().unwrap();
+        let result = Connection::connect_tls(&address, None, Some(client_identity)).await;
+        assert!(result.is_ok());
     }
 }

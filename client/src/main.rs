@@ -102,12 +102,26 @@ fn open_connection(
         ConnectionTarget::Tcp { address } => runtime
             .block_on(Connection::connect_tcp(&address))
             .unwrap_or_else(|error| panic!("failed to connect to {address}: {error}")),
-        ConnectionTarget::TlsTcp { address } => runtime
-            .block_on(Connection::connect_tls(
-                &address,
-                expected_server_fingerprint,
+        ConnectionTarget::TlsTcp { address } => {
+            // Not yet policed by the server (client approval is milestone
+            // N) — presenting it now proves the two-sided mTLS handshake
+            // itself works (M2) ahead of any real approval decision.
+            let client_identity = protocol::tls::load_or_generate_identity(std::path::Path::new(
+                CLIENT_TLS_IDENTITY_DIRECTORY,
             ))
-            .unwrap_or_else(|error| panic!("failed to connect over TLS to {address}: {error}")),
+            .unwrap_or_else(|error| panic!("failed to load/generate client TLS identity: {error}"));
+            println!(
+                "Client TLS fingerprint: {}",
+                protocol::tls::Fingerprint::of(&client_identity.public_key_der)
+            );
+            runtime
+                .block_on(Connection::connect_tls(
+                    &address,
+                    expected_server_fingerprint,
+                    Some(client_identity),
+                ))
+                .unwrap_or_else(|error| panic!("failed to connect over TLS to {address}: {error}"))
+        }
         ConnectionTarget::Rtu { path, baud_rate } => {
             Connection::open_rtu(runtime.handle(), &path, baud_rate)
                 .unwrap_or_else(|error| panic!("failed to open serial port {path:?}: {error}"))
@@ -136,16 +150,6 @@ fn main() {
                  verified (insecure placeholder verifier)."
             ),
         }
-        // Not yet presented during the handshake (mTLS is milestone M2) —
-        // generating/persisting it now, and printing its fingerprint,
-        // means a technician already has what they'll need to hand to the
-        // server operator once client approval (milestone N) exists.
-        let client_identity = protocol::tls::load_or_generate_identity(std::path::Path::new(
-            CLIENT_TLS_IDENTITY_DIRECTORY,
-        ))
-        .unwrap_or_else(|error| panic!("failed to load/generate client TLS identity: {error}"));
-        let client_fingerprint = protocol::tls::Fingerprint::of(&client_identity.public_key_der);
-        println!("Client TLS fingerprint: {client_fingerprint}");
     }
     let unit_id: u8 = match args.next() {
         Some(value) => value
