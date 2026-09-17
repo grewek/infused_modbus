@@ -29,7 +29,11 @@
 // unconditionally (client::connection::InsecureAcceptAnyServerCert) —
 // useful for local testing, not for a real deployment. Either way, the
 // server does not yet verify *this* client's identity (mutual TLS is a
-// later milestone, M/N) — see CLAUDE.md's TLS design.
+// later milestone, M/N) — see CLAUDE.md's TLS design. The client does
+// already generate/persist its own identity under
+// CLIENT_TLS_IDENTITY_DIRECTORY and prints its fingerprint, ahead of it
+// actually being presented during the handshake, so that value is ready
+// once it's needed.
 //
 // Every register DataType is read (polling.rs) and written
 // (write_confirmation.rs/transaction_consumer.rs) over the wire now, honoring
@@ -53,6 +57,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 const DEFAULT_UNIT_ID: u8 = 1;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
+const CLIENT_TLS_IDENTITY_DIRECTORY: &str = "client-tls-identity";
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEVICE_DESCRIPTION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -131,6 +136,16 @@ fn main() {
                  verified (insecure placeholder verifier)."
             ),
         }
+        // Not yet presented during the handshake (mTLS is milestone M2) —
+        // generating/persisting it now, and printing its fingerprint,
+        // means a technician already has what they'll need to hand to the
+        // server operator once client approval (milestone N) exists.
+        let client_identity = protocol::tls::load_or_generate_identity(std::path::Path::new(
+            CLIENT_TLS_IDENTITY_DIRECTORY,
+        ))
+        .unwrap_or_else(|error| panic!("failed to load/generate client TLS identity: {error}"));
+        let client_fingerprint = protocol::tls::Fingerprint::of(&client_identity.public_key_der);
+        println!("Client TLS fingerprint: {client_fingerprint}");
     }
     let unit_id: u8 = match args.next() {
         Some(value) => value
