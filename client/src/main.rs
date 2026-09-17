@@ -14,18 +14,22 @@
 // otherwise fails.
 //
 // Usage:
-//   cargo run -p client -- <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms]
+//   cargo run -p client -- <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>]
 //
 // <connection> is one of:
 //   tcp://<address:port>                e.g. tcp://127.0.0.1:502
 //   rtu://<serial-path>:<baud-rate>      e.g. rtu:///dev/ttyUSB0:9600
 //   tls+tcp://<address:port>            e.g. tls+tcp://127.0.0.1:502
 //
-// tls+tcp:// is not yet secure to use over an untrusted network: the
-// server's certificate is accepted unconditionally (see
-// client::connection::InsecureAcceptAnyServerCert) until real
-// fingerprint-based verification lands (CLAUDE.md's TLS design, milestone
-// L). It proves the transport works, nothing more, for now.
+// tls+tcp:// verifies the server's identity by comparing its certificate's
+// public-key fingerprint against --expect-server-fingerprint (pinned out of
+// band, e.g. read off the server's own startup log at commissioning) — see
+// client::connection::PinnedFingerprintServerCertVerifier. Without that
+// flag, the connection falls back to accepting any server certificate
+// unconditionally (client::connection::InsecureAcceptAnyServerCert) —
+// useful for local testing, not for a real deployment. Either way, the
+// server does not yet verify *this* client's identity (mutual TLS is a
+// later milestone, M/N) — see CLAUDE.md's TLS design.
 //
 // Every register DataType is read (polling.rs) and written
 // (write_confirmation.rs/transaction_consumer.rs) over the wire now, honoring
@@ -57,16 +61,15 @@ fn usage() -> ! {
     eprintln!(
         "Usage: client <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>]\n\
          <connection> is tcp://<address:port>, tls+tcp://<address:port>, or rtu://<serial-path>:<baud-rate>\n\
-         --expect-server-fingerprint pins the server's TLS identity (tls+tcp:// only) — not yet enforced, milestone L3."
+         --expect-server-fingerprint pins the server's TLS identity (tls+tcp:// only) — \
+         without it, the server's identity is not verified at all (see CLAUDE.md's TLS design)."
     );
     std::process::exit(1);
 }
 
 /// Pulls `--expect-server-fingerprint <value>` out of `args` if present
 /// (order-independent relative to the positional arguments), leaving the
-/// rest of `args` untouched. Not yet consumed by anything — `connect_tls`
-/// still uses the K6a placeholder verifier; wiring this into a real
-/// fingerprint check is milestone L3.
+/// rest of `args` untouched.
 fn extract_expected_server_fingerprint(
     args: &mut Vec<String>,
 ) -> Option<protocol::tls::Fingerprint> {
@@ -83,7 +86,11 @@ fn extract_expected_server_fingerprint(
     }))
 }
 
-fn open_connection(runtime: &tokio::runtime::Runtime, connection_string: &str) -> Connection {
+fn open_connection(
+    runtime: &tokio::runtime::Runtime,
+    connection_string: &str,
+    expected_server_fingerprint: Option<protocol::tls::Fingerprint>,
+) -> Connection {
     let target =
         parse_connection_string(connection_string).unwrap_or_else(|error| panic!("{error}"));
     match target {
@@ -91,7 +98,10 @@ fn open_connection(runtime: &tokio::runtime::Runtime, connection_string: &str) -
             .block_on(Connection::connect_tcp(&address))
             .unwrap_or_else(|error| panic!("failed to connect to {address}: {error}")),
         ConnectionTarget::TlsTcp { address } => runtime
-            .block_on(Connection::connect_tls(&address))
+            .block_on(Connection::connect_tls(
+                &address,
+                expected_server_fingerprint,
+            ))
             .unwrap_or_else(|error| panic!("failed to connect over TLS to {address}: {error}")),
         ConnectionTarget::Rtu { path, baud_rate } => {
             Connection::open_rtu(runtime.handle(), &path, baud_rate)
@@ -103,11 +113,6 @@ fn open_connection(runtime: &tokio::runtime::Runtime, connection_string: &str) -
 fn main() {
     let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
     let expected_server_fingerprint = extract_expected_server_fingerprint(&mut raw_args);
-    if let Some(fingerprint) = &expected_server_fingerprint {
-        println!(
-            "Expecting server TLS fingerprint {fingerprint} — NOT enforced yet (milestone L3), informational only."
-        );
-    }
     let mut args = raw_args.into_iter();
     let Some(mountpoint) = args.next() else {
         usage();
@@ -118,6 +123,15 @@ fn main() {
     let Some(connection_string) = args.next() else {
         usage();
     };
+    if connection_string.starts_with("tls+tcp://") {
+        match &expected_server_fingerprint {
+            Some(fingerprint) => println!("Pinning server TLS fingerprint {fingerprint}."),
+            None => println!(
+                "No --expect-server-fingerprint given — the server's identity will NOT be \
+                 verified (insecure placeholder verifier)."
+            ),
+        }
+    }
     let unit_id: u8 = match args.next() {
         Some(value) => value
             .parse()
@@ -137,7 +151,7 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed to read {device_description_path}: {error}"));
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");
-    let mut connection = open_connection(&runtime, &connection_string);
+    let mut connection = open_connection(&runtime, &connection_string, expected_server_fingerprint);
 
     // Ask the server to "introduce itself" (FC 43) before doing anything
     // else with the connection — see client/src/device_identification.rs.
