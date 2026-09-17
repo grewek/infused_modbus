@@ -55,10 +55,32 @@ const DEVICE_DESCRIPTION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: client <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms]\n\
-         <connection> is tcp://<address:port>, tls+tcp://<address:port>, or rtu://<serial-path>:<baud-rate>"
+        "Usage: client <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>]\n\
+         <connection> is tcp://<address:port>, tls+tcp://<address:port>, or rtu://<serial-path>:<baud-rate>\n\
+         --expect-server-fingerprint pins the server's TLS identity (tls+tcp:// only) — not yet enforced, milestone L3."
     );
     std::process::exit(1);
+}
+
+/// Pulls `--expect-server-fingerprint <value>` out of `args` if present
+/// (order-independent relative to the positional arguments), leaving the
+/// rest of `args` untouched. Not yet consumed by anything — `connect_tls`
+/// still uses the K6a placeholder verifier; wiring this into a real
+/// fingerprint check is milestone L3.
+fn extract_expected_server_fingerprint(
+    args: &mut Vec<String>,
+) -> Option<protocol::tls::Fingerprint> {
+    let flag_index = args
+        .iter()
+        .position(|arg| arg == "--expect-server-fingerprint")?;
+    if flag_index + 1 >= args.len() {
+        panic!("--expect-server-fingerprint requires a value");
+    }
+    args.remove(flag_index);
+    let value = args.remove(flag_index);
+    Some(value.parse().unwrap_or_else(|error: String| {
+        panic!("invalid --expect-server-fingerprint value: {error}")
+    }))
 }
 
 fn open_connection(runtime: &tokio::runtime::Runtime, connection_string: &str) -> Connection {
@@ -79,7 +101,14 @@ fn open_connection(runtime: &tokio::runtime::Runtime, connection_string: &str) -
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let expected_server_fingerprint = extract_expected_server_fingerprint(&mut raw_args);
+    if let Some(fingerprint) = &expected_server_fingerprint {
+        println!(
+            "Expecting server TLS fingerprint {fingerprint} — NOT enforced yet (milestone L3), informational only."
+        );
+    }
+    let mut args = raw_args.into_iter();
     let Some(mountpoint) = args.next() else {
         usage();
     };

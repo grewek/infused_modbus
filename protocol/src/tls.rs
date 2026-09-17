@@ -149,6 +149,31 @@ impl fmt::Display for Fingerprint {
     }
 }
 
+/// Parses the `Display` format back — a technician pastes a fingerprint
+/// they read off a device label or copied from another terminal into a CLI
+/// argument (see the `--expect-server-fingerprint` flag), so this has to
+/// accept exactly what `Display` produces.
+impl std::str::FromStr for Fingerprint {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut bytes = [0u8; 32];
+        let byte_strings: Vec<&str> = text.split(':').collect();
+        if byte_strings.len() != bytes.len() {
+            return Err(format!(
+                "expected 32 colon-separated hex bytes, got {} in {text:?}",
+                byte_strings.len()
+            ));
+        }
+        for (index, byte_string) in byte_strings.iter().enumerate() {
+            bytes[index] = u8::from_str_radix(byte_string, 16).map_err(|error| {
+                format!("invalid hex byte {byte_string:?} in {text:?}: {error}")
+            })?;
+        }
+        Ok(Fingerprint(bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +263,23 @@ mod tests {
             Fingerprint::of(&first.public_key_der),
             Fingerprint::of(&second.public_key_der)
         );
+    }
+
+    #[test]
+    fn fingerprint_round_trips_through_display_and_from_str() {
+        let fingerprint = Fingerprint::of(b"abc");
+        let parsed: Fingerprint = fingerprint.to_string().parse().unwrap();
+        assert_eq!(fingerprint, parsed);
+    }
+
+    #[test]
+    fn fingerprint_from_str_rejects_wrong_byte_count() {
+        assert!("3a:f2".parse::<Fingerprint>().is_err());
+    }
+
+    #[test]
+    fn fingerprint_from_str_rejects_non_hex_bytes() {
+        let too_short_but_right_count = vec!["zz"; 32].join(":");
+        assert!(too_short_but_right_count.parse::<Fingerprint>().is_err());
     }
 }
