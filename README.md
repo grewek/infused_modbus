@@ -2,7 +2,7 @@
 
 A Modbus **client** (master) and Modbus **server** (slave) that expose the Modbus data they handle through a **FUSE filesystem** instead of — or in addition to — a conventional API. "Infused" refers to this live-updating FUSE projection of Modbus data: register values show up as readable files, and writes happen by writing to files, no client library required.
 
-Both **Modbus TCP** and **Modbus RTU** (serial) are supported, symmetrically, for both the client and the server.
+Both **Modbus TCP** and **Modbus RTU** (serial) are supported, symmetrically, for both the client and the server. A TLS-secured TCP transport (`tls+tcp://`) also exists but is still under active development — see [Supported connection types](#supported-connection-types) and [Connecting over TLS](#connecting-over-tls-work-in-progress) below before relying on it for anything.
 
 ## ⚠️ This project was built entirely with AI assistance
 
@@ -30,6 +30,18 @@ Nothing here shipped without a human decision behind it, but essentially all of 
 - **Modbus implemented from scratch.** The `protocol` crate implements Modbus TCP/RTU framing, CRC16, and PDU encode/decode directly, rather than wrapping an existing crate like `tokio-modbus`. Some individual inputs read from the wire (declared lengths/counts) are checked against the actual remaining buffer before being used for allocation or indexing — this reduces a few specific classes of bugs, but is not a substitute for a real security review, which this project has not had (see the warning above).
 - **Polling batches register reads.** The client keeps its local mirror fresh by polling, grouping contiguous register addresses into a single `Read Holding Registers` request (up to Modbus's 125-register limit) instead of one request per register. Standard Modbus has no mechanism for a device to push updates on its own — polling is the only option the protocol allows.
 - **Every register data type is read and written over the wire**, including ones spanning more than one 16-bit Modbus register (`u32`, `f64`, ...) — see [Device description TOML format](#device-description-toml-format) for the full type list and how `mem-layout` controls their byte order.
+
+## Supported connection types
+
+`client` and `server` both take a scheme-prefixed connection string on the command line (see [Getting started](#getting-started)). Everything built on top of the transport — transactions, polling, FC 43 device-description discovery — works identically regardless of which one is chosen.
+
+| Scheme | Transport | Status |
+| ------ | --------- | ------ |
+| `tcp://<address:port>` | Plain Modbus TCP | Supported |
+| `rtu://<serial-path>:<baud-rate>` | Modbus RTU over a serial link | Supported (secondary — TCP gets the primary design/testing attention; see `CLAUDE.md`) |
+| `tls+tcp://<address:port>` | Modbus TCP over TLS (self-signed identities, fingerprint pinning, no CA) | **Under active development.** The transport itself works end to end, but the server currently has no way to actually approve a connecting client — see [Connecting over TLS](#connecting-over-tls-work-in-progress) for exactly what does and doesn't work today. |
+
+A given `client`/`server` instance uses exactly one of these at a time — they are never combined on the same instance.
 
 ## Supported Modbus function codes
 
@@ -82,10 +94,11 @@ Requires Linux (FUSE is a Linux-specific dependency) and a FUSE-capable kernel/u
 cargo run -p server -- <mountpoint> <device-description.toml> <connection>
 ```
 
-`<connection>` is either:
+`<connection>` is one of:
 
 - `tcp://<bind-address:port>` — e.g. `tcp://0.0.0.0:502`
 - `rtu://<serial-path>:<baud-rate>` — e.g. `rtu:///dev/ttyUSB0:9600`
+- `tls+tcp://<bind-address:port>` — see [Connecting over TLS](#connecting-over-tls-work-in-progress) below; still under active development.
 
 Example:
 
@@ -100,7 +113,7 @@ cargo run -p server -- /tmp/modbus-server device.toml tcp://0.0.0.0:502
 cargo run -p client -- <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms]
 ```
 
-`<connection>` uses the same `tcp://`/`rtu://` scheme as the server. `<device-description.toml>` is required as a fallback, but if the server it connects to supports FC 43 (see below), the client uses the server's own description instead.
+`<connection>` uses the same `tcp://`/`rtu://`/`tls+tcp://` scheme as the server. `<device-description.toml>` is required as a fallback, but if the server it connects to supports FC 43 (see below), the client uses the server's own description instead.
 
 Example:
 
@@ -108,6 +121,34 @@ Example:
 mkdir -p /tmp/modbus-client
 cargo run -p client -- /tmp/modbus-client device.toml tcp://127.0.0.1:502 1 1000
 ```
+
+### Connecting over TLS (work in progress)
+
+`tls+tcp://` encrypts the Modbus TCP connection and authenticates both sides — but without a certificate authority: there's no CA to set up, no certificates to buy or issue. Instead, both `client` and `server` generate their own self-signed identity automatically the first time they run (persisted next to wherever the process was started: `server-tls-identity/` and `client-tls-identity/` respectively), and trust is based purely on comparing the raw public-key **fingerprint** a peer presents — the same idea as an SSH host key, not a PKI certificate chain. Read `CLAUDE.md`'s "Planned: TLS transport security & client trust" section for the full design this is built from.
+
+**1. Start the server.** It generates its identity on first run and prints its fingerprint:
+
+```sh
+cargo run -p server -- /tmp/modbus-server device.toml tls+tcp://0.0.0.0:502
+```
+
+```
+Server TLS fingerprint: 86:3f:7f:d5:06:06:0f:5e:26:8d:bd:a8:1e:15:14:38:39:f3:f4:ba:0a:a4:a9:6a:da:c6:9a:60:dd:7f:a4:74
+```
+
+Note this value down — in a real deployment, a technician commissioning the server would read it directly off the console/log and hand it to whoever sets up a client, out of band (there is no other channel this travels over).
+
+**2. Start the client, pinning that fingerprint:**
+
+```sh
+cargo run -p client -- /tmp/modbus-client device.toml tls+tcp://127.0.0.1:502 --expect-server-fingerprint 86:3f:7f:d5:06:06:0f:5e:26:8d:bd:a8:1e:15:14:38:39:f3:f4:ba:0a:a4:a9:6a:da:c6:9a:60:dd:7f:a4:74
+```
+
+Without `--expect-server-fingerprint`, the client accepts **any** server certificate unconditionally and prints a warning saying so — useful only for local testing, never for a real deployment. With it, the connection is rejected outright if the server presents a different certificate than expected.
+
+**3. The client also generates (and prints) its own identity** the first time it runs, and presents it to the server as part of a mutual TLS (mTLS) handshake — both sides authenticate to each other, not just the client authenticating the server.
+
+**What doesn't work yet:** the server requires every connecting client to present a certificate, but has no mechanism yet to decide *which* client fingerprints it should actually trust — there is no approval workflow built yet. As a result, **every client is currently rejected**, mid-handshake, regardless of which fingerprint it presents. This is deliberate (fail closed rather than fail open) while that mechanism — a separate local channel a technician uses to approve specific clients — is still being built. In its current state, `tls+tcp://` proves the encrypted transport and the server-authentication half work end to end, but a client cannot yet actually complete and hold a working connection to a real server over it.
 
 ### Interacting with the filesystem
 
@@ -241,6 +282,7 @@ This project is under active development. As of now:
 - `u8`/`i8` registers each occupy a whole 16-bit register (in the low byte) rather than two of them being packed into one — no real device was found that packs independent named values that way, so the simpler representation was kept.
 - FC 43 (device identification) only supports "Extended" access serving custom private objects (the mechanism used for description discovery above) — the standard VendorName/ProductCode/etc. objects and Basic/Regular/Individual access aren't implemented yet.
 - RTU serial parameters beyond baud rate (data bits, parity, stop bits) aren't configurable yet; fixed defaults (8 data bits, no parity, 1 stop bit) are used.
+- `tls+tcp://` (see [Connecting over TLS](#connecting-over-tls-work-in-progress)) has no client-approval mechanism yet, so every client is currently rejected — there is no way yet for an operator to approve a specific client's certificate. The TLS identity directories are also fixed, not yet configurable via a CLI flag, and RTU's serial link is a separate, unauthenticated threat model that TLS does nothing to address.
 
 ## Development
 
