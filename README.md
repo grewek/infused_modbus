@@ -33,7 +33,7 @@ Nothing here shipped without a human decision behind it, but essentially all of 
 
 ## Supported Modbus function codes
 
-This lists every public function code defined by the Modbus Application Protocol specification, not just the ones this project implements — so the gaps are visible rather than silently omitted. "Decoded, not wired" means `protocol` can encode/decode the PDU, but `client`/`server` don't call it yet; support for everything else marked "Not implemented yet" will be added later.
+This lists every public function code defined by the Modbus Application Protocol specification, not just the ones this project implements — so the gaps are visible rather than silently omitted. "Decoded, not wired" means `protocol` can encode/decode the PDU, but `client`/`server` don't call it yet; support for everything else marked "Not implemented yet" will be added later. "Out of scope" means this project has decided not to implement it at all — see the note below the table.
 
 | Code | Name | Status |
 | ---- | ---- | ------ |
@@ -43,10 +43,10 @@ This lists every public function code defined by the Modbus Application Protocol
 | 0x04 | Read Input Registers | Not implemented yet |
 | 0x05 | Write Single Coil | Supported |
 | 0x06 | Write Single Register | Supported |
-| 0x07 | Read Exception Status | Not implemented yet |
-| 0x08 | Diagnostics | Not implemented yet |
-| 0x0B | Get Comm Event Counter | Not implemented yet |
-| 0x0C | Get Comm Event Log | Not implemented yet |
+| 0x07 | Read Exception Status | Out of scope |
+| 0x08 | Diagnostics | Out of scope |
+| 0x0B | Get Comm Event Counter | Out of scope |
+| 0x0C | Get Comm Event Log | Out of scope |
 | 0x0F | Write Multiple Coils | Supported |
 | 0x10 | Write Multiple Registers | Supported |
 | 0x11 | Report Server ID | Not implemented yet |
@@ -56,6 +56,8 @@ This lists every public function code defined by the Modbus Application Protocol
 | 0x17 | Read/Write Multiple Registers | Not implemented yet |
 | 0x18 | Read FIFO Queue | Not implemented yet |
 | 0x2B / MEI 0x0E | Encapsulated Interface Transport — Read Device Identification | Supported (Extended access only — see [Device description discovery](#device-description-discovery-fc-43)) |
+
+**0x07, 0x08, 0x0B, 0x0C are deliberately out of scope.** All four are marked "(Serial Line only)" in the spec itself and exist to diagnose the physical RS-485/RTU link (CRC error counts, character overrun counts, a Listen Only Mode to silence a malfunctioning node on a multidrop bus, a rolling event log of send/receive activity). None of them read or write register/coil data, they have no equivalent over TCP, and implementing them would mean tracking link-level counters/state that serve no purpose for this project while adding attack surface to `server`. Not planned to be revisited.
 
 ## Client vs. server
 
