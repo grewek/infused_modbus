@@ -117,6 +117,10 @@ pub struct InfusedFilesystem {
     client_trust: Option<Arc<Mutex<ClientTrustState>>>,
     client_trust_ino: INodeNo,
     client_trust_approved_ino: INodeNo,
+    connection_attempts_ino: INodeNo,
+    approved_log_ino: INodeNo,
+    pending_log_ino: INodeNo,
+    rejected_log_ino: INodeNo,
 }
 
 impl InfusedFilesystem {
@@ -163,11 +167,19 @@ impl InfusedFilesystem {
         let client_trust_ino =
             INodeNo(first_report_ino + registers.len() as u64 + coils.len() as u64);
         let client_trust_approved_ino = INodeNo(client_trust_ino.0 + 1);
+        // connection_attempts/'s directory + its three fixed log files sit
+        // right after approved/ — fixed like report_ino/coils_ino (always
+        // exactly three files), unlike approved/'s dynamic per-fingerprint
+        // entries, so no next_ino calibration needed for these.
+        let connection_attempts_ino = INodeNo(client_trust_approved_ino.0 + 1);
+        let approved_log_ino = INodeNo(connection_attempts_ino.0 + 1);
+        let pending_log_ino = INodeNo(approved_log_ino.0 + 1);
+        let rejected_log_ino = INodeNo(pending_log_ino.0 + 1);
         if let Some(client_trust) = &client_trust {
             client_trust
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .set_next_ino(client_trust_approved_ino.0 + 1);
+                .set_next_ino(rejected_log_ino.0 + 1);
         }
         Self {
             registers,
@@ -185,6 +197,10 @@ impl InfusedFilesystem {
             client_trust,
             client_trust_ino,
             client_trust_approved_ino,
+            connection_attempts_ino,
+            approved_log_ino,
+            pending_log_ino,
+            rejected_log_ino,
         }
     }
 
@@ -219,6 +235,26 @@ impl InfusedFilesystem {
         self.client_trust
             .as_ref()
             .map(|client_trust| client_trust.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    // Dispatches one of the three fixed connection_attempts/*.log inodes to
+    // its ring buffer's current content. Any other ino (including when
+    // client_trust is None) returns empty — callers are expected to have
+    // already confirmed `ino` is one of the three via their own match, same
+    // convention as every other *_content helper in this file.
+    fn connection_attempts_log_content(&self, ino: INodeNo) -> String {
+        let Some(state) = self.client_trust_lock() else {
+            return String::new();
+        };
+        if ino == self.approved_log_ino {
+            state.approved_log_content()
+        } else if ino == self.pending_log_ino {
+            state.pending_log_content()
+        } else if ino == self.rejected_log_ino {
+            state.rejected_log_content()
+        } else {
+            String::new()
+        }
     }
 
     // report/'s file inodes sit right after the fixed report/ directory
@@ -482,7 +518,35 @@ impl Filesystem for InfusedFilesystem {
                         Generation(0),
                     );
                 }
+                Some("connection_attempts") => {
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.directory_attr(self.connection_attempts_ino, req),
+                        Generation(0),
+                    );
+                }
                 _ => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
+        if parent == self.connection_attempts_ino && self.client_trust.is_some() {
+            let log_ino = match name.to_str() {
+                Some("approved.log") => Some(self.approved_log_ino),
+                Some("pending.log") => Some(self.pending_log_ino),
+                Some("rejected.log") => Some(self.rejected_log_ino),
+                _ => None,
+            };
+            match log_ino {
+                Some(ino) => {
+                    let content = self.connection_attempts_log_content(ino);
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.file_attr(ino, content.len() as u64, 0o444, req),
+                        Generation(0),
+                    );
+                }
+                None => reply.error(Errno::ENOENT),
             }
             return;
         }
@@ -614,8 +678,22 @@ impl Filesystem for InfusedFilesystem {
             || ino == self.report_ino
             || (ino == self.client_trust_ino && self.client_trust.is_some())
             || (ino == self.client_trust_approved_ino && self.client_trust.is_some())
+            || (ino == self.connection_attempts_ino && self.client_trust.is_some())
         {
             reply.attr(&ATTR_TTL, &self.directory_attr(ino, req));
+            return;
+        }
+
+        if self.client_trust.is_some()
+            && (ino == self.approved_log_ino
+                || ino == self.pending_log_ino
+                || ino == self.rejected_log_ino)
+        {
+            let content = self.connection_attempts_log_content(ino);
+            reply.attr(
+                &ATTR_TTL,
+                &self.file_attr(ino, content.len() as u64, 0o444, req),
+            );
             return;
         }
 
@@ -764,6 +842,12 @@ impl Filesystem for InfusedFilesystem {
             .and_then(|state| state.fingerprint_by_ino(ino).map(str::to_string))
         {
             format!("{fingerprint}\n")
+        } else if self.client_trust.is_some()
+            && (ino == self.approved_log_ino
+                || ino == self.pending_log_ino
+                || ino == self.rejected_log_ino)
+        {
+            self.connection_attempts_log_content(ino)
         } else {
             reply.error(Errno::ENOENT);
             return;
@@ -819,6 +903,35 @@ impl Filesystem for InfusedFilesystem {
                     self.client_trust_approved_ino,
                     FileType::Directory,
                     "approved".to_string(),
+                ),
+                (
+                    self.connection_attempts_ino,
+                    FileType::Directory,
+                    "connection_attempts".to_string(),
+                ),
+            ]
+        } else if ino == self.connection_attempts_ino && self.client_trust.is_some() {
+            vec![
+                (
+                    self.connection_attempts_ino,
+                    FileType::Directory,
+                    ".".to_string(),
+                ),
+                (self.client_trust_ino, FileType::Directory, "..".to_string()),
+                (
+                    self.approved_log_ino,
+                    FileType::RegularFile,
+                    "approved.log".to_string(),
+                ),
+                (
+                    self.pending_log_ino,
+                    FileType::RegularFile,
+                    "pending.log".to_string(),
+                ),
+                (
+                    self.rejected_log_ino,
+                    FileType::RegularFile,
+                    "rejected.log".to_string(),
                 ),
             ]
         } else if ino == self.client_trust_approved_ino {
@@ -1494,5 +1607,55 @@ mod tests {
         let state = filesystem.client_trust_lock().unwrap();
         assert_eq!(state.ino_by_fingerprint("aa:bb:cc"), Some(ino));
         assert_eq!(state.fingerprint_by_ino(ino), Some("aa:bb:cc"));
+    }
+
+    #[test]
+    fn connection_attempts_log_inodes_are_all_distinct() {
+        let filesystem = test_filesystem_with_client_trust();
+        let inos = [
+            filesystem.client_trust_ino,
+            filesystem.client_trust_approved_ino,
+            filesystem.connection_attempts_ino,
+            filesystem.approved_log_ino,
+            filesystem.pending_log_ino,
+            filesystem.rejected_log_ino,
+        ];
+        let unique: HashSet<INodeNo> = inos.iter().copied().collect();
+        assert_eq!(unique.len(), inos.len());
+    }
+
+    #[test]
+    fn connection_attempts_log_content_routes_to_the_right_ring_buffer() {
+        let filesystem = test_filesystem_with_client_trust();
+        {
+            let mut state = filesystem.client_trust_lock().unwrap();
+            state.log_approved("aa:bb");
+            state.log_pending("cc:dd");
+            state.log_rejected("ee:ff");
+        }
+
+        assert_eq!(
+            filesystem.connection_attempts_log_content(filesystem.approved_log_ino),
+            "aa:bb\n"
+        );
+        assert_eq!(
+            filesystem.connection_attempts_log_content(filesystem.pending_log_ino),
+            "cc:dd\n"
+        );
+        assert_eq!(
+            filesystem.connection_attempts_log_content(filesystem.rejected_log_ino),
+            "ee:ff\n"
+        );
+    }
+
+    #[test]
+    fn connection_attempts_log_content_is_empty_without_client_trust() {
+        let (filesystem, _receiver) = test_filesystem();
+        // Any ino at all — there's no client_trust, so every one of these
+        // should behave the same (empty), not panic on an absent lock.
+        assert_eq!(
+            filesystem.connection_attempts_log_content(INodeNo(9999)),
+            ""
+        );
     }
 }

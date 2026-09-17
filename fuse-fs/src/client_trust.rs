@@ -10,7 +10,15 @@
 // so this crate stays decoupled from wire/TLS types.
 
 use fuser::INodeNo;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+// Each connection_attempts/*.log file is a fixed-size ring buffer — an
+// attacker who floods handshake attempts must not be able to grow these
+// files without bound (same "validate/bound untrusted input" instinct as
+// PDU-length checks elsewhere in this project). Oldest entry drops when a
+// new one arrives past capacity. Arbitrary but generous for a first cut;
+// not yet configurable.
+const CONNECTION_ATTEMPTS_LOG_CAPACITY: usize = 50;
 
 /// `client-trust/approved/`'s dynamic entries (one file per approved
 /// fingerprint) need runtime-assigned inodes — the approved set changes
@@ -23,6 +31,14 @@ pub struct ClientTrustState {
     approved_name_to_ino: HashMap<String, INodeNo>,
     approved_ino_to_name: HashMap<INodeNo, String>,
     next_ino: u64,
+    // connection_attempts/*.log content — see `log_approved`/`log_pending`/
+    // `log_rejected`. Three separate buffers, not one shared log with an
+    // outcome column, so `cat`ing one file never needs the reader to filter
+    // anything out themselves (matches CLAUDE.md's fixed-three-files
+    // design).
+    approved_log: VecDeque<String>,
+    pending_log: VecDeque<String>,
+    rejected_log: VecDeque<String>,
 }
 
 impl ClientTrustState {
@@ -78,6 +94,54 @@ impl ClientTrustState {
             .iter()
             .map(|(name, &ino)| (name.as_str(), ino))
     }
+
+    /// A fingerprint that was checked against the approved set and matched
+    /// — the connection was allowed to proceed.
+    pub fn log_approved(&mut self, entry: impl Into<String>) {
+        push_bounded(&mut self.approved_log, entry.into());
+    }
+
+    /// A fingerprint that presented a well-formed certificate but isn't
+    /// (yet) in the approved set — worth a technician's review, not a hard
+    /// failure like a malformed certificate. See `log_rejected` for the
+    /// distinction this project draws between the two.
+    pub fn log_pending(&mut self, entry: impl Into<String>) {
+        push_bounded(&mut self.pending_log, entry.into());
+    }
+
+    /// A connection attempt that failed for a reason that isn't "not yet
+    /// approved" — e.g. a certificate that couldn't even be parsed. Kept
+    /// separate from `log_pending` so a technician reviewing pending
+    /// requests never has to filter out attempts there's nothing to
+    /// approve about.
+    pub fn log_rejected(&mut self, entry: impl Into<String>) {
+        push_bounded(&mut self.rejected_log, entry.into());
+    }
+
+    pub fn approved_log_content(&self) -> String {
+        join_log(&self.approved_log)
+    }
+
+    pub fn pending_log_content(&self) -> String {
+        join_log(&self.pending_log)
+    }
+
+    pub fn rejected_log_content(&self) -> String {
+        join_log(&self.rejected_log)
+    }
+}
+
+fn push_bounded(log: &mut VecDeque<String>, entry: String) {
+    if log.len() >= CONNECTION_ATTEMPTS_LOG_CAPACITY {
+        log.pop_front();
+    }
+    log.push_back(entry);
+}
+
+fn join_log(log: &VecDeque<String>) -> String {
+    log.iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>()
 }
 
 #[cfg(test)]
@@ -134,5 +198,47 @@ mod tests {
         let mut names: Vec<&str> = state.approved_entries().map(|(name, _ino)| name).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["aa:bb", "cc:dd"]);
+    }
+
+    #[test]
+    fn logs_start_empty() {
+        let state = ClientTrustState::new();
+        assert_eq!(state.approved_log_content(), "");
+        assert_eq!(state.pending_log_content(), "");
+        assert_eq!(state.rejected_log_content(), "");
+    }
+
+    #[test]
+    fn each_log_is_independent_of_the_others() {
+        let mut state = ClientTrustState::new();
+        state.log_approved("aa:bb");
+        state.log_pending("cc:dd");
+        state.log_rejected("ee:ff");
+
+        assert_eq!(state.approved_log_content(), "aa:bb\n");
+        assert_eq!(state.pending_log_content(), "cc:dd\n");
+        assert_eq!(state.rejected_log_content(), "ee:ff\n");
+    }
+
+    #[test]
+    fn log_entries_appear_in_the_order_they_were_logged() {
+        let mut state = ClientTrustState::new();
+        state.log_approved("first");
+        state.log_approved("second");
+
+        assert_eq!(state.approved_log_content(), "first\nsecond\n");
+    }
+
+    #[test]
+    fn log_drops_the_oldest_entry_once_over_capacity() {
+        let mut state = ClientTrustState::new();
+        for index in 0..(CONNECTION_ATTEMPTS_LOG_CAPACITY + 1) {
+            state.log_approved(format!("entry-{index}"));
+        }
+
+        let content = state.approved_log_content();
+        assert!(!content.contains("entry-0\n"));
+        assert!(content.contains(&format!("entry-{CONNECTION_ATTEMPTS_LOG_CAPACITY}\n")));
+        assert_eq!(content.lines().count(), CONNECTION_ATTEMPTS_LOG_CAPACITY);
     }
 }

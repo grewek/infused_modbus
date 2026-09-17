@@ -68,6 +68,7 @@ fn start_serving(
     coil_store: Arc<Mutex<CoilStore>>,
     mem_layout: MemLayout,
     toml_source: Arc<String>,
+    client_trust: Arc<Mutex<fuse_fs::client_trust::ClientTrustState>>,
 ) {
     let target =
         parse_connection_string(connection_string).unwrap_or_else(|error| panic!("{error}"));
@@ -128,8 +129,12 @@ fn start_serving(
             // not just unapproved ones: nothing can ever become approved.
             let approved_clients =
                 Arc::new(Mutex::new(server::client_trust::ApprovedClients::new()));
-            let server_config = server::tls::build_server_config(&identity, approved_clients)
-                .unwrap_or_else(|error| panic!("failed to build TLS server config: {error}"));
+            let server_config = server::tls::build_server_config(
+                &identity,
+                approved_clients,
+                Arc::clone(&client_trust),
+            )
+            .unwrap_or_else(|error| panic!("failed to build TLS server config: {error}"));
             let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
             let listener = runtime
@@ -240,6 +245,13 @@ fn main() {
         );
     });
 
+    // Shared between the TLS handshake path (which logs connection
+    // attempts and, later, checks approvals) and the FUSE `client-trust/`
+    // subtree (which displays that same state) — one `ClientTrustState`,
+    // not two independently-populated copies. See O2's "known gap" note:
+    // this is what closes it.
+    let client_trust = Arc::new(Mutex::new(fuse_fs::client_trust::ClientTrustState::new()));
+
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");
     start_serving(
         &runtime,
@@ -250,6 +262,7 @@ fn main() {
         Arc::clone(&coil_store),
         mem_layout,
         Arc::new(toml_source.clone()),
+        Arc::clone(&client_trust),
     );
 
     std::fs::create_dir_all(&mountpoint).ok();
@@ -262,9 +275,7 @@ fn main() {
         coil_store,
         transaction_sender,
         report,
-        Some(Arc::new(Mutex::new(
-            fuse_fs::client_trust::ClientTrustState::new(),
-        ))),
+        Some(client_trust),
     );
     let session = fuser::spawn_mount(filesystem, &mountpoint, &fuser::Config::default())
         .unwrap_or_else(|error| panic!("mount failed: {error}"));
