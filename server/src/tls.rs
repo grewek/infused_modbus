@@ -58,71 +58,6 @@ impl SignatureVerification {
     }
 }
 
-/// Accepts *any* client certificate without checking whether it should be
-/// trusted — still verifies the handshake signature is cryptographically
-/// valid (the peer really holds the private key it presented), just not
-/// whether that identity is one this server should allow to connect.
-///
-/// **Temporary placeholder for milestone M2.** Its entire purpose is to
-/// prove a two-sided (mutual) TLS handshake completes before any real
-/// client-approval policy exists — see `ApprovedFingerprintClientCertVerifier`
-/// for the real one (N2a). Must never be reachable in a real deployment.
-#[derive(Debug)]
-struct InsecureAcceptAnyClientCert {
-    signature_verification: SignatureVerification,
-}
-
-impl InsecureAcceptAnyClientCert {
-    fn new() -> Self {
-        Self {
-            signature_verification: SignatureVerification::new(),
-        }
-    }
-}
-
-impl ClientCertVerifier for InsecureAcceptAnyClientCert {
-    // Empty: this server has no CA/trust-anchor concept at all (matches the
-    // project's fingerprint-only design), so there is nothing meaningful to
-    // hint to a connecting client about which authorities it should pick a
-    // certificate from.
-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &[]
-    }
-
-    fn verify_client_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _now: UnixTime,
-    ) -> Result<ClientCertVerified, TlsError> {
-        Ok(ClientCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TlsError> {
-        self.signature_verification
-            .verify_tls12_signature(message, cert, dss)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TlsError> {
-        self.signature_verification
-            .verify_tls13_signature(message, cert, dss)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.signature_verification.supported_verify_schemes()
-    }
-}
-
 /// Verifies a presented client certificate by comparing its public-key
 /// fingerprint against `approved`, the server's live client-approval roster
 /// (Milestone N's `client-trust`/`approved/` design) — this project's only
@@ -131,19 +66,13 @@ impl ClientCertVerifier for InsecureAcceptAnyClientCert {
 /// public key ever consulted. Fail-closed: an empty `approved` set (the
 /// default at startup, before Milestone P's admin channel adds anything)
 /// rejects every client.
-///
-/// Not wired into `build_server_config` yet — that's N2b, deliberately a
-/// separate step so this verifier's own logic could be reviewed/tested in
-/// isolation first.
 #[derive(Debug)]
-#[allow(dead_code)]
 struct ApprovedFingerprintClientCertVerifier {
     approved: Arc<Mutex<ApprovedClients>>,
     signature_verification: SignatureVerification,
 }
 
 impl ApprovedFingerprintClientCertVerifier {
-    #[allow(dead_code)]
     fn new(approved: Arc<Mutex<ApprovedClients>>) -> Self {
         Self {
             approved,
@@ -153,8 +82,10 @@ impl ApprovedFingerprintClientCertVerifier {
 }
 
 impl ClientCertVerifier for ApprovedFingerprintClientCertVerifier {
-    // Empty for the same reason as `InsecureAcceptAnyClientCert` — no
-    // CA/trust-anchor concept, nothing meaningful to hint.
+    // Empty: this server has no CA/trust-anchor concept at all (matches the
+    // project's fingerprint-only design), so there is nothing meaningful to
+    // hint to a connecting client about which authorities it should pick a
+    // certificate from.
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
         &[]
     }
@@ -209,14 +140,21 @@ impl ClientCertVerifier for ApprovedFingerprintClientCertVerifier {
 }
 
 /// Builds a `rustls::ServerConfig` presenting `identity`. **Requires** a
-/// client certificate now (mTLS on), but does not yet police *which* one —
-/// see `InsecureAcceptAnyClientCert`. Real client approval is Milestone N.
-pub fn build_server_config(identity: &Identity) -> Result<ServerConfig, String> {
+/// client certificate (mTLS on) and checks it against `approved` — see
+/// `ApprovedFingerprintClientCertVerifier`. Fail-closed: an empty
+/// `approved` set (the default until Milestone P's admin channel adds
+/// something) rejects every client.
+pub fn build_server_config(
+    identity: &Identity,
+    approved: Arc<Mutex<ApprovedClients>>,
+) -> Result<ServerConfig, String> {
     let certificate = CertificateDer::from(identity.certificate_der.clone());
     let private_key = PrivateKeyDer::try_from(identity.private_key_der.clone())
         .map_err(|error| error.to_string())?;
     ServerConfig::builder()
-        .with_client_cert_verifier(Arc::new(InsecureAcceptAnyClientCert::new()))
+        .with_client_cert_verifier(Arc::new(ApprovedFingerprintClientCertVerifier::new(
+            approved,
+        )))
         .with_single_cert(vec![certificate], private_key)
         .map_err(|error| error.to_string())
 }
@@ -294,7 +232,8 @@ mod tests {
     #[test]
     fn builds_a_server_config_from_a_generated_identity() {
         let identity = protocol::tls::generate_self_signed_identity().unwrap();
-        assert!(build_server_config(&identity).is_ok());
+        let approved = Arc::new(Mutex::new(ApprovedClients::new()));
+        assert!(build_server_config(&identity, approved).is_ok());
     }
 
     // `ApprovedFingerprintClientCertVerifier` tests below exercise
@@ -351,7 +290,14 @@ mod tests {
     #[tokio::test]
     async fn tls_connection_is_served_like_any_other_stream() {
         let identity = protocol::tls::generate_self_signed_identity().unwrap();
-        let server_config = build_server_config(&identity).unwrap();
+        // The server now checks the presented client fingerprint against an
+        // approved set (N2b) — generate the test client's identity first so
+        // it can be approved before the server config is even built.
+        let client_identity = protocol::tls::generate_self_signed_identity().unwrap();
+        let mut approved_clients = ApprovedClients::new();
+        approved_clients.insert(Fingerprint::of(&client_identity.public_key_der));
+        let approved = Arc::new(Mutex::new(approved_clients));
+        let server_config = build_server_config(&identity, approved).unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -387,11 +333,9 @@ mod tests {
             .await;
         });
 
-        // The server now requires a client certificate (M2) — any identity
-        // works, since `InsecureAcceptAnyClientCert` doesn't police which
-        // one, but *some* certificate has to be presented or the handshake
-        // fails outright.
-        let client_identity = protocol::tls::generate_self_signed_identity().unwrap();
+        // Present the identity that was approved above — an unapproved one
+        // would now be rejected (N2b), unlike back when M2 first wrote this
+        // test and any identity worked.
         let client_certificate = CertificateDer::from(client_identity.certificate_der);
         let client_private_key = PrivateKeyDer::try_from(client_identity.private_key_der).unwrap();
         let client_config = ClientConfig::builder()
@@ -434,7 +378,10 @@ mod tests {
     #[tokio::test]
     async fn rejects_a_connection_without_any_client_certificate() {
         let identity = protocol::tls::generate_self_signed_identity().unwrap();
-        let server_config = build_server_config(&identity).unwrap();
+        // Empty on purpose — this test is about presenting *no* certificate
+        // at all, which fails regardless of what's approved.
+        let approved = Arc::new(Mutex::new(ApprovedClients::new()));
+        let server_config = build_server_config(&identity, approved).unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -472,6 +419,58 @@ mod tests {
                 assert!(
                     write_result.is_err() || read_result.is_err(),
                     "expected the connection to fail somewhere without a client certificate"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_a_connection_with_an_unapproved_client_certificate() {
+        let identity = protocol::tls::generate_self_signed_identity().unwrap();
+        // Non-empty, but doesn't contain the fingerprint the client below
+        // will present — proves the real wiring (N2b), not just N2a's
+        // already-tested isolated decision logic.
+        let mut approved_clients = ApprovedClients::new();
+        approved_clients.insert(Fingerprint::of(
+            &protocol::tls::generate_self_signed_identity()
+                .unwrap()
+                .public_key_der,
+        ));
+        let approved = Arc::new(Mutex::new(approved_clients));
+        let server_config = build_server_config(&identity, approved).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+
+        tokio::spawn(async move {
+            let (tcp_stream, _peer) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(tcp_stream).await;
+        });
+
+        let client_identity = protocol::tls::generate_self_signed_identity().unwrap();
+        let client_certificate = CertificateDer::from(client_identity.certificate_der);
+        let client_private_key = PrivateKeyDer::try_from(client_identity.private_key_der).unwrap();
+        let client_config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureAcceptAnyServerCert::new()))
+            .with_client_auth_cert(vec![client_certificate], client_private_key)
+            .unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let tcp_stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+        let connect_result = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp_stream)
+            .await;
+
+        // Same TLS 1.3 timing caveat as the no-certificate-at-all test above.
+        match connect_result {
+            Err(_) => {}
+            Ok(mut stream) => {
+                let write_result = stream.write_all(b"anything").await;
+                let read_result = stream.read_u8().await;
+                assert!(
+                    write_result.is_err() || read_result.is_err(),
+                    "expected the connection to fail somewhere with an unapproved client certificate"
                 );
             }
         }

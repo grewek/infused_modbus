@@ -16,13 +16,13 @@
 //   rtu://<serial-path>:<baud-rate>    e.g. rtu:///dev/ttyUSB0:9600
 //   tls+tcp://<bind-address:port>      e.g. tls+tcp://0.0.0.0:502
 //
-// tls+tcp:// is not yet secure to use over an untrusted network: this
-// server accepts any client's certificate unconditionally, and requires no
-// client certificate at all (mutual TLS is a later milestone) — see
-// server::tls::build_server_config. It proves the transport works, nothing
-// more, for now. The server's own TLS identity is generated on first run
-// and persisted under TLS_IDENTITY_DIRECTORY below (a fixed default, not
-// yet CLI-configurable).
+// tls+tcp:// requires a client certificate and checks its fingerprint
+// against an approved set (see server::tls::build_server_config /
+// server::client_trust::ApprovedClients) — but that set is currently always
+// empty and has no way to be populated yet (the admin approval channel is
+// Milestone P), so **every** client is rejected until that exists. The
+// server's own TLS identity is generated on first run and persisted under
+// TLS_IDENTITY_DIRECTORY below (a fixed default, not yet CLI-configurable).
 //
 // Every register DataType can be read and written over the wire now (see
 // handler.rs) — Write Single Register only ever carries one register
@@ -122,7 +122,13 @@ fn start_serving(
             // files by hand.
             let fingerprint = protocol::tls::Fingerprint::of(&identity.public_key_der);
             println!("Server TLS fingerprint: {fingerprint}");
-            let server_config = server::tls::build_server_config(&identity)
+            // Empty and, for now, permanently so — there is no admin
+            // channel yet to approve anything (that's Milestone P). Until
+            // it exists, tls+tcp:// is fail-closed against every client,
+            // not just unapproved ones: nothing can ever become approved.
+            let approved_clients =
+                Arc::new(Mutex::new(server::client_trust::ApprovedClients::new()));
+            let server_config = server::tls::build_server_config(&identity, approved_clients)
                 .unwrap_or_else(|error| panic!("failed to build TLS server config: {error}"));
             let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
