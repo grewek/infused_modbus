@@ -115,6 +115,13 @@ fn start_serving(
                     .unwrap_or_else(|error| {
                         panic!("failed to load/generate TLS identity: {error}")
                     });
+            // Printed so a technician commissioning this server can read it
+            // off the console and hand it to whoever configures a client's
+            // --expect-server-fingerprint — otherwise there is no way to
+            // learn this value short of inspecting the persisted identity
+            // files by hand.
+            let fingerprint = protocol::tls::Fingerprint::of(&identity.public_key_der);
+            println!("Server TLS fingerprint: {fingerprint}");
             let server_config = server::tls::build_server_config(&identity)
                 .unwrap_or_else(|error| panic!("failed to build TLS server config: {error}"));
             let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));

@@ -1,1 +1,5 @@
 /target
+
+# Generated TLS identities (self-signed cert + private key) — never commit
+# generated key material, even throwaway/test-generated.
+/server-tls-identity/
