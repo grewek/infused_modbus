@@ -1,3 +1,4 @@
+use crate::client_trust::ClientTrustState;
 use crate::{
     CoilStore, CoilValue, PendingTransaction, RegisterStore, RegisterValue, StagedValue,
     WriteReport,
@@ -111,6 +112,12 @@ pub struct InfusedFilesystem {
     transaction_sender: mpsc::Sender<HashMap<String, StagedValue>>,
     report_ino: INodeNo,
     report: Arc<Mutex<WriteReport>>,
+    // Only `Some` on the server — see `ClientTrustState`'s own doc comment
+    // for why this is the one asymmetric piece of state in this struct.
+    // Not read anywhere yet (Milestone O1 is pure plumbing) — O2 adds the
+    // `client-trust/approved/` directory that actually consults it.
+    #[allow(dead_code)]
+    client_trust: Option<Arc<Mutex<ClientTrustState>>>,
 }
 
 impl InfusedFilesystem {
@@ -121,6 +128,7 @@ impl InfusedFilesystem {
         coil_store: Arc<Mutex<CoilStore>>,
         transaction_sender: mpsc::Sender<HashMap<String, StagedValue>>,
         report: Arc<Mutex<WriteReport>>,
+        client_trust: Option<Arc<Mutex<ClientTrustState>>>,
     ) -> Self {
         let name_to_ino = registers
             .iter()
@@ -161,6 +169,7 @@ impl InfusedFilesystem {
             transaction_sender,
             report_ino,
             report,
+            client_trust,
         }
     }
 
@@ -945,7 +954,7 @@ mod tests {
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, receiver) = mpsc::channel();
         (
-            InfusedFilesystem::new(registers, coils, store, coil_store, sender, report),
+            InfusedFilesystem::new(registers, coils, store, coil_store, sender, report, None),
             receiver,
         )
     }

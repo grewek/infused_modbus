@@ -256,6 +256,9 @@ fn main() {
         coil_store,
         transaction_sender,
         report,
+        // client-trust/ only exists on the server — see CLAUDE.md's TLS
+        // design and fuse_fs::client_trust::ClientTrustState.
+        None,
     );
     // spawn_mount (not the blocking mount()) so Ctrl+C/SIGTERM below can
     // unmount cleanly instead of just killing the process and leaving a

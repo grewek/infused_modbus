@@ -262,6 +262,9 @@ fn main() {
         coil_store,
         transaction_sender,
         report,
+        Some(Arc::new(Mutex::new(
+            fuse_fs::client_trust::ClientTrustState::new(),
+        ))),
     );
     let session = fuser::spawn_mount(filesystem, &mountpoint, &fuser::Config::default())
         .unwrap_or_else(|error| panic!("mount failed: {error}"));

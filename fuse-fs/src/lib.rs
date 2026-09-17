@@ -1,3 +1,4 @@
+pub mod client_trust;
 pub mod filesystem;
 pub mod register_encoding;
 
