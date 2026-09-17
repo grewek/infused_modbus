@@ -5,13 +5,58 @@
 // wrapping an accepted TCP connection with a `tokio_rustls::TlsAcceptor`
 // built from this config) works with it as-is. No new serve-loop needed.
 
-use protocol::tls::Identity;
+use crate::client_trust::ApprovedClients;
+use protocol::tls::{Fingerprint, Identity};
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// The `ClientCertVerifier` methods concerned with checking that a
+/// handshake signature is cryptographically valid — i.e. that the peer
+/// really holds the private key for the certificate it presented — as
+/// opposed to *whether that certificate should be trusted*, which is a
+/// separate decision each verifier below makes its own way. Mirrors
+/// `client::connection::SignatureVerification` (same shape, can't share the
+/// type across crates since each side's `ClientCertVerifier`/
+/// `ServerCertVerifier` trait methods differ).
+#[derive(Debug)]
+struct SignatureVerification {
+    supported_algorithms: WebPkiSupportedAlgorithms,
+}
+
+impl SignatureVerification {
+    fn new() -> Self {
+        Self {
+            supported_algorithms: rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_algorithms.supported_schemes()
+    }
+}
 
 /// Accepts *any* client certificate without checking whether it should be
 /// trusted — still verifies the handshake signature is cryptographically
@@ -20,19 +65,17 @@ use std::sync::Arc;
 ///
 /// **Temporary placeholder for milestone M2.** Its entire purpose is to
 /// prove a two-sided (mutual) TLS handshake completes before any real
-/// client-approval policy exists — see CLAUDE.md's `client-trust`/
-/// `approved/` design (Milestone N) for the real one. Must never be
-/// reachable in a real deployment once N exists.
+/// client-approval policy exists — see `ApprovedFingerprintClientCertVerifier`
+/// for the real one (N2a). Must never be reachable in a real deployment.
 #[derive(Debug)]
 struct InsecureAcceptAnyClientCert {
-    supported_algorithms: WebPkiSupportedAlgorithms,
+    signature_verification: SignatureVerification,
 }
 
 impl InsecureAcceptAnyClientCert {
     fn new() -> Self {
         Self {
-            supported_algorithms: rustls::crypto::ring::default_provider()
-                .signature_verification_algorithms,
+            signature_verification: SignatureVerification::new(),
         }
     }
 }
@@ -61,7 +104,8 @@ impl ClientCertVerifier for InsecureAcceptAnyClientCert {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_algorithms)
+        self.signature_verification
+            .verify_tls12_signature(message, cert, dss)
     }
 
     fn verify_tls13_signature(
@@ -70,11 +114,97 @@ impl ClientCertVerifier for InsecureAcceptAnyClientCert {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_algorithms)
+        self.signature_verification
+            .verify_tls13_signature(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.supported_algorithms.supported_schemes()
+        self.signature_verification.supported_verify_schemes()
+    }
+}
+
+/// Verifies a presented client certificate by comparing its public-key
+/// fingerprint against `approved`, the server's live client-approval roster
+/// (Milestone N's `client-trust`/`approved/` design) — this project's only
+/// real client-authentication decision, matching `PinnedFingerprintServerCertVerifier`
+/// on the client side: no CA, no certificate fields other than the raw
+/// public key ever consulted. Fail-closed: an empty `approved` set (the
+/// default at startup, before Milestone P's admin channel adds anything)
+/// rejects every client.
+///
+/// Not wired into `build_server_config` yet — that's N2b, deliberately a
+/// separate step so this verifier's own logic could be reviewed/tested in
+/// isolation first.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct ApprovedFingerprintClientCertVerifier {
+    approved: Arc<Mutex<ApprovedClients>>,
+    signature_verification: SignatureVerification,
+}
+
+impl ApprovedFingerprintClientCertVerifier {
+    #[allow(dead_code)]
+    fn new(approved: Arc<Mutex<ApprovedClients>>) -> Self {
+        Self {
+            approved,
+            signature_verification: SignatureVerification::new(),
+        }
+    }
+}
+
+impl ClientCertVerifier for ApprovedFingerprintClientCertVerifier {
+    // Empty for the same reason as `InsecureAcceptAnyClientCert` — no
+    // CA/trust-anchor concept, nothing meaningful to hint.
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, TlsError> {
+        let parsed = webpki::EndEntityCert::try_from(end_entity).map_err(|_error| {
+            TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding)
+        })?;
+        let presented_fingerprint = Fingerprint::of(parsed.subject_public_key_info().as_ref());
+        let is_approved = self
+            .approved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&presented_fingerprint);
+        if is_approved {
+            Ok(ClientCertVerified::assertion())
+        } else {
+            Err(TlsError::General(format!(
+                "client TLS fingerprint {presented_fingerprint} is not approved"
+            )))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.signature_verification
+            .verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.signature_verification
+            .verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.signature_verification.supported_verify_schemes()
     }
 }
 
@@ -165,6 +295,57 @@ mod tests {
     fn builds_a_server_config_from_a_generated_identity() {
         let identity = protocol::tls::generate_self_signed_identity().unwrap();
         assert!(build_server_config(&identity).is_ok());
+    }
+
+    // `ApprovedFingerprintClientCertVerifier` tests below exercise
+    // `verify_client_cert` directly against a real certificate — no TLS
+    // handshake needed to test the decision logic itself, only real DER
+    // bytes for `webpki::EndEntityCert::try_from` to parse.
+
+    #[test]
+    fn approved_fingerprint_client_cert_verifier_accepts_an_approved_fingerprint() {
+        let identity = protocol::tls::generate_self_signed_identity().unwrap();
+        let fingerprint = Fingerprint::of(&identity.public_key_der);
+        let mut approved_clients = ApprovedClients::new();
+        approved_clients.insert(fingerprint);
+        let verifier =
+            ApprovedFingerprintClientCertVerifier::new(Arc::new(Mutex::new(approved_clients)));
+
+        let end_entity = CertificateDer::from(identity.certificate_der);
+        let result = verifier.verify_client_cert(&end_entity, &[], UnixTime::now());
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn approved_fingerprint_client_cert_verifier_rejects_an_unapproved_fingerprint() {
+        let identity = protocol::tls::generate_self_signed_identity().unwrap();
+        // Empty — nothing approved, matching the fail-closed default before
+        // Milestone P's admin channel ever inserts anything.
+        let verifier = ApprovedFingerprintClientCertVerifier::new(Arc::new(Mutex::new(
+            ApprovedClients::new(),
+        )));
+
+        let end_entity = CertificateDer::from(identity.certificate_der);
+        let result = verifier.verify_client_cert(&end_entity, &[], UnixTime::now());
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn approved_fingerprint_client_cert_verifier_rejects_one_identity_when_a_different_one_is_approved()
+     {
+        let approved_identity = protocol::tls::generate_self_signed_identity().unwrap();
+        let other_identity = protocol::tls::generate_self_signed_identity().unwrap();
+        let mut approved_clients = ApprovedClients::new();
+        approved_clients.insert(Fingerprint::of(&approved_identity.public_key_der));
+        let verifier =
+            ApprovedFingerprintClientCertVerifier::new(Arc::new(Mutex::new(approved_clients)));
+
+        let end_entity = CertificateDer::from(other_identity.certificate_der);
+        let result = verifier.verify_client_cert(&end_entity, &[], UnixTime::now());
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]

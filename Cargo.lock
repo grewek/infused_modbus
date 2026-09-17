@@ -779,6 +779,7 @@ dependencies = [
  "fuser",
  "protocol",
  "rustls",
+ "rustls-webpki",
  "tokio",
  "tokio-rustls",
  "tokio-serial",
