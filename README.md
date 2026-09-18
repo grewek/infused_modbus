@@ -2,7 +2,7 @@
 
 A Modbus **client** (master) and Modbus **server** (slave) that expose the Modbus data they handle through a **FUSE filesystem** instead of — or in addition to — a conventional API. "Infused" refers to this live-updating FUSE projection of Modbus data: register values show up as readable files, and writes happen by writing to files, no client library required.
 
-Both **Modbus TCP** and **Modbus RTU** (serial) are supported, symmetrically, for both the client and the server. A TLS-secured TCP transport (`tls+tcp://`) also exists but is still under active development — see [Supported connection types](#supported-connection-types) and [Connecting over TLS](#connecting-over-tls-work-in-progress) below before relying on it for anything.
+Both **Modbus TCP** and **Modbus RTU** (serial) are supported, symmetrically, for both the client and the server. A TLS-secured TCP transport (`tls+tcp://`) is also supported, with mutual TLS, a client-approval workflow, and DoS-hardening limits — see [Supported connection types](#supported-connection-types) and [Connecting over TLS](#connecting-over-tls) below for the full picture, including what's still fixed rather than configurable.
 
 ## ⚠️ This project was built entirely with AI assistance
 
@@ -10,7 +10,7 @@ This codebase was designed and implemented in collaboration with **Claude Code**
 
 ## ⚠️ Early-stage software — do not treat this as secure
 
-This project is under active development and has **not** had a security review. Neither `client` nor `server` should be considered hardened, and `server` in particular accepts Modbus connections from any master that can reach it, with no authentication (outside of `tls+tcp://`'s still-incomplete client approval, see below). Some individual inputs read from the wire are checked before use (see below), but that describes isolated pieces of the implementation, not an overall security guarantee. Do not expose either binary to an untrusted network, and do not use this project anywhere a security failure would have real consequences.
+This project is under active development and has **not** had a security review. Neither `client` nor `server` should be considered hardened, and `server` in particular accepts Modbus connections from any master that can reach it, with no authentication outside of `tls+tcp://` (see [Connecting over TLS](#connecting-over-tls) below) — plain `tcp://`/`rtu://` have none at all. Some individual inputs read from the wire are checked before use (see below), but that describes isolated pieces of the implementation, not an overall security guarantee. Do not expose either binary to an untrusted network, and do not use this project anywhere a security failure would have real consequences.
 
 ## How this project came to be
 
@@ -30,13 +30,13 @@ Nothing here shipped without a human decision behind it, but essentially all of 
 - **Modbus implemented from scratch.** The `protocol` crate implements Modbus TCP/RTU framing, CRC16, and PDU encode/decode directly, rather than wrapping an existing crate like `tokio-modbus`. Some individual inputs read from the wire (declared lengths/counts) are checked against the actual remaining buffer before being used for allocation or indexing — this reduces a few specific classes of bugs, but is not a substitute for a real security review, which this project has not had (see the warning above).
 - **Polling batches register reads.** The client keeps its local mirror fresh by polling, grouping contiguous register addresses into a single `Read Holding Registers` request (up to Modbus's 125-register limit) instead of one request per register. Standard Modbus has no mechanism for a device to push updates on its own — polling is the only option the protocol allows.
 - **Every register data type is read and written over the wire**, including ones spanning more than one 16-bit Modbus register (`u32`, `f64`, ...) — see [Device description TOML format](#device-description-toml-format) for the full type list and how `mem-layout` controls their byte order.
-- **Client TLS certificates require server-side approval.** Over `tls+tcp://`, the server requires every connecting client to present a certificate, and only ones an operator has explicitly approved are allowed through — via a local admin channel kept separate from the FUSE mount itself, not through the filesystem. See [Connecting over TLS](#connecting-over-tls-work-in-progress).
+- **Client TLS certificates require server-side approval.** Over `tls+tcp://`, the server requires every connecting client to present a certificate, and only ones an operator has explicitly approved are allowed through — via a local admin channel kept separate from the FUSE mount itself, not through the filesystem. Approvals are persisted to disk, bounded by an optional `--max-clients` limit, and revoking one immediately disconnects it if it's already connected, not just future attempts. See [Connecting over TLS](#connecting-over-tls).
 - **FUSE directory permissions are configurable.** An optional `fuse-permissions.toml` sets `mode`/`uid`/`gid` per top-level directory, enforced by the kernel rather than just displayed — see [FUSE directory permissions](#fuse-directory-permissions).
 
 ## Client vs. server
 
 - **`client`** acts as a Modbus master against a connected device. It polls the device to keep `holding-registers/` fresh, and turns `transactions/` commits into Modbus writes, updating the local mirror only once the device confirms them.
-- **`server`** acts as a Modbus slave that external Modbus masters query and write against. Its own in-memory register store is the state being served: an external write applies immediately and is reflected into `holding-registers/`, and a locally staged `transactions/` commit is visible to external masters on their next read. `server`'s mount also has a `client-trust/` directory that `client`'s never has — see [Connecting over TLS](#connecting-over-tls-work-in-progress).
+- **`server`** acts as a Modbus slave that external Modbus masters query and write against. Its own in-memory register store is the state being served: an external write applies immediately and is reflected into `holding-registers/`, and a locally staged `transactions/` commit is visible to external masters on their next read. `server`'s mount also has a `client-trust/` directory that `client`'s never has — see [Connecting over TLS](#connecting-over-tls).
 
 This has been tested against this project's own client/server implementations and against virtual serial ports, not against third-party PLC or SCADA hardware or software — whether it interoperates with a specific real-world device or system has not been verified.
 
@@ -48,7 +48,7 @@ This has been tested against this project's own client/server implementations an
 | ------ | --------- | ------ |
 | `tcp://<address:port>` | Plain Modbus TCP | Supported |
 | `rtu://<serial-path>:<baud-rate>` | Modbus RTU over a serial link | Supported (secondary — TCP gets the primary design/testing attention; see `CLAUDE.md`) |
-| `tls+tcp://<address:port>` | Modbus TCP over TLS (self-signed identities, fingerprint pinning, mutual TLS) | **Under active development.** A server operator can approve specific client certificates via a local admin channel, and an approved client connects normally — see [Connecting over TLS](#connecting-over-tls-work-in-progress) for what does and doesn't work yet (approvals aren't persisted across restarts, there's no cap on how many clients can be approved, and revoking a client doesn't disconnect it if it's already connected). |
+| `tls+tcp://<address:port>` | Modbus TCP over TLS (self-signed identities, fingerprint pinning, mutual TLS) | Supported. Client certificate approvals persist across restarts, are bounded by an optional `--max-clients` limit, and revoking one disconnects it immediately — see [Connecting over TLS](#connecting-over-tls) for the full workflow and the DoS-hardening limits (handshake timeout, connection caps) that come with it. A few paths (admin socket, TLS identity directories) are still fixed rather than CLI-configurable. |
 
 A given `client`/`server` instance uses exactly one of these at a time — they are never combined on the same instance.
 
@@ -93,16 +93,16 @@ Requires Linux (FUSE is a Linux-specific dependency) and a FUSE-capable kernel/u
 ### Run the server
 
 ```sh
-cargo run -p server -- <mountpoint> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>]
+cargo run -p server -- <mountpoint> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>]
 ```
 
 `<connection>` is one of:
 
 - `tcp://<bind-address:port>` — e.g. `tcp://0.0.0.0:502`
 - `rtu://<serial-path>:<baud-rate>` — e.g. `rtu:///dev/ttyUSB0:9600`
-- `tls+tcp://<bind-address:port>` — see [Connecting over TLS](#connecting-over-tls-work-in-progress) below; still under active development.
+- `tls+tcp://<bind-address:port>` — see [Connecting over TLS](#connecting-over-tls) below.
 
-`--fuse-permissions` is optional — see [FUSE directory permissions](#fuse-directory-permissions).
+`--fuse-permissions` is optional — see [FUSE directory permissions](#fuse-directory-permissions). `--max-clients` is also optional (`tls+tcp://` only) and bounds how many client certificates can be approved at once — without it, there is no limit.
 
 Example:
 
@@ -111,7 +111,7 @@ mkdir -p /tmp/modbus-server
 cargo run -p server -- /tmp/modbus-server device.toml tcp://0.0.0.0:502
 ```
 
-`server` also has a second, unrelated invocation form for managing TLS client approvals — see [Connecting over TLS](#connecting-over-tls-work-in-progress):
+`server` also has a second, unrelated invocation form for managing TLS client approvals — see [Connecting over TLS](#connecting-over-tls):
 
 ```sh
 cargo run -p server -- admin approve|revoke <fingerprint>
@@ -133,7 +133,7 @@ mkdir -p /tmp/modbus-client
 cargo run -p client -- /tmp/modbus-client device.toml tcp://127.0.0.1:502 1 1000
 ```
 
-### Connecting over TLS (work in progress)
+### Connecting over TLS
 
 `tls+tcp://` encrypts the Modbus TCP connection and authenticates both sides — but without a certificate authority: there's no CA to set up, no certificates to buy or issue. Instead, both `client` and `server` generate their own self-signed identity automatically the first time they run (persisted next to wherever the process was started: `server-tls-identity/` and `client-tls-identity/` respectively), and trust is based purely on comparing the raw public-key **fingerprint** a peer presents — the same idea as an SSH host key, not a PKI certificate chain. Read `CLAUDE.md`'s "Planned: TLS transport security & client trust" section for the full design this is built from.
 
@@ -165,11 +165,23 @@ Without `--expect-server-fingerprint`, the client accepts **any** server certifi
 cargo run -p server -- admin approve <client-fingerprint>
 ```
 
-This talks to a Unix domain socket the server always serves in the background, regardless of connection type (`server-admin.sock`, relative to wherever the server was started; mode `0600`, additionally checked against the server process's own UID via `SO_PEERCRED` — only the local user account actually running the server can approve/revoke/list). `server admin revoke <fingerprint>` and `server admin list` work the same way. The currently approved set is also visible read-only under `client-trust/approved/` in the server's mount (one file per fingerprint).
+This talks to a Unix domain socket the server always serves in the background, regardless of connection type (`server-admin.sock`, relative to wherever the server was started; mode `0600`, additionally checked against the server process's own UID via `SO_PEERCRED` — only the local user account actually running the server can approve/revoke/list). The currently approved set is also visible read-only under `client-trust/approved/` in the server's mount (one file per fingerprint).
 
 **5. Reconnect the client** with the same command as step 2 — the identical certificate now completes the mTLS handshake, and the client mounts and polls normally.
 
-**What doesn't work yet:** approvals are **not persisted** — every server restart starts with an empty approved set, and every previously-approved client has to be re-approved by hand. There is no `--max-clients` limit yet, and revoking a fingerprint currently only blocks *future* handshakes — it does not terminate an already-open connection that used it. `server-admin.sock`'s path and the TLS identity directories are also fixed, not yet configurable via a CLI flag.
+**6. Revoke a client** when it should no longer connect:
+
+```sh
+cargo run -p server -- admin revoke <client-fingerprint>
+```
+
+This disconnects any already-open connection using that fingerprint immediately, not just future handshake attempts.
+
+**Approvals persist automatically.** Every successful `approve`/`revoke` atomically rewrites `approved-clients.toml` (mode `0600`, in the directory the server was started from) — restarting the server re-reads it at startup, so a previously-approved client doesn't need to be re-approved by hand. `--max-clients <n>` (see [Run the server](#run-the-server)) bounds how many fingerprints can be approved at once; approving past that limit fails until an existing one is revoked.
+
+**DoS hardening.** The TLS handshake itself has a 10-second timeout, independent of the per-request Modbus timeout. The server also caps concurrent connections: at most 100 in total at once, and at most 5 per individual approved fingerprint, so one already-approved but compromised or buggy client can't exhaust the whole connection pool by itself. Either cap being exceeded drops the new connection outright rather than queuing it. Protection against a flood from many different source addresses is out of scope for `infused_modbus` itself — that's upstream infrastructure's job (firewall/rate-limiter), not something the application layer handles.
+
+**Still fixed, not yet configurable via a CLI flag:** the admin socket's path, the TLS identity directories, `approved-clients.toml`'s own path, and the DoS-hardening limits above. RTU's serial link also remains a separate, unauthenticated threat model that TLS does nothing to address.
 
 ### Interacting with the filesystem
 
@@ -311,7 +323,7 @@ mode = 0o444
 
 Both binaries mount with the kernel's `default_permissions` option, so these values are enforced by the kernel itself, not just displayed by `ls -l` — the usual Unix rules apply, including that a directory needs its own execute bit to be enterable at all. A directory meant to stay "read-only but still browsable" needs e.g. `0o555`, not `0o444` — `0o444` alone makes everything inside it completely unreachable, even to its own owner.
 
-`client-trust/` (server-only, see [Connecting over TLS](#connecting-over-tls-work-in-progress)) cannot be configured here at all — a `[client-trust]` section anywhere in this file is a hard parse error at startup, not a silently-ignored setting. It is always mode `0700`, owned by the server process's own real user, regardless of `fuse-permissions.toml`.
+`client-trust/` (server-only, see [Connecting over TLS](#connecting-over-tls)) cannot be configured here at all — a `[client-trust]` section anywhere in this file is a hard parse error at startup, not a silently-ignored setting. It is always mode `0700`, owned by the server process's own real user, regardless of `fuse-permissions.toml`.
 
 ## Current limitations
 
@@ -321,7 +333,7 @@ This project is under active development. As of now:
 - `u8`/`i8` registers each occupy a whole 16-bit register (in the low byte) rather than two of them being packed into one — no real device was found that packs independent named values that way, so the simpler representation was kept.
 - FC 43 (device identification) only supports "Extended" access serving custom private objects (the mechanism used for description discovery above) — the standard VendorName/ProductCode/etc. objects and Basic/Regular/Individual access aren't implemented yet.
 - RTU serial parameters beyond baud rate (data bits, parity, stop bits) aren't configurable yet; fixed defaults (8 data bits, no parity, 1 stop bit) are used.
-- `tls+tcp://` client approvals (see [Connecting over TLS](#connecting-over-tls-work-in-progress)) are **not persisted** across restarts, have no configurable cap on how many clients can be approved at once, and revoking a fingerprint does not yet disconnect an already-open connection using it. There is also no dedicated TLS-handshake timeout or connection-count limiting yet, beyond whatever the underlying TCP/TLS stack already provides. The TLS identity directories and the admin socket path are fixed, not yet configurable via a CLI flag. RTU's serial link remains a separate, unauthenticated threat model that TLS does nothing to address.
+- `tls+tcp://`'s admin socket path, TLS identity directories, `approved-clients.toml`'s own path, and DoS-hardening limits (handshake timeout, connection caps — see [Connecting over TLS](#connecting-over-tls)) are all fixed constants, not yet configurable via a CLI flag. Protection against a flood from many different source addresses is explicitly out of scope for the application layer itself. RTU's serial link remains a separate, unauthenticated threat model that TLS does nothing to address.
 
 ## Development
 
