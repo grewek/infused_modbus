@@ -99,6 +99,32 @@ impl RegisterStore {
     }
 }
 
+// Mirrors RegisterStore exactly, keyed by input-register name instead of
+// holding-register name. Reuses RegisterValue rather than a new type, since
+// input registers (FC 4) can be any of the same DataType range as holding
+// registers — the only real difference is that no Modbus function code ever
+// lets a master write one, which is a property of who's allowed to call
+// `set` (client: only its own polling loop; server: only its own local
+// write path), not of the value's shape.
+#[derive(Debug, Default)]
+pub struct InputRegisterStore {
+    values: HashMap<String, RegisterValue>,
+}
+
+impl InputRegisterStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, name: &str) -> Option<RegisterValue> {
+        self.values.get(name).copied()
+    }
+
+    pub fn set(&mut self, name: impl Into<String>, value: RegisterValue) {
+        self.values.insert(name.into(), value);
+    }
+}
+
 // A coil's value. Always exactly one bit — unlike RegisterValue there's only
 // ever one shape, since protocol::device_description::CoilDescription has no
 // data_type — but still a newtype rather than a bare `bool`, so its FUSE file
@@ -124,6 +150,30 @@ pub struct CoilStore {
 }
 
 impl CoilStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, name: &str) -> Option<CoilValue> {
+        self.values.get(name).copied()
+    }
+
+    pub fn set(&mut self, name: impl Into<String>, value: CoilValue) {
+        self.values.insert(name.into(), value);
+    }
+}
+
+// Mirrors CoilStore exactly, keyed by discrete-input name instead of coil
+// name. Reuses CoilValue rather than a new single-bit type, for the same
+// reason InputRegisterStore reuses RegisterValue above — discrete inputs
+// (FC 2) are bit-shaped identically to coils, only the write-permission
+// story around `set` differs.
+#[derive(Debug, Default)]
+pub struct DiscreteInputStore {
+    values: HashMap<String, CoilValue>,
+}
+
+impl DiscreteInputStore {
     pub fn new() -> Self {
         Self::default()
     }
@@ -356,6 +406,48 @@ mod tests {
     #[test]
     fn coil_value_false_displays_as_zero() {
         assert_eq!(CoilValue(false).to_string(), "0");
+    }
+
+    #[test]
+    fn input_register_store_get_returns_none_for_unknown_register() {
+        let store = InputRegisterStore::new();
+        assert_eq!(store.get("Flow_Rate"), None);
+    }
+
+    #[test]
+    fn input_register_store_set_then_get_returns_the_value() {
+        let mut store = InputRegisterStore::new();
+        store.set("Flow_Rate", RegisterValue::F32(3.5));
+        assert_eq!(store.get("Flow_Rate"), Some(RegisterValue::F32(3.5)));
+    }
+
+    #[test]
+    fn input_register_store_set_overwrites_previous_value() {
+        let mut store = InputRegisterStore::new();
+        store.set("Flow_Rate", RegisterValue::F32(3.5));
+        store.set("Flow_Rate", RegisterValue::F32(4.0));
+        assert_eq!(store.get("Flow_Rate"), Some(RegisterValue::F32(4.0)));
+    }
+
+    #[test]
+    fn discrete_input_store_get_returns_none_for_unknown_input() {
+        let store = DiscreteInputStore::new();
+        assert_eq!(store.get("Door_Open_Sensor"), None);
+    }
+
+    #[test]
+    fn discrete_input_store_set_then_get_returns_the_value() {
+        let mut store = DiscreteInputStore::new();
+        store.set("Door_Open_Sensor", CoilValue(true));
+        assert_eq!(store.get("Door_Open_Sensor"), Some(CoilValue(true)));
+    }
+
+    #[test]
+    fn discrete_input_store_set_overwrites_previous_value() {
+        let mut store = DiscreteInputStore::new();
+        store.set("Door_Open_Sensor", CoilValue(true));
+        store.set("Door_Open_Sensor", CoilValue(false));
+        assert_eq!(store.get("Door_Open_Sensor"), Some(CoilValue(false)));
     }
 
     #[test]
