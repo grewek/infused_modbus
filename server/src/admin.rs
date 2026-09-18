@@ -556,7 +556,11 @@ mod tests {
             &live_connections,
             &approved_clients_path,
         );
-        let (_handle, mut cancelled) = live_connections.lock().unwrap().register(fingerprint());
+        let (_handle, mut cancelled) = live_connections
+            .lock()
+            .unwrap()
+            .register(fingerprint())
+            .unwrap();
 
         let response = handle_line(
             &format!("REVOKE {}", fingerprint()),

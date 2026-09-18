@@ -25,6 +25,12 @@ pub struct ConnectionHandle {
 pub struct LiveConnections {
     by_fingerprint: HashMap<Fingerprint, HashMap<u64, oneshot::Sender<()>>>,
     next_id: u64,
+    // Milestone U3: bounds how many connections a single approved
+    // fingerprint may hold open at once, separate from U2's global cap —
+    // so an already-approved but compromised or buggy client can't exhaust
+    // the whole connection pool by itself. `None` (the `Default`/`new()`
+    // case) means unlimited, matching every pre-U3 server's behavior.
+    max_connections_per_fingerprint: Option<usize>,
 }
 
 impl LiveConnections {
@@ -32,15 +38,34 @@ impl LiveConnections {
         Self::default()
     }
 
+    pub fn with_max_connections_per_fingerprint(max_connections_per_fingerprint: usize) -> Self {
+        Self {
+            max_connections_per_fingerprint: Some(max_connections_per_fingerprint),
+            ..Self::default()
+        }
+    }
+
     /// Registers a newly-accepted, already-verified connection for
-    /// `fingerprint`. Returns a handle to pass back to `deregister` once
-    /// the connection ends on its own, and a receiver that resolves
-    /// (`Err`, since nothing is ever actually sent — dropping the sender
-    /// is the signal) once `revoke` is called for this fingerprint.
+    /// `fingerprint`, or `None` if `fingerprint` already holds
+    /// `max_connections_per_fingerprint` connections open (Milestone U3).
+    /// On success, returns a handle to pass back to `deregister` once the
+    /// connection ends on its own, and a receiver that resolves (`Err`,
+    /// since nothing is ever actually sent — dropping the sender is the
+    /// signal) once `revoke` is called for this fingerprint.
     pub fn register(
         &mut self,
         fingerprint: Fingerprint,
-    ) -> (ConnectionHandle, oneshot::Receiver<()>) {
+    ) -> Option<(ConnectionHandle, oneshot::Receiver<()>)> {
+        let current_count = self
+            .by_fingerprint
+            .get(&fingerprint)
+            .map_or(0, HashMap::len);
+        if self
+            .max_connections_per_fingerprint
+            .is_some_and(|max| current_count >= max)
+        {
+            return None;
+        }
         let id = self.next_id;
         self.next_id += 1;
         let (sender, receiver) = oneshot::channel();
@@ -48,7 +73,7 @@ impl LiveConnections {
             .entry(fingerprint)
             .or_default()
             .insert(id, sender);
-        (ConnectionHandle { fingerprint, id }, receiver)
+        Some((ConnectionHandle { fingerprint, id }, receiver))
     }
 
     /// Removes a single connection's registration once it ends on its
@@ -91,7 +116,7 @@ mod tests {
     #[test]
     fn register_returns_a_receiver_that_has_not_resolved_yet() {
         let mut live = LiveConnections::new();
-        let (_handle, mut receiver) = live.register(fingerprint(b"client-a"));
+        let (_handle, mut receiver) = live.register(fingerprint(b"client-a")).unwrap();
         assert_eq!(
             receiver.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
@@ -108,8 +133,8 @@ mod tests {
     fn revoke_resolves_every_registered_receiver_for_that_fingerprint() {
         let mut live = LiveConnections::new();
         let fp = fingerprint(b"client-a");
-        let (_handle_one, mut receiver_one) = live.register(fp);
-        let (_handle_two, mut receiver_two) = live.register(fp);
+        let (_handle_one, mut receiver_one) = live.register(fp).unwrap();
+        let (_handle_two, mut receiver_two) = live.register(fp).unwrap();
 
         assert_eq!(live.revoke(&fp), 2);
 
@@ -128,8 +153,8 @@ mod tests {
         let mut live = LiveConnections::new();
         let fp_a = fingerprint(b"client-a");
         let fp_b = fingerprint(b"client-b");
-        let (_handle_a, _receiver_a) = live.register(fp_a);
-        let (_handle_b, mut receiver_b) = live.register(fp_b);
+        let (_handle_a, _receiver_a) = live.register(fp_a).unwrap();
+        let (_handle_b, mut receiver_b) = live.register(fp_b).unwrap();
 
         live.revoke(&fp_a);
 
@@ -143,8 +168,8 @@ mod tests {
     fn deregister_removes_only_its_own_connection() {
         let mut live = LiveConnections::new();
         let fp = fingerprint(b"client-a");
-        let (handle_one, _receiver_one) = live.register(fp);
-        let (_handle_two, mut receiver_two) = live.register(fp);
+        let (handle_one, _receiver_one) = live.register(fp).unwrap();
+        let (_handle_two, mut receiver_two) = live.register(fp).unwrap();
 
         live.deregister(handle_one);
 
@@ -161,10 +186,70 @@ mod tests {
     fn deregister_of_the_only_connection_leaves_the_fingerprint_untracked() {
         let mut live = LiveConnections::new();
         let fp = fingerprint(b"client-a");
-        let (handle, _receiver) = live.register(fp);
+        let (handle, _receiver) = live.register(fp).unwrap();
 
         live.deregister(handle);
 
         assert_eq!(live.revoke(&fp), 0);
+    }
+
+    #[test]
+    fn unlimited_live_connections_accepts_many_registrations_for_one_fingerprint() {
+        let mut live = LiveConnections::new();
+        let fp = fingerprint(b"client-a");
+        for _ in 0..10 {
+            assert!(live.register(fp).is_some());
+        }
+    }
+
+    #[test]
+    fn with_max_connections_per_fingerprint_rejects_registration_once_at_the_limit() {
+        let mut live = LiveConnections::with_max_connections_per_fingerprint(2);
+        let fp = fingerprint(b"client-a");
+        assert!(live.register(fp).is_some());
+        assert!(live.register(fp).is_some());
+
+        assert!(live.register(fp).is_none());
+    }
+
+    #[test]
+    fn with_max_connections_per_fingerprint_does_not_affect_a_different_fingerprint() {
+        let mut live = LiveConnections::with_max_connections_per_fingerprint(1);
+        let fp_a = fingerprint(b"client-a");
+        let fp_b = fingerprint(b"client-b");
+        assert!(live.register(fp_a).is_some());
+
+        // fp_a is now at its limit, but fp_b has its own independent count.
+        assert!(live.register(fp_b).is_some());
+    }
+
+    #[test]
+    fn deregister_frees_a_slot_for_a_new_registration_under_the_limit() {
+        let mut live = LiveConnections::with_max_connections_per_fingerprint(1);
+        let fp = fingerprint(b"client-a");
+        let (handle, _receiver) = live.register(fp).unwrap();
+        assert!(live.register(fp).is_none());
+
+        live.deregister(handle);
+
+        assert!(live.register(fp).is_some());
+    }
+
+    #[test]
+    fn revoke_frees_every_slot_for_a_new_registration_under_the_limit() {
+        let mut live = LiveConnections::with_max_connections_per_fingerprint(1);
+        let fp = fingerprint(b"client-a");
+        live.register(fp).unwrap();
+        assert!(live.register(fp).is_none());
+
+        live.revoke(&fp);
+
+        assert!(live.register(fp).is_some());
+    }
+
+    #[test]
+    fn with_max_connections_per_fingerprint_of_zero_rejects_every_registration() {
+        let mut live = LiveConnections::with_max_connections_per_fingerprint(0);
+        assert!(live.register(fingerprint(b"client-a")).is_none());
     }
 }

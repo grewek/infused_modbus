@@ -70,6 +70,13 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 // for the same precedent. A distributed flood from many source addresses
 // is explicitly out of scope for this application layer (CLAUDE.md).
 const MAX_CONCURRENT_TLS_CONNECTIONS: usize = 100;
+// Milestone U3: bounds how many connections a single approved fingerprint
+// may hold open at once, independent of MAX_CONCURRENT_TLS_CONNECTIONS —
+// so an already-approved but compromised or buggy client can't exhaust the
+// whole connection pool by itself. A legitimate client normally holds
+// exactly one persistent connection; this leaves headroom for e.g. brief
+// reconnect overlap without allowing unbounded growth.
+const MAX_CONNECTIONS_PER_FINGERPRINT: usize = 5;
 const TLS_IDENTITY_DIRECTORY: &str = "server-tls-identity";
 const ADMIN_SOCKET_PATH: &str = "server-admin.sock";
 const APPROVED_CLIENTS_PATH: &str = "approved-clients.toml";
@@ -324,8 +331,17 @@ fn start_serving(
                             .await;
                             return;
                         };
-                        let (handle, cancelled) =
-                            live_connections.lock().unwrap().register(fingerprint);
+                        // Already at MAX_CONNECTIONS_PER_FINGERPRINT for
+                        // this fingerprint (Milestone U3) — drop this
+                        // connection outright, same reasoning as the
+                        // global cap (U2): an already-approved but
+                        // compromised or buggy client shouldn't be able to
+                        // exhaust the whole connection pool by itself.
+                        let Some((handle, cancelled)) =
+                            live_connections.lock().unwrap().register(fingerprint)
+                        else {
+                            return;
+                        };
                         tokio::select! {
                             _ = serve_tcp_connection(
                                 stream,
@@ -469,7 +485,14 @@ fn main() {
     // connection as it opens/closes) and the admin socket below (which
     // calls `revoke` on it) — see Milestone R: `REVOKE` must terminate an
     // already-open connection, not just block future handshakes.
-    let live_connections = Arc::new(Mutex::new(server::live_connections::LiveConnections::new()));
+    // `with_max_connections_per_fingerprint` (Milestone U3) additionally
+    // rejects a *new* registration once one fingerprint already holds this
+    // many connections open, independent of U2's global cap.
+    let live_connections = Arc::new(Mutex::new(
+        server::live_connections::LiveConnections::with_max_connections_per_fingerprint(
+            MAX_CONNECTIONS_PER_FINGERPRINT,
+        ),
+    ));
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");
 
