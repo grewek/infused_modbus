@@ -18,7 +18,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 
 /// The real UID this process is running as — the only UID ever allowed to
 /// talk to the admin socket (see `is_authorized_uid`). Read once via
@@ -212,11 +212,21 @@ pub async fn run_admin_socket(
     }
 }
 
+/// Sends one command to the admin socket at `socket_path` and returns its
+/// response line (without the trailing newline). Wraps the raw line
+/// protocol so the `server admin` CLI subcommand (P4) never has to speak it
+/// directly.
+pub async fn send_admin_command(socket_path: &Path, command: &str) -> std::io::Result<String> {
+    let mut stream = UnixStream::connect(socket_path).await?;
+    stream.write_all(format!("{command}\n").as_bytes()).await?;
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).await?;
+    Ok(response.trim_end().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     fn fingerprint() -> Fingerprint {
         Fingerprint::of(b"admin-socket-test")
@@ -499,5 +509,31 @@ mod tests {
         while UnixStream::connect(&socket_path).await.is_err() {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test]
+    async fn send_admin_command_round_trips_approve_and_list() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let socket_path = temporary_directory.path().join("admin.sock");
+        let (approved, client_trust) = state();
+
+        let bound_path = socket_path.clone();
+        tokio::spawn(async move {
+            run_admin_socket(&bound_path, approved, client_trust)
+                .await
+                .unwrap();
+        });
+        while !socket_path.exists() {
+            tokio::task::yield_now().await;
+        }
+
+        let approve_response =
+            send_admin_command(&socket_path, &format!("APPROVE {}", fingerprint()))
+                .await
+                .unwrap();
+        assert_eq!(approve_response, format!("OK APPROVE {}", fingerprint()));
+
+        let list_response = send_admin_command(&socket_path, "LIST").await.unwrap();
+        assert_eq!(list_response, format!("OK LIST {}", fingerprint()));
     }
 }

@@ -10,6 +10,8 @@
 //
 // Usage:
 //   cargo run -p server -- <mountpoint> <device-description.toml> <connection>
+//   cargo run -p server -- admin approve|revoke <fingerprint>
+//   cargo run -p server -- admin list
 //
 // <connection> is one of:
 //   tcp://<bind-address:port>          e.g. tcp://0.0.0.0:502
@@ -18,9 +20,13 @@
 //
 // tls+tcp:// requires a client certificate and checks its fingerprint
 // against an approved set (see server::tls::build_server_config /
-// server::client_trust::ApprovedClients) — but that set is currently always
-// empty and has no way to be populated yet (the admin approval channel is
-// Milestone P), so **every** client is rejected until that exists. The
+// server::client_trust::ApprovedClients). The set starts empty on every
+// run (not yet persisted — that's Milestone S) and is populated via the
+// `admin` subcommand above, which talks to a Unix domain socket
+// (ADMIN_SOCKET_PATH below, fixed and not yet CLI-configurable) that this
+// process always serves in the background, regardless of which connection
+// type it was started with — the same "always present regardless of
+// transport" precedent as the FUSE `client-trust/` subtree itself. The
 // server's own TLS identity is generated on first run and persisted under
 // TLS_IDENTITY_DIRECTORY below (a fixed default, not yet CLI-configurable).
 //
@@ -49,13 +55,54 @@ use tokio_serial::SerialPortBuilderExt;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TLS_IDENTITY_DIRECTORY: &str = "server-tls-identity";
+const ADMIN_SOCKET_PATH: &str = "server-admin.sock";
 
 fn usage() -> ! {
     eprintln!(
         "Usage: server <mountpoint> <device-description.toml> <connection>\n\
-         <connection> is tcp://<bind-address:port>, tls+tcp://<bind-address:port>, or rtu://<serial-path>:<baud-rate>"
+         <connection> is tcp://<bind-address:port>, tls+tcp://<bind-address:port>, or rtu://<serial-path>:<baud-rate>\n\
+         \n\
+         Usage: server admin approve|revoke <fingerprint>\n\
+         Usage: server admin list"
     );
     std::process::exit(1);
+}
+
+fn admin_usage() -> ! {
+    eprintln!("Usage: server admin approve|revoke <fingerprint>\nUsage: server admin list");
+    std::process::exit(1);
+}
+
+/// Handles the `server admin approve|revoke|list [<fingerprint>]`
+/// subcommand (P4): translates it into one line of the admin protocol,
+/// sends it over ADMIN_SOCKET_PATH via `server::admin::send_admin_command`,
+/// and prints the response — a technician never has to speak the raw
+/// protocol (`APPROVE <fp>` / `REVOKE <fp>` / `LIST`) by hand.
+fn run_admin_subcommand(mut args: impl Iterator<Item = String>) {
+    let Some(verb) = args.next() else {
+        admin_usage();
+    };
+    let command = match verb.as_str() {
+        "approve" | "revoke" => {
+            let Some(fingerprint) = args.next() else {
+                admin_usage();
+            };
+            format!("{} {fingerprint}", verb.to_uppercase())
+        }
+        "list" => "LIST".to_string(),
+        _ => admin_usage(),
+    };
+
+    let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");
+    let response = runtime
+        .block_on(server::admin::send_admin_command(
+            Path::new(ADMIN_SOCKET_PATH),
+            &command,
+        ))
+        .unwrap_or_else(|error| {
+            panic!("failed to talk to the admin socket at {ADMIN_SOCKET_PATH}: {error}")
+        });
+    println!("{response}");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -69,6 +116,7 @@ fn start_serving(
     mem_layout: MemLayout,
     toml_source: Arc<String>,
     client_trust: Arc<Mutex<fuse_fs::client_trust::ClientTrustState>>,
+    approved_clients: Arc<Mutex<server::client_trust::ApprovedClients>>,
 ) {
     let target =
         parse_connection_string(connection_string).unwrap_or_else(|error| panic!("{error}"));
@@ -123,12 +171,11 @@ fn start_serving(
             // files by hand.
             let fingerprint = protocol::tls::Fingerprint::of(&identity.public_key_der);
             println!("Server TLS fingerprint: {fingerprint}");
-            // Empty and, for now, permanently so — there is no admin
-            // channel yet to approve anything (that's Milestone P). Until
-            // it exists, tls+tcp:// is fail-closed against every client,
-            // not just unapproved ones: nothing can ever become approved.
-            let approved_clients =
-                Arc::new(Mutex::new(server::client_trust::ApprovedClients::new()));
+            // Shared with the admin socket (see main()) so `server admin
+            // approve|revoke` actually changes who this verifier accepts —
+            // starts empty on every run (not persisted yet, Milestone S),
+            // so tls+tcp:// is fail-closed against every client until at
+            // least one has been approved via the admin subcommand.
             let server_config = server::tls::build_server_config(
                 &identity,
                 approved_clients,
@@ -210,9 +257,14 @@ fn start_serving(
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let Some(mountpoint) = args.next() else {
+    let Some(first_argument) = args.next() else {
         usage();
     };
+    if first_argument == "admin" {
+        run_admin_subcommand(args);
+        return;
+    }
+    let mountpoint = first_argument;
     let Some(device_description_path) = args.next() else {
         usage();
     };
@@ -251,8 +303,36 @@ fn main() {
     // not two independently-populated copies. See O2's "known gap" note:
     // this is what closes it.
     let client_trust = Arc::new(Mutex::new(fuse_fs::client_trust::ClientTrustState::new()));
+    // Shared between the TLS client-cert verifier (which enforces it) and
+    // the admin socket below (which is the only thing that ever mutates
+    // it) — same one-writer-per-piece-of-state precedent as `client_trust`
+    // just above. Starts empty on every run; not persisted yet (Milestone
+    // S).
+    let approved_clients = Arc::new(Mutex::new(server::client_trust::ApprovedClients::new()));
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");
+
+    // Always served, regardless of connection type — approving/revoking
+    // clients is meaningful only under tls+tcp://, but `client-trust/`'s
+    // FUSE presence is likewise unconditional (see fuse-fs O1), so the
+    // admin channel that manages it follows the same precedent rather than
+    // depending on which transport was chosen.
+    runtime.spawn({
+        let approved_clients = Arc::clone(&approved_clients);
+        let client_trust = Arc::clone(&client_trust);
+        async move {
+            if let Err(error) = server::admin::run_admin_socket(
+                Path::new(ADMIN_SOCKET_PATH),
+                approved_clients,
+                client_trust,
+            )
+            .await
+            {
+                eprintln!("admin socket at {ADMIN_SOCKET_PATH} failed: {error}");
+            }
+        }
+    });
+
     start_serving(
         &runtime,
         &connection_string,
@@ -263,6 +343,7 @@ fn main() {
         mem_layout,
         Arc::new(toml_source.clone()),
         Arc::clone(&client_trust),
+        approved_clients,
     );
 
     std::fs::create_dir_all(&mountpoint).ok();
