@@ -95,6 +95,15 @@ impl ApprovedClients {
     pub fn remove(&mut self, fingerprint: &Fingerprint) -> bool {
         self.fingerprints.remove(fingerprint)
     }
+
+    /// A snapshot of every currently approved fingerprint — used by the
+    /// admin channel (Milestone S2) to persist the set to disk after every
+    /// successful `insert`/`remove`, called while still holding this
+    /// struct's own lock so the snapshot and the on-disk file can never
+    /// observe a different, later-superseded state.
+    pub fn fingerprints(&self) -> Vec<Fingerprint> {
+        self.fingerprints.iter().copied().collect()
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +190,31 @@ mod tests {
     fn with_max_clients_of_zero_starts_at_capacity() {
         let approved = ApprovedClients::with_max_clients(0);
         assert!(approved.is_at_capacity());
+    }
+
+    #[test]
+    fn fingerprints_returns_every_currently_approved_fingerprint() {
+        let mut approved = ApprovedClients::new();
+        let fp_a = fingerprint(b"client-a");
+        let fp_b = fingerprint(b"client-b");
+        approved.insert(fp_a);
+        approved.insert(fp_b);
+
+        let mut fingerprints = approved.fingerprints();
+        fingerprints.sort_by_key(Fingerprint::to_string);
+        let mut expected = vec![fp_a, fp_b];
+        expected.sort_by_key(Fingerprint::to_string);
+        assert_eq!(fingerprints, expected);
+    }
+
+    #[test]
+    fn fingerprints_excludes_a_removed_fingerprint() {
+        let mut approved = ApprovedClients::new();
+        let fp = fingerprint(b"client-a");
+        approved.insert(fp);
+        approved.remove(&fp);
+
+        assert_eq!(approved.fingerprints(), Vec::new());
     }
 
     #[test]

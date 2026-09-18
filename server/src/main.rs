@@ -443,6 +443,7 @@ fn main() {
                 approved_clients,
                 client_trust,
                 live_connections,
+                approved_clients_path.to_path_buf(),
             )
             .await
             {

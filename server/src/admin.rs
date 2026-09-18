@@ -116,28 +116,46 @@ impl AdminCommand {
 /// than treating it as a hard precondition. Approving is idempotent too,
 /// *except* when the approved set is already at its configured
 /// `--max-clients` capacity (Milestone Q) — see `ApprovedClients::insert`'s
-/// `ApprovalOutcome`.
+/// `ApprovalOutcome`. Every successful `APPROVE`/`REVOKE` also persists the
+/// resulting fingerprint set to `approved_clients_path` (Milestone S2),
+/// snapshotted and saved while still holding `approved`'s lock so the
+/// on-disk file can never reflect a different, later-superseded state than
+/// what's actually in memory. A persistence failure is logged but doesn't
+/// fail the command — the in-memory approval (and so the TLS verifier's
+/// decision) already took effect; only durability across a future restart
+/// is at risk, which is preferable to an operator being unable to approve
+/// a client at all just because a disk write hiccupped.
 fn apply_command(
     command: &AdminCommand,
     approved: &Mutex<ApprovedClients>,
     client_trust: &Mutex<ClientTrustState>,
     live_connections: &Mutex<LiveConnections>,
+    approved_clients_path: &Path,
 ) -> String {
     match command {
-        AdminCommand::Approve(fingerprint) => match approved.lock().unwrap().insert(*fingerprint) {
-            ApprovalOutcome::Approved | ApprovalOutcome::AlreadyApproved => {
-                client_trust
-                    .lock()
-                    .unwrap()
-                    .insert_approved(fingerprint.to_string());
-                format!("OK APPROVE {fingerprint}")
+        AdminCommand::Approve(fingerprint) => {
+            let mut approved_guard = approved.lock().unwrap();
+            let outcome = approved_guard.insert(*fingerprint);
+            match outcome {
+                ApprovalOutcome::Approved | ApprovalOutcome::AlreadyApproved => {
+                    persist(approved_clients_path, &approved_guard);
+                    drop(approved_guard);
+                    client_trust
+                        .lock()
+                        .unwrap()
+                        .insert_approved(fingerprint.to_string());
+                    format!("OK APPROVE {fingerprint}")
+                }
+                ApprovalOutcome::AtCapacity => {
+                    format!("ERROR APPROVE {fingerprint}: at max-clients capacity")
+                }
             }
-            ApprovalOutcome::AtCapacity => {
-                format!("ERROR APPROVE {fingerprint}: at max-clients capacity")
-            }
-        },
+        }
         AdminCommand::Revoke(fingerprint) => {
-            approved.lock().unwrap().remove(fingerprint);
+            let mut approved_guard = approved.lock().unwrap();
+            approved_guard.remove(fingerprint);
+            persist(approved_clients_path, &approved_guard);
+            drop(approved_guard);
             client_trust
                 .lock()
                 .unwrap()
@@ -157,6 +175,14 @@ fn apply_command(
     }
 }
 
+fn persist(approved_clients_path: &Path, approved: &ApprovedClients) {
+    if let Err(error) =
+        crate::persistence::save_atomically(approved_clients_path, &approved.fingerprints())
+    {
+        eprintln!("failed to persist {approved_clients_path:?}: {error}");
+    }
+}
+
 /// Handles one line of admin-protocol input and returns the response line
 /// (without a trailing newline).
 fn handle_line(
@@ -164,9 +190,16 @@ fn handle_line(
     approved: &Mutex<ApprovedClients>,
     client_trust: &Mutex<ClientTrustState>,
     live_connections: &Mutex<LiveConnections>,
+    approved_clients_path: &Path,
 ) -> String {
     match AdminCommand::parse(line.trim_end()) {
-        Ok(command) => apply_command(&command, approved, client_trust, live_connections),
+        Ok(command) => apply_command(
+            &command,
+            approved,
+            client_trust,
+            live_connections,
+            approved_clients_path,
+        ),
         Err(error) => format!("ERROR {error}"),
     }
 }
@@ -179,6 +212,7 @@ pub async fn run_admin_socket(
     approved: Arc<Mutex<ApprovedClients>>,
     client_trust: Arc<Mutex<ClientTrustState>>,
     live_connections: Arc<Mutex<LiveConnections>>,
+    approved_clients_path: std::path::PathBuf,
 ) -> std::io::Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(socket_path)?;
@@ -207,11 +241,18 @@ pub async fn run_admin_socket(
         let approved = Arc::clone(&approved);
         let client_trust = Arc::clone(&client_trust);
         let live_connections = Arc::clone(&live_connections);
+        let approved_clients_path = approved_clients_path.clone();
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
             let mut lines = BufReader::new(reader).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let response = handle_line(&line, &approved, &client_trust, &live_connections);
+                let response = handle_line(
+                    &line,
+                    &approved,
+                    &client_trust,
+                    &live_connections,
+                    &approved_clients_path,
+                );
                 if writer
                     .write_all(format!("{response}\n").as_bytes())
                     .await
@@ -316,6 +357,7 @@ mod tests {
         Arc<Mutex<ApprovedClients>>,
         Arc<Mutex<ClientTrustState>>,
         Arc<Mutex<LiveConnections>>,
+        tempfile::TempDir,
     );
 
     fn state() -> TestState {
@@ -323,15 +365,23 @@ mod tests {
             Arc::new(Mutex::new(ApprovedClients::new())),
             Arc::new(Mutex::new(ClientTrustState::new())),
             Arc::new(Mutex::new(LiveConnections::new())),
+            tempfile::tempdir().unwrap(),
         )
     }
 
     #[test]
     fn handle_line_approve_marks_the_fingerprint_approved_in_both_stores() {
-        let (approved, client_trust, live_connections) = state();
+        let (approved, client_trust, live_connections, temp_dir) = state();
+        let approved_clients_path = temp_dir.path().join("approved-clients.toml");
         let line = format!("APPROVE {}", fingerprint());
 
-        let response = handle_line(&line, &approved, &client_trust, &live_connections);
+        let response = handle_line(
+            &line,
+            &approved,
+            &client_trust,
+            &live_connections,
+            &approved_clients_path,
+        );
 
         assert_eq!(response, format!("OK APPROVE {}", fingerprint()));
         assert!(approved.lock().unwrap().contains(&fingerprint()));
@@ -345,12 +395,45 @@ mod tests {
     }
 
     #[test]
-    fn handle_line_approve_is_idempotent() {
-        let (approved, client_trust, live_connections) = state();
+    fn handle_line_approve_persists_the_approved_set() {
+        let (approved, client_trust, live_connections, temp_dir) = state();
+        let approved_clients_path = temp_dir.path().join("approved-clients.toml");
         let line = format!("APPROVE {}", fingerprint());
 
-        handle_line(&line, &approved, &client_trust, &live_connections);
-        let second_response = handle_line(&line, &approved, &client_trust, &live_connections);
+        handle_line(
+            &line,
+            &approved,
+            &client_trust,
+            &live_connections,
+            &approved_clients_path,
+        );
+
+        assert_eq!(
+            crate::persistence::load(&approved_clients_path).unwrap(),
+            vec![fingerprint()]
+        );
+    }
+
+    #[test]
+    fn handle_line_approve_is_idempotent() {
+        let (approved, client_trust, live_connections, temp_dir) = state();
+        let approved_clients_path = temp_dir.path().join("approved-clients.toml");
+        let line = format!("APPROVE {}", fingerprint());
+
+        handle_line(
+            &line,
+            &approved,
+            &client_trust,
+            &live_connections,
+            &approved_clients_path,
+        );
+        let second_response = handle_line(
+            &line,
+            &approved,
+            &client_trust,
+            &live_connections,
+            &approved_clients_path,
+        );
 
         assert_eq!(second_response, format!("OK APPROVE {}", fingerprint()));
         assert_eq!(client_trust.lock().unwrap().approved_entries().count(), 1);
@@ -361,11 +444,14 @@ mod tests {
         let approved = Arc::new(Mutex::new(ApprovedClients::with_max_clients(1)));
         let client_trust = Arc::new(Mutex::new(ClientTrustState::new()));
         let live_connections = Arc::new(Mutex::new(LiveConnections::new()));
+        let temp_dir = tempfile::tempdir().unwrap();
+        let approved_clients_path = temp_dir.path().join("approved-clients.toml");
         handle_line(
             &format!("APPROVE {}", fingerprint()),
             &approved,
             &client_trust,
             &live_connections,
+            &approved_clients_path,
         );
 
         let response = handle_line(
@@ -373,6 +459,7 @@ mod tests {
             &approved,
             &client_trust,
             &live_connections,
+            &approved_clients_path,
         );
 
         assert!(response.starts_with("ERROR"));
@@ -384,6 +471,11 @@ mod tests {
                 .ino_by_fingerprint(&other_fingerprint().to_string())
                 .is_none()
         );
+        // A rejected APPROVE must not overwrite the persisted set either.
+        assert_eq!(
+            crate::persistence::load(&approved_clients_path).unwrap(),
+            vec![fingerprint()]
+        );
         // The already-approved fingerprint is unaffected and re-approving
         // it still succeeds even though the set is full.
         assert_eq!(
@@ -391,7 +483,8 @@ mod tests {
                 &format!("APPROVE {}", fingerprint()),
                 &approved,
                 &client_trust,
-                &live_connections
+                &live_connections,
+                &approved_clients_path,
             ),
             format!("OK APPROVE {}", fingerprint())
         );
@@ -399,12 +492,14 @@ mod tests {
 
     #[test]
     fn handle_line_revoke_removes_the_fingerprint_from_both_stores() {
-        let (approved, client_trust, live_connections) = state();
+        let (approved, client_trust, live_connections, temp_dir) = state();
+        let approved_clients_path = temp_dir.path().join("approved-clients.toml");
         handle_line(
             &format!("APPROVE {}", fingerprint()),
             &approved,
             &client_trust,
             &live_connections,
+            &approved_clients_path,
         );
 
         let response = handle_line(
@@ -412,6 +507,7 @@ mod tests {
             &approved,
             &client_trust,
             &live_connections,
+            &approved_clients_path,
         );
 
         assert_eq!(
@@ -426,16 +522,22 @@ mod tests {
                 .ino_by_fingerprint(&fingerprint().to_string())
                 .is_none()
         );
+        assert_eq!(
+            crate::persistence::load(&approved_clients_path).unwrap(),
+            Vec::new()
+        );
     }
 
     #[test]
     fn handle_line_revoke_of_an_unapproved_fingerprint_still_succeeds() {
-        let (approved, client_trust, live_connections) = state();
+        let (approved, client_trust, live_connections, temp_dir) = state();
+        let approved_clients_path = temp_dir.path().join("approved-clients.toml");
         let response = handle_line(
             &format!("REVOKE {}", fingerprint()),
             &approved,
             &client_trust,
             &live_connections,
+            &approved_clients_path,
         );
         assert_eq!(
             response,
@@ -445,12 +547,14 @@ mod tests {
 
     #[test]
     fn handle_line_revoke_terminates_live_connections_for_that_fingerprint() {
-        let (approved, client_trust, live_connections) = state();
+        let (approved, client_trust, live_connections, temp_dir) = state();
+        let approved_clients_path = temp_dir.path().join("approved-clients.toml");
         handle_line(
             &format!("APPROVE {}", fingerprint()),
             &approved,
             &client_trust,
             &live_connections,
+            &approved_clients_path,
         );
         let (_handle, mut cancelled) = live_connections.lock().unwrap().register(fingerprint());
 
@@ -459,6 +563,7 @@ mod tests {
             &approved,
             &client_trust,
             &live_connections,
+            &approved_clients_path,
         );
 
         assert_eq!(
@@ -473,9 +578,16 @@ mod tests {
 
     #[test]
     fn handle_line_list_reflects_approved_fingerprints() {
-        let (approved, client_trust, live_connections) = state();
+        let (approved, client_trust, live_connections, temp_dir) = state();
+        let approved_clients_path = temp_dir.path().join("approved-clients.toml");
         assert_eq!(
-            handle_line("LIST", &approved, &client_trust, &live_connections),
+            handle_line(
+                "LIST",
+                &approved,
+                &client_trust,
+                &live_connections,
+                &approved_clients_path
+            ),
             "OK LIST "
         );
 
@@ -484,20 +596,34 @@ mod tests {
             &approved,
             &client_trust,
             &live_connections,
+            &approved_clients_path,
         );
 
         assert_eq!(
-            handle_line("LIST", &approved, &client_trust, &live_connections),
+            handle_line(
+                "LIST",
+                &approved,
+                &client_trust,
+                &live_connections,
+                &approved_clients_path
+            ),
             format!("OK LIST {}", fingerprint())
         );
     }
 
     #[test]
     fn handle_line_reports_a_parse_error() {
-        let (approved, client_trust, live_connections) = state();
+        let (approved, client_trust, live_connections, temp_dir) = state();
+        let approved_clients_path = temp_dir.path().join("approved-clients.toml");
         assert!(
-            handle_line("nonsense", &approved, &client_trust, &live_connections)
-                .starts_with("ERROR ")
+            handle_line(
+                "nonsense",
+                &approved,
+                &client_trust,
+                &live_connections,
+                &approved_clients_path
+            )
+            .starts_with("ERROR ")
         );
     }
 
@@ -505,13 +631,20 @@ mod tests {
     async fn serves_a_list_command_over_a_real_socket() {
         let temporary_directory = tempfile::tempdir().unwrap();
         let socket_path = temporary_directory.path().join("admin.sock");
-        let (approved, client_trust, live_connections) = state();
+        let (approved, client_trust, live_connections, state_temp_dir) = state();
+        let approved_clients_path = state_temp_dir.path().join("approved-clients.toml");
 
         let bound_path = socket_path.clone();
         tokio::spawn(async move {
-            run_admin_socket(&bound_path, approved, client_trust, live_connections)
-                .await
-                .unwrap();
+            run_admin_socket(
+                &bound_path,
+                approved,
+                client_trust,
+                live_connections,
+                approved_clients_path,
+            )
+            .await
+            .unwrap();
         });
         // The listener above binds asynchronously; poll for the socket file
         // to exist rather than a fixed sleep, since the exact bind timing
@@ -537,13 +670,20 @@ mod tests {
     async fn approving_over_the_real_socket_is_visible_to_a_later_list() {
         let temporary_directory = tempfile::tempdir().unwrap();
         let socket_path = temporary_directory.path().join("admin.sock");
-        let (approved, client_trust, live_connections) = state();
+        let (approved, client_trust, live_connections, state_temp_dir) = state();
+        let approved_clients_path = state_temp_dir.path().join("approved-clients.toml");
 
         let bound_path = socket_path.clone();
         tokio::spawn(async move {
-            run_admin_socket(&bound_path, approved, client_trust, live_connections)
-                .await
-                .unwrap();
+            run_admin_socket(
+                &bound_path,
+                approved,
+                client_trust,
+                live_connections,
+                approved_clients_path,
+            )
+            .await
+            .unwrap();
         });
         while !socket_path.exists() {
             tokio::task::yield_now().await;
@@ -579,13 +719,20 @@ mod tests {
         // `is_authorized_uid_rejects_a_different_uid` above.
         let temporary_directory = tempfile::tempdir().unwrap();
         let socket_path = temporary_directory.path().join("admin.sock");
-        let (approved, client_trust, live_connections) = state();
+        let (approved, client_trust, live_connections, state_temp_dir) = state();
+        let approved_clients_path = state_temp_dir.path().join("approved-clients.toml");
 
         let bound_path = socket_path.clone();
         tokio::spawn(async move {
-            run_admin_socket(&bound_path, approved, client_trust, live_connections)
-                .await
-                .unwrap();
+            run_admin_socket(
+                &bound_path,
+                approved,
+                client_trust,
+                live_connections,
+                approved_clients_path,
+            )
+            .await
+            .unwrap();
         });
         while !socket_path.exists() {
             tokio::task::yield_now().await;
@@ -606,13 +753,20 @@ mod tests {
         let temporary_directory = tempfile::tempdir().unwrap();
         let socket_path = temporary_directory.path().join("admin.sock");
         std::fs::write(&socket_path, b"leftover, not a real socket").unwrap();
-        let (approved, client_trust, live_connections) = state();
+        let (approved, client_trust, live_connections, state_temp_dir) = state();
+        let approved_clients_path = state_temp_dir.path().join("approved-clients.toml");
 
         let bound_path = socket_path.clone();
         tokio::spawn(async move {
-            run_admin_socket(&bound_path, approved, client_trust, live_connections)
-                .await
-                .unwrap();
+            run_admin_socket(
+                &bound_path,
+                approved,
+                client_trust,
+                live_connections,
+                approved_clients_path,
+            )
+            .await
+            .unwrap();
         });
         while UnixStream::connect(&socket_path).await.is_err() {
             tokio::task::yield_now().await;
@@ -623,13 +777,20 @@ mod tests {
     async fn send_admin_command_round_trips_approve_and_list() {
         let temporary_directory = tempfile::tempdir().unwrap();
         let socket_path = temporary_directory.path().join("admin.sock");
-        let (approved, client_trust, live_connections) = state();
+        let (approved, client_trust, live_connections, state_temp_dir) = state();
+        let approved_clients_path = state_temp_dir.path().join("approved-clients.toml");
 
         let bound_path = socket_path.clone();
         tokio::spawn(async move {
-            run_admin_socket(&bound_path, approved, client_trust, live_connections)
-                .await
-                .unwrap();
+            run_admin_socket(
+                &bound_path,
+                approved,
+                client_trust,
+                live_connections,
+                approved_clients_path,
+            )
+            .await
+            .unwrap();
         });
         while !socket_path.exists() {
             tokio::task::yield_now().await;
