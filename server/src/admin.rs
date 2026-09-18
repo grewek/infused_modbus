@@ -6,11 +6,9 @@
 // real TLS `ClientCertVerifier` consults) and `fuse_fs::client_trust::
 // ClientTrustState` (the read-only `client-trust/approved/` FUSE mirror) —
 // keeping these in sync here is what closes O2's "known gap" note about
-// the two never being wired to the same writer. Still missing:
-// `SO_PEERCRED` verification of the connecting caller (P3), and the
-// `--max-clients` capacity check (Milestone Q).
+// the two never being wired to the same writer.
 
-use crate::client_trust::ApprovedClients;
+use crate::client_trust::{ApprovalOutcome, ApprovedClients};
 use fuse_fs::client_trust::ClientTrustState;
 use protocol::tls::Fingerprint;
 use std::fmt;
@@ -109,25 +107,31 @@ impl AdminCommand {
 }
 
 /// Applies a parsed command's effect and returns the response line (without
-/// a trailing newline). Approving/revoking are idempotent — re-approving an
-/// already-approved fingerprint, or revoking one that was never approved,
-/// is still a success, not an error, matching `ApprovedClients::insert`/
-/// `remove`'s own `bool` "was this newly true" return rather than treating
-/// it as a hard precondition.
+/// a trailing newline). Revoking is idempotent — revoking a fingerprint
+/// that was never approved is still a success, not an error, matching
+/// `ApprovedClients::remove`'s own `bool` "was this present" return rather
+/// than treating it as a hard precondition. Approving is idempotent too,
+/// *except* when the approved set is already at its configured
+/// `--max-clients` capacity (Milestone Q) — see `ApprovedClients::insert`'s
+/// `ApprovalOutcome`.
 fn apply_command(
     command: &AdminCommand,
     approved: &Mutex<ApprovedClients>,
     client_trust: &Mutex<ClientTrustState>,
 ) -> String {
     match command {
-        AdminCommand::Approve(fingerprint) => {
-            approved.lock().unwrap().insert(*fingerprint);
-            client_trust
-                .lock()
-                .unwrap()
-                .insert_approved(fingerprint.to_string());
-            format!("OK APPROVE {fingerprint}")
-        }
+        AdminCommand::Approve(fingerprint) => match approved.lock().unwrap().insert(*fingerprint) {
+            ApprovalOutcome::Approved | ApprovalOutcome::AlreadyApproved => {
+                client_trust
+                    .lock()
+                    .unwrap()
+                    .insert_approved(fingerprint.to_string());
+                format!("OK APPROVE {fingerprint}")
+            }
+            ApprovalOutcome::AtCapacity => {
+                format!("ERROR APPROVE {fingerprint}: at max-clients capacity")
+            }
+        },
         AdminCommand::Revoke(fingerprint) => {
             approved.lock().unwrap().remove(fingerprint);
             client_trust
@@ -232,6 +236,10 @@ mod tests {
         Fingerprint::of(b"admin-socket-test")
     }
 
+    fn other_fingerprint() -> Fingerprint {
+        Fingerprint::of(b"admin-socket-test-other")
+    }
+
     #[test]
     fn is_authorized_uid_accepts_the_servers_own_uid() {
         assert!(is_authorized_uid(server_uid()));
@@ -331,6 +339,43 @@ mod tests {
 
         assert_eq!(second_response, format!("OK APPROVE {}", fingerprint()));
         assert_eq!(client_trust.lock().unwrap().approved_entries().count(), 1);
+    }
+
+    #[test]
+    fn handle_line_approve_is_rejected_once_at_max_clients_capacity() {
+        let approved = Arc::new(Mutex::new(ApprovedClients::with_max_clients(1)));
+        let client_trust = Arc::new(Mutex::new(ClientTrustState::new()));
+        handle_line(
+            &format!("APPROVE {}", fingerprint()),
+            &approved,
+            &client_trust,
+        );
+
+        let response = handle_line(
+            &format!("APPROVE {}", other_fingerprint()),
+            &approved,
+            &client_trust,
+        );
+
+        assert!(response.starts_with("ERROR"));
+        assert!(!approved.lock().unwrap().contains(&other_fingerprint()));
+        assert!(
+            client_trust
+                .lock()
+                .unwrap()
+                .ino_by_fingerprint(&other_fingerprint().to_string())
+                .is_none()
+        );
+        // The already-approved fingerprint is unaffected and re-approving
+        // it still succeeds even though the set is full.
+        assert_eq!(
+            handle_line(
+                &format!("APPROVE {}", fingerprint()),
+                &approved,
+                &client_trust
+            ),
+            format!("OK APPROVE {}", fingerprint())
+        );
     }
 
     #[test]

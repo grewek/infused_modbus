@@ -17,9 +17,26 @@ pub struct ApprovedClients {
     // valid* approved fingerprints at once, not total approvals ever
     // granted — revoking one frees the slot for a new approval (Q3).
     // `None` (the `Default`/`new()` case) means unlimited, matching every
-    // pre-Q server's behavior exactly. Q1 scope only: stored and queryable
-    // via `is_at_capacity`, not yet consulted by `insert` — that's Q2.
+    // pre-Q server's behavior exactly. Consulted by `insert` (Q2).
     max_clients: Option<usize>,
+}
+
+/// What `insert` actually did — richer than a plain `bool` since Q2 adds a
+/// third real outcome (`AtCapacity`) that the admin channel (`server::admin
+/// ::apply_command`) needs to report distinctly from ordinary success, not
+/// silently swallow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    /// Newly inserted.
+    Approved,
+    /// Already approved — a no-op, but still a success from the caller's
+    /// perspective (re-approving an already-approved client isn't an
+    /// error), and deliberately exempt from the capacity check below: an
+    /// idempotent re-approval can never itself grow the approved count.
+    AlreadyApproved,
+    /// Not inserted: the approved set is already at its configured
+    /// `--max-clients` limit.
+    AtCapacity,
 }
 
 impl ApprovedClients {
@@ -41,10 +58,22 @@ impl ApprovedClients {
             .is_some_and(|max_clients| self.fingerprints.len() >= max_clients)
     }
 
-    /// Returns whether `fingerprint` was newly inserted (`false` if it was
-    /// already approved).
-    pub fn insert(&mut self, fingerprint: Fingerprint) -> bool {
-        self.fingerprints.insert(fingerprint)
+    /// Checking capacity and inserting both happen here, inside the one
+    /// `&mut self` call — since every caller already holds this struct's
+    /// lock for the call's duration (see the module doc comment), that's
+    /// the single critical section CLAUDE.md requires: "checking the
+    /// current approved count against `--max-clients` and inserting a
+    /// newly-approved fingerprint must happen inside one held lock ...
+    /// never as two separate lock acquisitions".
+    pub fn insert(&mut self, fingerprint: Fingerprint) -> ApprovalOutcome {
+        if self.fingerprints.contains(&fingerprint) {
+            return ApprovalOutcome::AlreadyApproved;
+        }
+        if self.is_at_capacity() {
+            return ApprovalOutcome::AtCapacity;
+        }
+        self.fingerprints.insert(fingerprint);
+        ApprovalOutcome::Approved
     }
 
     pub fn contains(&self, fingerprint: &Fingerprint) -> bool {
@@ -76,17 +105,17 @@ mod tests {
         let mut approved = ApprovedClients::new();
         let fp = fingerprint(b"client-a");
 
-        assert!(approved.insert(fp));
+        assert_eq!(approved.insert(fp), ApprovalOutcome::Approved);
         assert!(approved.contains(&fp));
     }
 
     #[test]
-    fn insert_of_an_already_approved_fingerprint_returns_false() {
+    fn insert_of_an_already_approved_fingerprint_reports_already_approved() {
         let mut approved = ApprovedClients::new();
         let fp = fingerprint(b"client-a");
 
-        assert!(approved.insert(fp));
-        assert!(!approved.insert(fp));
+        assert_eq!(approved.insert(fp), ApprovalOutcome::Approved);
+        assert_eq!(approved.insert(fp), ApprovalOutcome::AlreadyApproved);
     }
 
     #[test]
@@ -141,5 +170,71 @@ mod tests {
     fn with_max_clients_of_zero_starts_at_capacity() {
         let approved = ApprovedClients::with_max_clients(0);
         assert!(approved.is_at_capacity());
+    }
+
+    #[test]
+    fn insert_rejects_a_new_fingerprint_once_at_capacity() {
+        let mut approved = ApprovedClients::with_max_clients(1);
+        assert_eq!(
+            approved.insert(fingerprint(b"client-a")),
+            ApprovalOutcome::Approved
+        );
+
+        assert_eq!(
+            approved.insert(fingerprint(b"client-b")),
+            ApprovalOutcome::AtCapacity
+        );
+        assert!(!approved.contains(&fingerprint(b"client-b")));
+    }
+
+    #[test]
+    fn insert_of_an_already_approved_fingerprint_succeeds_even_at_capacity() {
+        let mut approved = ApprovedClients::with_max_clients(1);
+        let fp = fingerprint(b"client-a");
+        assert_eq!(approved.insert(fp), ApprovalOutcome::Approved);
+
+        // The set is now full, but re-approving the one fingerprint
+        // already in it doesn't grow the count, so it must still succeed.
+        assert_eq!(approved.insert(fp), ApprovalOutcome::AlreadyApproved);
+    }
+
+    #[test]
+    fn revoke_frees_a_slot_for_a_new_approval() {
+        let mut approved = ApprovedClients::with_max_clients(1);
+        let fp_a = fingerprint(b"client-a");
+        let fp_b = fingerprint(b"client-b");
+        assert_eq!(approved.insert(fp_a), ApprovalOutcome::Approved);
+        assert_eq!(approved.insert(fp_b), ApprovalOutcome::AtCapacity);
+
+        assert!(approved.remove(&fp_a));
+
+        assert_eq!(approved.insert(fp_b), ApprovalOutcome::Approved);
+    }
+
+    #[test]
+    fn concurrent_approvals_never_exceed_max_clients() {
+        use std::sync::{Arc, Mutex};
+
+        const MAX_CLIENTS: usize = 5;
+        const CONCURRENT_ATTEMPTS: u8 = 50;
+
+        let approved = Arc::new(Mutex::new(ApprovedClients::with_max_clients(MAX_CLIENTS)));
+        let handles: Vec<_> = (0..CONCURRENT_ATTEMPTS)
+            .map(|seed| {
+                let approved = Arc::clone(&approved);
+                std::thread::spawn(move || {
+                    approved.lock().unwrap().insert(fingerprint(&[seed]));
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let approved = approved.lock().unwrap();
+        let approved_count = (0..CONCURRENT_ATTEMPTS)
+            .filter(|seed| approved.contains(&fingerprint(&[*seed])))
+            .count();
+        assert!(approved_count <= MAX_CLIENTS);
     }
 }
