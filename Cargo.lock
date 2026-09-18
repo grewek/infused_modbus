@@ -777,6 +777,7 @@ version = "0.1.0"
 dependencies = [
  "fuse-fs",
  "fuser",
+ "libc",
  "protocol",
  "rustls",
  "rustls-webpki",
