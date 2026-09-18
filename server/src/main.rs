@@ -44,7 +44,8 @@ use fuse_fs::filesystem::InfusedFilesystem;
 use fuse_fs::{CoilStore, DiscreteInputStore, InputRegisterStore, RegisterStore, WriteReport};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::{
-    CoilDescription, DeviceDescription, MemLayout, RegisterDescription,
+    CoilDescription, DeviceDescription, DiscreteInputDescription, InputRegisterDescription,
+    MemLayout, RegisterDescription,
 };
 use server::connection::{serve_rtu_connection, serve_tcp_connection};
 use server::transaction_consumer::run_transaction_consumer;
@@ -179,7 +180,12 @@ fn start_serving(
     store: Arc<Mutex<RegisterStore>>,
     coils: Arc<Vec<CoilDescription>>,
     coil_store: Arc<Mutex<CoilStore>>,
+    discrete_inputs: Arc<Vec<DiscreteInputDescription>>,
+    discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
+    input_registers: Arc<Vec<InputRegisterDescription>>,
+    input_register_store: Arc<Mutex<InputRegisterStore>>,
     mem_layout: MemLayout,
+    input_register_mem_layout: MemLayout,
     toml_source: Arc<String>,
     client_trust: Arc<Mutex<fuse_fs::client_trust::ClientTrustState>>,
     approved_clients: Arc<Mutex<server::client_trust::ApprovedClients>>,
@@ -206,6 +212,10 @@ fn start_serving(
                     let store = Arc::clone(&store);
                     let coils = Arc::clone(&coils);
                     let coil_store = Arc::clone(&coil_store);
+                    let discrete_inputs = Arc::clone(&discrete_inputs);
+                    let discrete_input_store = Arc::clone(&discrete_input_store);
+                    let input_registers = Arc::clone(&input_registers);
+                    let input_register_store = Arc::clone(&input_register_store);
                     let toml_source = Arc::clone(&toml_source);
                     tokio::spawn(async move {
                         serve_tcp_connection(
@@ -214,7 +224,12 @@ fn start_serving(
                             store,
                             coils,
                             coil_store,
+                            discrete_inputs,
+                            discrete_input_store,
+                            input_registers,
+                            input_register_store,
                             mem_layout,
+                            input_register_mem_layout,
                             toml_source,
                             REQUEST_TIMEOUT,
                         )
@@ -271,6 +286,10 @@ fn start_serving(
                     let store = Arc::clone(&store);
                     let coils = Arc::clone(&coils);
                     let coil_store = Arc::clone(&coil_store);
+                    let discrete_inputs = Arc::clone(&discrete_inputs);
+                    let discrete_input_store = Arc::clone(&discrete_input_store);
+                    let input_registers = Arc::clone(&input_registers);
+                    let input_register_store = Arc::clone(&input_register_store);
                     let toml_source = Arc::clone(&toml_source);
                     let live_connections = Arc::clone(&live_connections);
                     let connection_semaphore = Arc::clone(&connection_semaphore);
@@ -324,7 +343,12 @@ fn start_serving(
                                 store,
                                 coils,
                                 coil_store,
+                                discrete_inputs,
+                                discrete_input_store,
+                                input_registers,
+                                input_register_store,
                                 mem_layout,
+                                input_register_mem_layout,
                                 toml_source,
                                 REQUEST_TIMEOUT,
                             )
@@ -349,7 +373,12 @@ fn start_serving(
                                 store,
                                 coils,
                                 coil_store,
+                                discrete_inputs,
+                                discrete_input_store,
+                                input_registers,
+                                input_register_store,
                                 mem_layout,
+                                input_register_mem_layout,
                                 toml_source,
                                 REQUEST_TIMEOUT,
                             ) => {}
@@ -388,7 +417,12 @@ fn start_serving(
                     store,
                     coils,
                     coil_store,
+                    discrete_inputs,
+                    discrete_input_store,
+                    input_registers,
+                    input_register_store,
                     mem_layout,
+                    input_register_mem_layout,
                     toml_source,
                     frame_silence,
                     REQUEST_TIMEOUT,
@@ -432,6 +466,7 @@ fn main() {
     let discrete_inputs = description.discrete_inputs;
     let input_registers = description.input_registers;
     let mem_layout = description.mem_layout;
+    let input_register_mem_layout = description.input_register_mem_layout;
 
     let store = Arc::new(Mutex::new(RegisterStore::new()));
     let coil_store = Arc::new(Mutex::new(CoilStore::new()));
@@ -535,7 +570,12 @@ fn main() {
         Arc::clone(&store),
         Arc::new(coils.clone()),
         Arc::clone(&coil_store),
+        Arc::new(discrete_inputs.clone()),
+        Arc::clone(&discrete_input_store),
+        Arc::new(input_registers.clone()),
+        Arc::clone(&input_register_store),
         mem_layout,
+        input_register_mem_layout,
         Arc::new(toml_source.clone()),
         Arc::clone(&client_trust),
         approved_clients,

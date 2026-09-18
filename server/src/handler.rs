@@ -31,20 +31,25 @@
 
 use crate::device_identification::{build_objects, handle_read_device_identification};
 use fuse_fs::register_encoding::{register_value_from_words, register_value_to_words};
-use fuse_fs::{CoilStore, CoilValue, RegisterStore, RegisterValue};
+use fuse_fs::{
+    CoilStore, CoilValue, DiscreteInputStore, InputRegisterStore, RegisterStore, RegisterValue,
+};
 use protocol::device_description::{
-    AccessRight, CoilDescription, DataType, MemLayout, RegisterDescription,
+    AccessRight, CoilDescription, DataType, DiscreteInputDescription, InputRegisterDescription,
+    MemLayout, RegisterDescription,
 };
 use protocol::pdu::{
     EXCEPTION_ILLEGAL_DATA_ADDRESS, EXCEPTION_ILLEGAL_DATA_VALUE, EXCEPTION_ILLEGAL_FUNCTION,
     ExceptionResponse, FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT, FUNCTION_CODE_READ_COILS,
-    FUNCTION_CODE_READ_HOLDING_REGISTERS, FUNCTION_CODE_WRITE_MULTIPLE_COILS,
+    FUNCTION_CODE_READ_DISCRETE_INPUTS, FUNCTION_CODE_READ_HOLDING_REGISTERS,
+    FUNCTION_CODE_READ_INPUT_REGISTERS, FUNCTION_CODE_WRITE_MULTIPLE_COILS,
     FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS, FUNCTION_CODE_WRITE_SINGLE_COIL,
     FUNCTION_CODE_WRITE_SINGLE_REGISTER, ReadCoilsRequest, ReadCoilsResponse,
-    ReadDeviceIdentificationRequest, ReadHoldingRegistersRequest, ReadHoldingRegistersResponse,
-    WriteMultipleCoilsRequest, WriteMultipleCoilsResponse, WriteMultipleRegistersRequest,
-    WriteMultipleRegistersResponse, WriteSingleCoilRequest, WriteSingleCoilResponse,
-    WriteSingleRegisterRequest, WriteSingleRegisterResponse,
+    ReadDeviceIdentificationRequest, ReadDiscreteInputsRequest, ReadDiscreteInputsResponse,
+    ReadHoldingRegistersRequest, ReadHoldingRegistersResponse, ReadInputRegistersRequest,
+    ReadInputRegistersResponse, WriteMultipleCoilsRequest, WriteMultipleCoilsResponse,
+    WriteMultipleRegistersRequest, WriteMultipleRegistersResponse, WriteSingleCoilRequest,
+    WriteSingleCoilResponse, WriteSingleRegisterRequest, WriteSingleRegisterResponse,
 };
 use std::sync::{Mutex, PoisonError};
 
@@ -55,7 +60,12 @@ pub fn handle_request(
     store: &Mutex<RegisterStore>,
     coils: &[CoilDescription],
     coil_store: &Mutex<CoilStore>,
+    discrete_inputs: &[DiscreteInputDescription],
+    discrete_input_store: &Mutex<DiscreteInputStore>,
+    input_registers: &[InputRegisterDescription],
+    input_register_store: &Mutex<InputRegisterStore>,
     mem_layout: MemLayout,
+    input_register_mem_layout: MemLayout,
     toml_source: &str,
 ) -> Vec<u8> {
     let Some(&function_code) = pdu.first() else {
@@ -77,6 +87,15 @@ pub fn handle_request(
         FUNCTION_CODE_READ_COILS => handle_read_coils(pdu, coils, coil_store),
         FUNCTION_CODE_WRITE_SINGLE_COIL => handle_write_single_coil(pdu, coils, coil_store),
         FUNCTION_CODE_WRITE_MULTIPLE_COILS => handle_write_multiple_coils(pdu, coils, coil_store),
+        FUNCTION_CODE_READ_DISCRETE_INPUTS => {
+            handle_read_discrete_inputs(pdu, discrete_inputs, discrete_input_store)
+        }
+        FUNCTION_CODE_READ_INPUT_REGISTERS => handle_read_input_registers(
+            pdu,
+            input_registers,
+            input_register_store,
+            input_register_mem_layout,
+        ),
         FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT => {
             handle_encapsulated_interface_transport(pdu, toml_source)
         }
@@ -336,6 +355,112 @@ fn handle_read_coils(
     ReadCoilsResponse { coil_values }.encode()
 }
 
+// Read-only counterpart of handle_read_coils — same packed-bit response
+// shape, same "missing value defaults to false" behavior, just backed by
+// DiscreteInputStore instead of CoilStore. No write-side handler exists
+// for this, on purpose: no Modbus function code ever lets a master write a
+// discrete input (see protocol::device_description::DiscreteInputDescription's
+// own doc comment).
+fn handle_read_discrete_inputs(
+    pdu: &[u8],
+    discrete_inputs: &[DiscreteInputDescription],
+    discrete_input_store: &Mutex<DiscreteInputStore>,
+) -> Vec<u8> {
+    let Ok(request) = ReadDiscreteInputsRequest::decode(pdu) else {
+        return ExceptionResponse {
+            function_code: FUNCTION_CODE_READ_DISCRETE_INPUTS,
+            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+        }
+        .encode();
+    };
+
+    let discrete_input_store = discrete_input_store
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut discrete_input_values = Vec::with_capacity(request.quantity as usize);
+    for offset in 0..request.quantity {
+        let address = request.starting_address.wrapping_add(offset);
+        match discrete_inputs
+            .iter()
+            .find(|discrete_input| discrete_input.address == address)
+        {
+            Some(discrete_input) => {
+                let value = discrete_input_store
+                    .get(&discrete_input.name)
+                    .is_some_and(|value| value.0);
+                discrete_input_values.push(value);
+            }
+            None => {
+                return ExceptionResponse {
+                    function_code: FUNCTION_CODE_READ_DISCRETE_INPUTS,
+                    exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+                }
+                .encode();
+            }
+        }
+    }
+    ReadDiscreteInputsResponse {
+        discrete_input_values,
+    }
+    .encode()
+}
+
+// Read-only counterpart of handle_read — same register-by-register walk
+// and multi-register assembly, just backed by InputRegisterStore and its
+// own mem_layout instead of RegisterStore's. No write-side handler exists
+// for this, on purpose, same reasoning as handle_read_discrete_inputs
+// above.
+fn handle_read_input_registers(
+    pdu: &[u8],
+    input_registers: &[InputRegisterDescription],
+    input_register_store: &Mutex<InputRegisterStore>,
+    input_register_mem_layout: MemLayout,
+) -> Vec<u8> {
+    let Ok(request) = ReadInputRegistersRequest::decode(pdu) else {
+        return ExceptionResponse {
+            function_code: FUNCTION_CODE_READ_INPUT_REGISTERS,
+            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+        }
+        .encode();
+    };
+
+    let store = input_register_store
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut register_values = Vec::with_capacity(request.quantity as usize);
+    let mut address = request.starting_address;
+    let end_address = request.starting_address.wrapping_add(request.quantity);
+    while address != end_address {
+        let Some(input_register) = input_registers
+            .iter()
+            .find(|input_register| input_register.address == address)
+        else {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_INPUT_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+            .encode();
+        };
+
+        let value = match store.get(&input_register.name) {
+            Some(value) if value.data_type() == input_register.data_type => value,
+            _ => default_register_value(input_register.data_type),
+        };
+        let words = register_value_to_words(value, input_register_mem_layout);
+
+        if register_values.len() + words.len() > request.quantity as usize {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_INPUT_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+            .encode();
+        }
+        register_values.extend(words);
+        address = address.wrapping_add(input_register.data_type.register_count());
+    }
+    ReadInputRegistersResponse { register_values }.encode()
+}
+
 fn handle_write_single_coil(
     pdu: &[u8],
     coils: &[CoilDescription],
@@ -469,6 +594,34 @@ mod tests {
         ]
     }
 
+    fn discrete_inputs() -> Vec<DiscreteInputDescription> {
+        vec![
+            DiscreteInputDescription {
+                name: "Door_Open_Sensor".to_string(),
+                address: 1,
+            },
+            DiscreteInputDescription {
+                name: "Emergency_Stop_Pressed".to_string(),
+                address: 2,
+            },
+        ]
+    }
+
+    fn input_registers() -> Vec<InputRegisterDescription> {
+        vec![
+            InputRegisterDescription {
+                name: "Pressure".to_string(),
+                address: 30001,
+                data_type: DataType::U16,
+            },
+            InputRegisterDescription {
+                name: "Flow_Rate".to_string(),
+                address: 30002,
+                data_type: DataType::F32,
+            },
+        ]
+    }
+
     #[test]
     fn read_returns_current_store_values() {
         let store = Mutex::new(RegisterStore::new());
@@ -489,6 +642,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -516,6 +674,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -542,6 +705,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -572,6 +740,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -602,6 +775,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -636,7 +814,12 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
             MemLayout::Cdab,
+            MemLayout::Abcd,
             "",
         );
 
@@ -663,6 +846,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -696,6 +884,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -729,6 +922,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -759,6 +957,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -799,7 +1002,12 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
             MemLayout::Dcba,
+            MemLayout::Abcd,
             "",
         );
 
@@ -836,6 +1044,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -857,21 +1070,26 @@ mod tests {
     fn unimplemented_function_code_returns_illegal_function() {
         let store = Mutex::new(RegisterStore::new());
         let coil_store = Mutex::new(CoilStore::new());
-        // Read Input Registers (0x04) — not implemented at all.
-        let request = vec![0x04, 0x00, 0x00, 0x00, 0x01];
+        // Report Server ID (0x11) — not implemented at all.
+        let request = vec![0x11, 0x00, 0x00, 0x00, 0x01];
         let response = handle_request(
             &request,
             &registers(),
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
             ExceptionResponse {
-                function_code: 0x04,
+                function_code: 0x11,
                 exception_code: EXCEPTION_ILLEGAL_FUNCTION,
             }
         );
@@ -887,6 +1105,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -917,6 +1140,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "name = \"X\"",
         );
@@ -946,6 +1174,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -973,6 +1206,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -999,6 +1237,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -1027,6 +1270,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -1060,6 +1308,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -1089,6 +1342,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -1129,6 +1387,11 @@ mod tests {
             &store,
             &coils(),
             &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             "",
         );
@@ -1142,5 +1405,265 @@ mod tests {
         );
         assert_eq!(coil_store.lock().unwrap().get("Motor_Running"), None);
         assert_eq!(coil_store.lock().unwrap().get("Alarm_Reset"), None);
+    }
+
+    #[test]
+    fn read_discrete_inputs_returns_current_store_values() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        discrete_input_store
+            .lock()
+            .unwrap()
+            .set("Door_Open_Sensor", CoilValue(true));
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+
+        let request = ReadDiscreteInputsRequest {
+            starting_address: 1,
+            quantity: 2,
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+        );
+
+        assert_eq!(
+            ReadDiscreteInputsResponse::decode(&response).unwrap(),
+            ReadDiscreteInputsResponse {
+                discrete_input_values: vec![true, false, false, false, false, false, false, false]
+            }
+        );
+    }
+
+    #[test]
+    fn read_discrete_inputs_defaults_to_false_for_an_input_with_no_value_yet() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+
+        let request = ReadDiscreteInputsRequest {
+            starting_address: 1,
+            quantity: 1,
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+        );
+
+        assert_eq!(
+            ReadDiscreteInputsResponse::decode(&response).unwrap(),
+            ReadDiscreteInputsResponse {
+                discrete_input_values: vec![false; 8]
+            }
+        );
+    }
+
+    #[test]
+    fn read_discrete_inputs_of_unknown_address_returns_an_exception() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+
+        let request = ReadDiscreteInputsRequest {
+            starting_address: 99,
+            quantity: 1,
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_DISCRETE_INPUTS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
+    }
+
+    #[test]
+    fn read_input_registers_returns_current_store_values() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+        input_register_store
+            .lock()
+            .unwrap()
+            .set("Pressure", RegisterValue::U16(1013));
+
+        let request = ReadInputRegistersRequest {
+            starting_address: 30001,
+            quantity: 1,
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+        );
+
+        assert_eq!(
+            ReadInputRegistersResponse::decode(&response).unwrap(),
+            ReadInputRegistersResponse {
+                register_values: vec![1013]
+            }
+        );
+    }
+
+    #[test]
+    fn read_input_registers_defaults_to_zero_for_a_register_with_no_value_yet() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+
+        let request = ReadInputRegistersRequest {
+            starting_address: 30001,
+            quantity: 1,
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+        );
+
+        assert_eq!(
+            ReadInputRegistersResponse::decode(&response).unwrap(),
+            ReadInputRegistersResponse {
+                register_values: vec![0]
+            }
+        );
+    }
+
+    #[test]
+    fn read_input_registers_returns_a_correctly_assembled_multi_register_value() {
+        use fuse_fs::register_encoding::register_value_from_words;
+
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+        input_register_store
+            .lock()
+            .unwrap()
+            .set("Flow_Rate", RegisterValue::F32(3.5));
+
+        let request = ReadInputRegistersRequest {
+            starting_address: 30002,
+            quantity: 2,
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            MemLayout::Abcd,
+            MemLayout::Cdab,
+            "",
+        );
+
+        let decoded = ReadInputRegistersResponse::decode(&response).unwrap();
+        let value =
+            register_value_from_words(DataType::F32, &decoded.register_values, MemLayout::Cdab)
+                .unwrap();
+        assert_eq!(value, RegisterValue::F32(3.5));
+    }
+
+    #[test]
+    fn read_input_registers_of_unknown_address_returns_an_exception() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+
+        let request = ReadInputRegistersRequest {
+            starting_address: 39999,
+            quantity: 1,
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_INPUT_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
     }
 }

@@ -4,8 +4,11 @@
 // its own spawned tokio task, which needs 'static ownership.
 
 use crate::handler::handle_request;
-use fuse_fs::{CoilStore, RegisterStore};
-use protocol::device_description::{CoilDescription, MemLayout, RegisterDescription};
+use fuse_fs::{CoilStore, DiscreteInputStore, InputRegisterStore, RegisterStore};
+use protocol::device_description::{
+    CoilDescription, DiscreteInputDescription, InputRegisterDescription, MemLayout,
+    RegisterDescription,
+};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -23,7 +26,12 @@ pub async fn serve_tcp_connection<S>(
     store: Arc<Mutex<RegisterStore>>,
     coils: Arc<Vec<CoilDescription>>,
     coil_store: Arc<Mutex<CoilStore>>,
+    discrete_inputs: Arc<Vec<DiscreteInputDescription>>,
+    discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
+    input_registers: Arc<Vec<InputRegisterDescription>>,
+    input_register_store: Arc<Mutex<InputRegisterStore>>,
     mem_layout: MemLayout,
+    input_register_mem_layout: MemLayout,
     toml_source: Arc<String>,
     timeout: Duration,
 ) where
@@ -41,6 +49,10 @@ pub async fn serve_tcp_connection<S>(
         let handler_store = Arc::clone(&store);
         let handler_coils = Arc::clone(&coils);
         let handler_coil_store = Arc::clone(&coil_store);
+        let handler_discrete_inputs = Arc::clone(&discrete_inputs);
+        let handler_discrete_input_store = Arc::clone(&discrete_input_store);
+        let handler_input_registers = Arc::clone(&input_registers);
+        let handler_input_register_store = Arc::clone(&input_register_store);
         let handler_toml_source = Arc::clone(&toml_source);
         let result = protocol::tcp::serve_request(
             &mut stream,
@@ -51,7 +63,12 @@ pub async fn serve_tcp_connection<S>(
                     &handler_store,
                     &handler_coils,
                     &handler_coil_store,
+                    &handler_discrete_inputs,
+                    &handler_discrete_input_store,
+                    &handler_input_registers,
+                    &handler_input_register_store,
                     mem_layout,
+                    input_register_mem_layout,
                     &handler_toml_source,
                 )
             },
@@ -79,7 +96,12 @@ pub async fn serve_rtu_connection<S>(
     store: Arc<Mutex<RegisterStore>>,
     coils: Arc<Vec<CoilDescription>>,
     coil_store: Arc<Mutex<CoilStore>>,
+    discrete_inputs: Arc<Vec<DiscreteInputDescription>>,
+    discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
+    input_registers: Arc<Vec<InputRegisterDescription>>,
+    input_register_store: Arc<Mutex<InputRegisterStore>>,
     mem_layout: MemLayout,
+    input_register_mem_layout: MemLayout,
     toml_source: Arc<String>,
     frame_silence: Duration,
     timeout: Duration,
@@ -91,6 +113,10 @@ pub async fn serve_rtu_connection<S>(
         let handler_store = Arc::clone(&store);
         let handler_coils = Arc::clone(&coils);
         let handler_coil_store = Arc::clone(&coil_store);
+        let handler_discrete_inputs = Arc::clone(&discrete_inputs);
+        let handler_discrete_input_store = Arc::clone(&discrete_input_store);
+        let handler_input_registers = Arc::clone(&input_registers);
+        let handler_input_register_store = Arc::clone(&input_register_store);
         let handler_toml_source = Arc::clone(&toml_source);
         let result = protocol::rtu::serve_request(
             &mut stream,
@@ -101,7 +127,12 @@ pub async fn serve_rtu_connection<S>(
                     &handler_store,
                     &handler_coils,
                     &handler_coil_store,
+                    &handler_discrete_inputs,
+                    &handler_discrete_input_store,
+                    &handler_input_registers,
+                    &handler_input_register_store,
                     mem_layout,
+                    input_register_mem_layout,
                     &handler_toml_source,
                 )
             },
@@ -152,6 +183,22 @@ mod tests {
         Arc::new(Mutex::new(CoilStore::new()))
     }
 
+    fn discrete_inputs() -> Arc<Vec<DiscreteInputDescription>> {
+        Arc::new(Vec::new())
+    }
+
+    fn discrete_input_store() -> Arc<Mutex<DiscreteInputStore>> {
+        Arc::new(Mutex::new(DiscreteInputStore::new()))
+    }
+
+    fn input_registers() -> Arc<Vec<InputRegisterDescription>> {
+        Arc::new(Vec::new())
+    }
+
+    fn input_register_store() -> Arc<Mutex<InputRegisterStore>> {
+        Arc::new(Mutex::new(InputRegisterStore::new()))
+    }
+
     #[tokio::test]
     async fn serves_a_read_request_from_the_current_store_value() {
         let (mut master, server_stream) = tokio::io::duplex(1024);
@@ -167,6 +214,11 @@ mod tests {
             Arc::clone(&store),
             coils(),
             coil_store(),
+            discrete_inputs(),
+            discrete_input_store(),
+            input_registers(),
+            input_register_store(),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
             Duration::from_secs(1),
@@ -208,6 +260,11 @@ mod tests {
             Arc::clone(&store),
             coils(),
             coil_store(),
+            discrete_inputs(),
+            discrete_input_store(),
+            input_registers(),
+            input_register_store(),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
             Duration::from_secs(1),
@@ -255,6 +312,11 @@ mod tests {
             Arc::clone(&store),
             coils(),
             coil_store(),
+            discrete_inputs(),
+            discrete_input_store(),
+            input_registers(),
+            input_register_store(),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
             Duration::from_secs(1),
@@ -304,6 +366,11 @@ mod tests {
             Arc::clone(&store),
             coils(),
             coil_store(),
+            discrete_inputs(),
+            discrete_input_store(),
+            input_registers(),
+            input_register_store(),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
             Duration::from_millis(20),
@@ -346,6 +413,11 @@ mod tests {
             Arc::clone(&store),
             coils(),
             coil_store(),
+            discrete_inputs(),
+            discrete_input_store(),
+            input_registers(),
+            input_register_store(),
+            MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
             Duration::from_millis(20),

@@ -548,6 +548,10 @@ mod tests {
             .set("Tank_Temperature", fuse_fs::RegisterValue::U16(72));
         let coils = Arc::new(Vec::new());
         let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_inputs = Arc::new(Vec::new());
+        let discrete_input_store = Arc::new(Mutex::new(fuse_fs::DiscreteInputStore::new()));
+        let input_registers = Arc::new(Vec::new());
+        let input_register_store = Arc::new(Mutex::new(fuse_fs::InputRegisterStore::new()));
 
         tokio::spawn(async move {
             let (tcp_stream, _peer) = listener.accept().await.unwrap();
@@ -558,6 +562,11 @@ mod tests {
                 store,
                 coils,
                 coil_store,
+                discrete_inputs,
+                discrete_input_store,
+                input_registers,
+                input_register_store,
+                MemLayout::Abcd,
                 MemLayout::Abcd,
                 Arc::new(String::new()),
                 Duration::from_secs(1),
