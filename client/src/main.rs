@@ -53,7 +53,7 @@ use client::connection::Connection;
 use client::device_identification::fetch_device_description;
 use client::polling::run_polling_loop;
 use client::transaction_consumer::run_transaction_consumer;
-use fuse_fs::filesystem::InfusedFilesystem;
+use fuse_fs::filesystem::{InfusedFilesystem, WriteMode};
 use fuse_fs::{CoilStore, DiscreteInputStore, InputRegisterStore, RegisterStore, WriteReport};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::DeviceDescription;
@@ -310,6 +310,7 @@ fn main() {
         // design and fuse_fs::client_trust::ClientTrustState.
         None,
         fuse_permissions,
+        WriteMode::Staged,
     );
     // spawn_mount (not the blocking mount()) so Ctrl+C/SIGTERM below can
     // unmount cleanly instead of just killing the process and leaving a

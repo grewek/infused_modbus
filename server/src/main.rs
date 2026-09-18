@@ -40,7 +40,7 @@
 // over the wire instead of needing its own local copy — see
 // device_identification.rs for the object layout.
 
-use fuse_fs::filesystem::InfusedFilesystem;
+use fuse_fs::filesystem::{InfusedFilesystem, WriteMode};
 use fuse_fs::{CoilStore, DiscreteInputStore, InputRegisterStore, RegisterStore, WriteReport};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::{
@@ -598,6 +598,7 @@ fn main() {
         report,
         Some(client_trust),
         fuse_permissions,
+        WriteMode::Direct,
     );
     // default_permissions makes the kernel actually enforce what getattr
     // reports (see fuse_fs::permissions) instead of every request being

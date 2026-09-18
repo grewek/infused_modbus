@@ -22,7 +22,7 @@
 //
 // Ctrl+C to stop; the kernel unmounts automatically once the process exits.
 
-use fuse_fs::filesystem::InfusedFilesystem;
+use fuse_fs::filesystem::{InfusedFilesystem, WriteMode};
 use fuse_fs::{
     CoilStore, CoilValue, DiscreteInputStore, InputRegisterStore, RegisterStore, RegisterValue,
     StagedValue, WriteReport, WriteStatus,
@@ -165,6 +165,7 @@ fn main() {
         report,
         None,
         fuse_fs::permissions::FusePermissions::default(),
+        WriteMode::Staged,
     );
     let mut config = fuser::Config::default();
     config.mount_options = vec![fuser::MountOption::DefaultPermissions];

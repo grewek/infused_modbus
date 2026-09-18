@@ -19,6 +19,20 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
+/// Distinguishes the two roles `InfusedFilesystem` is shared between — see
+/// CLAUDE.md's "server direct-write model" section. The client has no
+/// authoritative state of its own: a write must round-trip to a real
+/// device, which can fail, so it stages writes via `transactions/`+
+/// `TRANSACTION_END` and confirms them asynchronously. The server's own
+/// state *is* authoritative, so it (once wired up — this variant alone
+/// changes no behavior yet) writes directly into `holding-registers/`/
+/// `coils/` instead, with no staging step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    Staged,
+    Direct,
+}
+
 const ROOT_INO: INodeNo = INodeNo(1);
 const HOLDING_REGISTERS_INO: INodeNo = INodeNo(2);
 const FIRST_REGISTER_INO: u64 = 3;
@@ -141,6 +155,11 @@ pub struct InfusedFilesystem {
     // (see `permissions_for`) — deliberately does not cover `client-trust/`
     // at all (T3 hardcodes that subtree's attrs regardless of this field).
     permissions: FusePermissions,
+    // Not yet consulted anywhere — see `WriteMode`'s own doc comment. Pure
+    // plumbing for now, ahead of the direct-write behavior it will
+    // eventually gate.
+    #[allow(dead_code)]
+    write_mode: WriteMode,
 }
 
 impl InfusedFilesystem {
@@ -159,6 +178,7 @@ impl InfusedFilesystem {
         report: Arc<Mutex<WriteReport>>,
         client_trust: Option<Arc<Mutex<ClientTrustState>>>,
         permissions: FusePermissions,
+        write_mode: WriteMode,
     ) -> Self {
         let name_to_ino = registers
             .iter()
@@ -261,6 +281,7 @@ impl InfusedFilesystem {
             pending_log_ino,
             rejected_log_ino,
             permissions,
+            write_mode,
         }
     }
 
@@ -1522,6 +1543,7 @@ mod tests {
                 report,
                 None,
                 permissions,
+                WriteMode::Staged,
             ),
             receiver,
         )
@@ -1548,6 +1570,7 @@ mod tests {
             report,
             Some(client_trust),
             FusePermissions::default(),
+            WriteMode::Direct,
         )
     }
 
