@@ -127,6 +127,13 @@ fn main() {
                                 ),
                             );
                         }
+                        StagedValue::DiscreteInput(_) | StagedValue::InputRegister(_) => {
+                            // This demo only mounts in WriteMode::Staged, so
+                            // these are never actually produced — see
+                            // fuse_fs::filesystem's "server direct-write
+                            // model" doc comment.
+                            println!("(demo) unreachable in WriteMode::Staged: {name}");
+                        }
                     }
                 }
             }

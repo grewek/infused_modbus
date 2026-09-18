@@ -469,15 +469,19 @@ impl InfusedFilesystem {
         }
     }
 
-    // Whether `ino` is a holding-register/coil file that's directly
-    // writable in the current WriteMode — used by `write`/`release`/
-    // `setattr` to accept a write to `holding-registers/<name>`/
-    // `coils/<name>` alongside the existing `transactions/` staging path.
-    // `false` on the client (WriteMode::Staged) regardless of whether `ino`
-    // names a real register/coil.
+    // Whether `ino` is a holding-register/coil/discrete-input/input-register
+    // file that's directly writable in the current WriteMode — used by
+    // `write`/`release`/`setattr` to accept a write to `holding-registers/
+    // <name>`/`coils/<name>`/`discrete-inputs/<name>`/`input-registers/
+    // <name>` alongside the existing `transactions/` staging path. `false`
+    // on the client (WriteMode::Staged) regardless of whether `ino` names a
+    // real register/coil/discrete-input/input-register.
     fn direct_writable_by_ino(&self, ino: INodeNo) -> bool {
         self.write_mode == WriteMode::Direct
-            && (self.register_by_ino(ino).is_some() || self.coil_by_ino(ino).is_some())
+            && (self.register_by_ino(ino).is_some()
+                || self.coil_by_ino(ino).is_some()
+                || self.discrete_input_by_ino(ino).is_some()
+                || self.input_register_by_ino(ino).is_some())
     }
 
     // `transactions/`+`TRANSACTION_END` only exist in WriteMode::Staged
@@ -888,7 +892,12 @@ impl Filesystem for InfusedFilesystem {
                     let content = self.discrete_input_content(discrete_input);
                     reply.entry(
                         &ATTR_TTL,
-                        &self.file_attr(ino, content.len() as u64, 0o444, req),
+                        &self.file_attr(
+                            ino,
+                            content.len() as u64,
+                            self.writable_data_file_mode(),
+                            req,
+                        ),
                         Generation(0),
                     );
                 }
@@ -910,7 +919,12 @@ impl Filesystem for InfusedFilesystem {
                     let content = self.input_register_content(input_register);
                     reply.entry(
                         &ATTR_TTL,
-                        &self.file_attr(ino, content.len() as u64, 0o444, req),
+                        &self.file_attr(
+                            ino,
+                            content.len() as u64,
+                            self.writable_data_file_mode(),
+                            req,
+                        ),
                         Generation(0),
                     );
                 }
@@ -1046,7 +1060,12 @@ impl Filesystem for InfusedFilesystem {
             let content = self.discrete_input_content(discrete_input);
             reply.attr(
                 &ATTR_TTL,
-                &self.file_attr(ino, content.len() as u64, 0o444, req),
+                &self.file_attr(
+                    ino,
+                    content.len() as u64,
+                    self.writable_data_file_mode(),
+                    req,
+                ),
             );
             return;
         }
@@ -1055,7 +1074,12 @@ impl Filesystem for InfusedFilesystem {
             let content = self.input_register_content(input_register);
             reply.attr(
                 &ATTR_TTL,
-                &self.file_attr(ino, content.len() as u64, 0o444, req),
+                &self.file_attr(
+                    ino,
+                    content.len() as u64,
+                    self.writable_data_file_mode(),
+                    req,
+                ),
             );
             return;
         }
@@ -1130,6 +1154,10 @@ impl Filesystem for InfusedFilesystem {
                 self.register_content(register).len() as u64
             } else if let Some(coil) = self.coil_by_ino(ino) {
                 self.coil_content(coil).len() as u64
+            } else if let Some(discrete_input) = self.discrete_input_by_ino(ino) {
+                self.discrete_input_content(discrete_input).len() as u64
+            } else if let Some(input_register) = self.input_register_by_ino(ino) {
+                self.input_register_content(input_register).len() as u64
             } else {
                 0
             };
@@ -1564,6 +1592,20 @@ impl Filesystem for InfusedFilesystem {
             } else if let Some(coil) = self.coil_by_ino(ino) {
                 Self::parse_coil_value(&text)
                     .map(|value| (coil.name.clone(), StagedValue::Coil(value)))
+            } else if let Some(discrete_input) = self.discrete_input_by_ino(ino) {
+                Self::parse_coil_value(&text).map(|value| {
+                    (
+                        discrete_input.name.clone(),
+                        StagedValue::DiscreteInput(value),
+                    )
+                })
+            } else if let Some(input_register) = self.input_register_by_ino(ino) {
+                Self::parse_register_value(input_register.data_type, &text).map(|value| {
+                    (
+                        input_register.name.clone(),
+                        StagedValue::InputRegister(value),
+                    )
+                })
             } else {
                 None
             };

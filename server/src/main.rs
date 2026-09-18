@@ -477,11 +477,15 @@ fn main() {
 
     let consumer_store = Arc::clone(&store);
     let consumer_coil_store = Arc::clone(&coil_store);
+    let consumer_discrete_input_store = Arc::clone(&discrete_input_store);
+    let consumer_input_register_store = Arc::clone(&input_register_store);
     let consumer_report = Arc::clone(&report);
     std::thread::spawn(move || {
         run_transaction_consumer(
             &consumer_store,
             &consumer_coil_store,
+            &consumer_discrete_input_store,
+            &consumer_input_register_store,
             &consumer_report,
             transaction_receiver,
         );

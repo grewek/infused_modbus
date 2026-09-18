@@ -197,6 +197,12 @@ impl DiscreteInputStore {
 pub enum StagedValue {
     Register(RegisterValue),
     Coil(CoilValue),
+    // Only ever produced by the server's direct-write path (WriteMode::
+    // Direct) — see fuse_fs::filesystem's "server direct-write model" doc
+    // comment. The client never constructs these: it has no write path at
+    // all for discrete inputs/input registers, staged or direct.
+    DiscreteInput(CoilValue),
+    InputRegister(RegisterValue),
 }
 
 impl fmt::Display for StagedValue {
@@ -204,6 +210,8 @@ impl fmt::Display for StagedValue {
         match self {
             StagedValue::Register(value) => write!(formatter, "{value}"),
             StagedValue::Coil(value) => write!(formatter, "{value}"),
+            StagedValue::DiscreteInput(value) => write!(formatter, "{value}"),
+            StagedValue::InputRegister(value) => write!(formatter, "{value}"),
         }
     }
 }
@@ -539,6 +547,22 @@ mod tests {
     #[test]
     fn staged_value_coil_displays_like_the_wrapped_coil_value() {
         assert_eq!(StagedValue::Coil(CoilValue(true)).to_string(), "1");
+    }
+
+    #[test]
+    fn staged_value_discrete_input_displays_like_the_wrapped_coil_value() {
+        assert_eq!(
+            StagedValue::DiscreteInput(CoilValue(false)).to_string(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn staged_value_input_register_displays_like_the_wrapped_register_value() {
+        assert_eq!(
+            StagedValue::InputRegister(RegisterValue::F32(3.5)).to_string(),
+            "3.5"
+        );
     }
 
     #[test]

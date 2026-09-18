@@ -162,6 +162,27 @@ pub fn run_transaction_consumer(
                             .set(name, WriteStatus::Failed(reason));
                     }
                 },
+                // Never actually produced on the client — fuse-fs only
+                // constructs these from its server-only direct-write path
+                // (WriteMode::Direct), and the client always runs
+                // WriteMode::Staged. Handled defensively rather than
+                // assumed unreachable: no Modbus function code lets a
+                // master write either kind at all, so there's nothing to
+                // even attempt.
+                StagedValue::DiscreteInput(_) => {
+                    let reason = format!("discrete input {name}: never writable via Modbus");
+                    report
+                        .lock()
+                        .unwrap()
+                        .set(name, WriteStatus::Failed(reason));
+                }
+                StagedValue::InputRegister(_) => {
+                    let reason = format!("input register {name}: never writable via Modbus");
+                    report
+                        .lock()
+                        .unwrap()
+                        .set(name, WriteStatus::Failed(reason));
+                }
             }
         }
 
