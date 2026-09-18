@@ -1,4 +1,5 @@
 use crate::client_trust::ClientTrustState;
+use crate::permissions::{DirectoryPermissions, FusePermissions};
 use crate::{
     CoilStore, CoilValue, PendingTransaction, RegisterStore, RegisterValue, StagedValue,
     WriteReport,
@@ -121,9 +122,14 @@ pub struct InfusedFilesystem {
     approved_log_ino: INodeNo,
     pending_log_ino: INodeNo,
     rejected_log_ino: INodeNo,
+    // Per-top-level-directory mode/uid/gid from `fuse-permissions.toml`
+    // (see `permissions_for`) — deliberately does not cover `client-trust/`
+    // at all (T3 hardcodes that subtree's attrs regardless of this field).
+    permissions: FusePermissions,
 }
 
 impl InfusedFilesystem {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         registers: Vec<RegisterDescription>,
         coils: Vec<CoilDescription>,
@@ -132,6 +138,7 @@ impl InfusedFilesystem {
         transaction_sender: mpsc::Sender<HashMap<String, StagedValue>>,
         report: Arc<Mutex<WriteReport>>,
         client_trust: Option<Arc<Mutex<ClientTrustState>>>,
+        permissions: FusePermissions,
     ) -> Self {
         let name_to_ino = registers
             .iter()
@@ -201,6 +208,7 @@ impl InfusedFilesystem {
             approved_log_ino,
             pending_log_ino,
             rejected_log_ino,
+            permissions,
         }
     }
 
@@ -294,6 +302,28 @@ impl InfusedFilesystem {
     fn report_coil_by_ino(&self, ino: INodeNo) -> Option<&CoilDescription> {
         let index = ino.0.checked_sub(self.first_coil_report_ino())?;
         self.coils.get(index as usize)
+    }
+
+    // The `fuse-permissions.toml` permissions that apply to `ino`, if it
+    // belongs to one of the 4 configurable subtrees (their own directory
+    // inode, or any file inside it) — `None` for `root`/`client-trust/*`,
+    // which `directory_attr`/`file_attr` fall back to their pre-T2 default
+    // for (client-trust/'s own hardcoded attrs are T3, not this).
+    fn permissions_for(&self, ino: INodeNo) -> Option<DirectoryPermissions> {
+        if ino == HOLDING_REGISTERS_INO || self.register_by_ino(ino).is_some() {
+            Some(self.permissions.holding_registers)
+        } else if ino == self.coils_ino || self.coil_by_ino(ino).is_some() {
+            Some(self.permissions.coils)
+        } else if ino == self.transactions_ino || self.transaction_name_by_ino(ino).is_some() {
+            Some(self.permissions.transactions)
+        } else if ino == self.report_ino
+            || self.report_register_by_ino(ino).is_some()
+            || self.report_coil_by_ino(ino).is_some()
+        {
+            Some(self.permissions.report)
+        } else {
+            None
+        }
     }
 
     fn register_by_name(&self, name: &str) -> Option<&RegisterDescription> {
@@ -418,8 +448,25 @@ impl InfusedFilesystem {
         }
     }
 
+    // `ino`'s owner/group: the configured `fuse-permissions.toml` value if
+    // `ino` belongs to one of the 4 configurable subtrees, otherwise the
+    // pre-T2 fallback (whichever uid/gid is making this particular
+    // request) — covers `root` and `client-trust/*` unchanged, the latter
+    // pending its own hardcoded T3 treatment.
+    fn owner_for(&self, ino: INodeNo, req: &Request) -> (u32, u32) {
+        match self.permissions_for(ino) {
+            Some(permissions) => (permissions.uid, permissions.gid),
+            None => (req.uid(), req.gid()),
+        }
+    }
+
     fn directory_attr(&self, ino: INodeNo, req: &Request) -> FileAttr {
         let now = SystemTime::now();
+        let mode = self
+            .permissions_for(ino)
+            .map(|permissions| permissions.mode)
+            .unwrap_or(0o755);
+        let (uid, gid) = self.owner_for(ino, req);
         FileAttr {
             ino,
             size: 0,
@@ -429,10 +476,10 @@ impl InfusedFilesystem {
             ctime: now,
             crtime: now,
             kind: FileType::Directory,
-            perm: 0o755,
+            perm: mode,
             nlink: 2,
-            uid: req.uid(),
-            gid: req.gid(),
+            uid,
+            gid,
             rdev: 0,
             blksize: 512,
             flags: 0,
@@ -441,6 +488,7 @@ impl InfusedFilesystem {
 
     fn file_attr(&self, ino: INodeNo, size: u64, perm: u16, req: &Request) -> FileAttr {
         let now = SystemTime::now();
+        let (uid, gid) = self.owner_for(ino, req);
         FileAttr {
             ino,
             size,
@@ -452,8 +500,8 @@ impl InfusedFilesystem {
             kind: FileType::RegularFile,
             perm,
             nlink: 1,
-            uid: req.uid(),
-            gid: req.gid(),
+            uid,
+            gid,
             rdev: 0,
             blksize: 512,
             flags: 0,
@@ -1177,6 +1225,15 @@ mod tests {
         InfusedFilesystem,
         mpsc::Receiver<HashMap<String, StagedValue>>,
     ) {
+        test_filesystem_with_permissions(FusePermissions::default())
+    }
+
+    fn test_filesystem_with_permissions(
+        permissions: FusePermissions,
+    ) -> (
+        InfusedFilesystem,
+        mpsc::Receiver<HashMap<String, StagedValue>>,
+    ) {
         let registers = vec![RegisterDescription {
             name: "Stop_Process".to_string(),
             address: 40001,
@@ -1192,7 +1249,16 @@ mod tests {
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, receiver) = mpsc::channel();
         (
-            InfusedFilesystem::new(registers, coils, store, coil_store, sender, report, None),
+            InfusedFilesystem::new(
+                registers,
+                coils,
+                store,
+                coil_store,
+                sender,
+                report,
+                None,
+                permissions,
+            ),
             receiver,
         )
     }
@@ -1211,7 +1277,131 @@ mod tests {
             sender,
             report,
             Some(client_trust),
+            FusePermissions::default(),
         )
+    }
+
+    // Distinct mode/uid/gid per directory so a test asserting on one
+    // directory's permissions can't accidentally pass due to two
+    // directories coincidentally sharing a value.
+    fn distinct_permissions() -> FusePermissions {
+        FusePermissions {
+            holding_registers: DirectoryPermissions {
+                mode: 0o700,
+                uid: 101,
+                gid: 201,
+            },
+            transactions: DirectoryPermissions {
+                mode: 0o710,
+                uid: 102,
+                gid: 202,
+            },
+            report: DirectoryPermissions {
+                mode: 0o720,
+                uid: 103,
+                gid: 203,
+            },
+            coils: DirectoryPermissions {
+                mode: 0o730,
+                uid: 104,
+                gid: 204,
+            },
+        }
+    }
+
+    #[test]
+    fn permissions_for_applies_to_the_holding_registers_directory_and_its_files() {
+        let permissions = distinct_permissions();
+        let (filesystem, _receiver) = test_filesystem_with_permissions(permissions);
+        let register_ino = *filesystem.name_to_ino.get("Stop_Process").unwrap();
+
+        assert_eq!(
+            filesystem.permissions_for(HOLDING_REGISTERS_INO),
+            Some(permissions.holding_registers)
+        );
+        assert_eq!(
+            filesystem.permissions_for(register_ino),
+            Some(permissions.holding_registers)
+        );
+    }
+
+    #[test]
+    fn permissions_for_applies_to_the_coils_directory_and_its_files() {
+        let permissions = distinct_permissions();
+        let (filesystem, _receiver) = test_filesystem_with_permissions(permissions);
+        let coil_ino = *filesystem.coil_name_to_ino.get("Motor_Running").unwrap();
+
+        assert_eq!(
+            filesystem.permissions_for(filesystem.coils_ino),
+            Some(permissions.coils)
+        );
+        assert_eq!(
+            filesystem.permissions_for(coil_ino),
+            Some(permissions.coils)
+        );
+    }
+
+    #[test]
+    fn permissions_for_applies_to_the_transactions_directory_and_a_staged_file() {
+        let permissions = distinct_permissions();
+        let (filesystem, _receiver) = test_filesystem_with_permissions(permissions);
+        let staged_ino = INodeNo(500);
+        filesystem
+            .transactions_lock()
+            .ino_to_name
+            .insert(staged_ino, "Stop_Process".to_string());
+
+        assert_eq!(
+            filesystem.permissions_for(filesystem.transactions_ino),
+            Some(permissions.transactions)
+        );
+        assert_eq!(
+            filesystem.permissions_for(staged_ino),
+            Some(permissions.transactions)
+        );
+    }
+
+    #[test]
+    fn permissions_for_applies_to_the_report_directory_and_its_register_and_coil_files() {
+        let permissions = distinct_permissions();
+        let (filesystem, _receiver) = test_filesystem_with_permissions(permissions);
+        let report_register_ino = INodeNo(filesystem.first_report_ino());
+        let report_coil_ino = INodeNo(filesystem.first_coil_report_ino());
+
+        assert_eq!(
+            filesystem.permissions_for(filesystem.report_ino),
+            Some(permissions.report)
+        );
+        assert_eq!(
+            filesystem.permissions_for(report_register_ino),
+            Some(permissions.report)
+        );
+        assert_eq!(
+            filesystem.permissions_for(report_coil_ino),
+            Some(permissions.report)
+        );
+    }
+
+    #[test]
+    fn permissions_for_returns_none_for_root_and_unrelated_inodes() {
+        let (filesystem, _receiver) = test_filesystem_with_permissions(distinct_permissions());
+
+        assert_eq!(filesystem.permissions_for(ROOT_INO), None);
+        assert_eq!(filesystem.permissions_for(INodeNo(999_999)), None);
+    }
+
+    #[test]
+    fn permissions_for_returns_none_for_client_trust_inodes() {
+        let filesystem = test_filesystem_with_client_trust();
+
+        assert_eq!(
+            filesystem.permissions_for(filesystem.client_trust_ino),
+            None
+        );
+        assert_eq!(
+            filesystem.permissions_for(filesystem.client_trust_approved_ino),
+            None
+        );
     }
 
     #[test]

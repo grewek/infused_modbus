@@ -59,13 +59,35 @@ const ADMIN_SOCKET_PATH: &str = "server-admin.sock";
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: server <mountpoint> <device-description.toml> <connection>\n\
+        "Usage: server <mountpoint> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>]\n\
          <connection> is tcp://<bind-address:port>, tls+tcp://<bind-address:port>, or rtu://<serial-path>:<baud-rate>\n\
+         --fuse-permissions sets custom mode/uid/gid per top-level FUSE directory — \
+         without it, every directory keeps its historical hardcoded behavior.\n\
          \n\
          Usage: server admin approve|revoke <fingerprint>\n\
          Usage: server admin list"
     );
     std::process::exit(1);
+}
+
+/// Pulls `--fuse-permissions <path>` out of `args` if present
+/// (order-independent), leaving the rest of `args` untouched. Absent
+/// entirely, every directory keeps its historical hardcoded behavior
+/// (`FusePermissions::default()`). Extracted before the `admin` subcommand
+/// check, so it's harmless (simply unused) if given alongside `admin`.
+fn extract_fuse_permissions(args: &mut Vec<String>) -> fuse_fs::permissions::FusePermissions {
+    let Some(flag_index) = args.iter().position(|arg| arg == "--fuse-permissions") else {
+        return fuse_fs::permissions::FusePermissions::default();
+    };
+    if flag_index + 1 >= args.len() {
+        panic!("--fuse-permissions requires a path");
+    }
+    args.remove(flag_index);
+    let path = args.remove(flag_index);
+    let toml_source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
+    fuse_fs::permissions::FusePermissions::parse(&toml_source)
+        .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
 }
 
 fn admin_usage() -> ! {
@@ -256,7 +278,9 @@ fn start_serving(
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let fuse_permissions = extract_fuse_permissions(&mut raw_args);
+    let mut args = raw_args.into_iter();
     let Some(first_argument) = args.next() else {
         usage();
     };
@@ -357,8 +381,14 @@ fn main() {
         transaction_sender,
         report,
         Some(client_trust),
+        fuse_permissions,
     );
-    let session = fuser::spawn_mount(filesystem, &mountpoint, &fuser::Config::default())
+    // default_permissions makes the kernel actually enforce what getattr
+    // reports (see fuse_fs::permissions) instead of every request being
+    // allowed regardless of mode/uid/gid.
+    let mut mount_config = fuser::Config::default();
+    mount_config.mount_options = vec![fuser::MountOption::DefaultPermissions];
+    let session = fuser::spawn_mount(filesystem, &mountpoint, &mount_config)
         .unwrap_or_else(|error| panic!("mount failed: {error}"));
 
     runtime.block_on(async {

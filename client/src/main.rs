@@ -14,7 +14,13 @@
 // otherwise fails.
 //
 // Usage:
-//   cargo run -p client -- <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>]
+//   cargo run -p client -- <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>]
+//
+// --fuse-permissions sets custom mode/uid/gid for holding-registers/,
+// transactions/, report/, and coils/ (see fuse_fs::permissions), enforced
+// by the kernel via the `default_permissions` mount option. Without it,
+// every directory keeps its historical hardcoded behavior (mode 0o755,
+// owned by whichever uid/gid made a given FUSE request).
 //
 // <connection> is one of:
 //   tcp://<address:port>                e.g. tcp://127.0.0.1:502
@@ -64,10 +70,12 @@ const DEVICE_DESCRIPTION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: client <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>]\n\
+        "Usage: client <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>]\n\
          <connection> is tcp://<address:port>, tls+tcp://<address:port>, or rtu://<serial-path>:<baud-rate>\n\
          --expect-server-fingerprint pins the server's TLS identity (tls+tcp:// only) — \
-         without it, the server's identity is not verified at all (see CLAUDE.md's TLS design)."
+         without it, the server's identity is not verified at all (see CLAUDE.md's TLS design).\n\
+         --fuse-permissions sets custom mode/uid/gid per top-level FUSE directory — \
+         without it, every directory keeps its historical hardcoded behavior."
     );
     std::process::exit(1);
 }
@@ -89,6 +97,25 @@ fn extract_expected_server_fingerprint(
     Some(value.parse().unwrap_or_else(|error: String| {
         panic!("invalid --expect-server-fingerprint value: {error}")
     }))
+}
+
+/// Pulls `--fuse-permissions <path>` out of `args` if present
+/// (order-independent, same shape as `--expect-server-fingerprint`),
+/// leaving the rest of `args` untouched. Absent entirely, every directory
+/// keeps its historical hardcoded behavior (`FusePermissions::default()`).
+fn extract_fuse_permissions(args: &mut Vec<String>) -> fuse_fs::permissions::FusePermissions {
+    let Some(flag_index) = args.iter().position(|arg| arg == "--fuse-permissions") else {
+        return fuse_fs::permissions::FusePermissions::default();
+    };
+    if flag_index + 1 >= args.len() {
+        panic!("--fuse-permissions requires a path");
+    }
+    args.remove(flag_index);
+    let path = args.remove(flag_index);
+    let toml_source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
+    fuse_fs::permissions::FusePermissions::parse(&toml_source)
+        .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
 }
 
 fn open_connection(
@@ -132,6 +159,7 @@ fn open_connection(
 fn main() {
     let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
     let expected_server_fingerprint = extract_expected_server_fingerprint(&mut raw_args);
+    let fuse_permissions = extract_fuse_permissions(&mut raw_args);
     let mut args = raw_args.into_iter();
     let Some(mountpoint) = args.next() else {
         usage();
@@ -259,11 +287,16 @@ fn main() {
         // client-trust/ only exists on the server — see CLAUDE.md's TLS
         // design and fuse_fs::client_trust::ClientTrustState.
         None,
+        fuse_permissions,
     );
     // spawn_mount (not the blocking mount()) so Ctrl+C/SIGTERM below can
     // unmount cleanly instead of just killing the process and leaving a
-    // stale mountpoint behind.
-    let session = fuser::spawn_mount(filesystem, &mountpoint, &fuser::Config::default())
+    // stale mountpoint behind. default_permissions makes the kernel
+    // actually enforce what getattr reports (see fuse_fs::permissions)
+    // instead of every request being allowed regardless of mode/uid/gid.
+    let mut mount_config = fuser::Config::default();
+    mount_config.mount_options = vec![fuser::MountOption::DefaultPermissions];
+    let session = fuser::spawn_mount(filesystem, &mountpoint, &mount_config)
         .unwrap_or_else(|error| panic!("mount failed: {error}"));
 
     runtime.block_on(async {

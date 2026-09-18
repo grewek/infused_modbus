@@ -151,7 +151,10 @@ fn main() {
         transaction_sender,
         report,
         None,
+        fuse_fs::permissions::FusePermissions::default(),
     );
-    fuser::mount(filesystem, &mountpoint, &fuser::Config::default())
+    let mut config = fuser::Config::default();
+    config.mount_options = vec![fuser::MountOption::DefaultPermissions];
+    fuser::mount(filesystem, &mountpoint, &config)
         .unwrap_or_else(|error| panic!("mount failed: {error}"));
 }
