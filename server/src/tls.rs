@@ -226,6 +226,30 @@ pub fn build_server_config(
         .map_err(|error| error.to_string())
 }
 
+/// Completes a TLS handshake on `stream`, bounded by `timeout` (Milestone
+/// U1) — separate from the per-I/O-step timeout `connection::
+/// serve_tcp_connection` applies once a connection is already serving real
+/// Modbus PDUs. A peer that opens a TCP connection and then never sends a
+/// `ClientHello` (or drags the handshake out deliberately) would otherwise
+/// tie up an accepted connection and its task indefinitely. Returns `None`
+/// uniformly for either a handshake failure (e.g. a peer not actually
+/// speaking TLS) or a timeout — callers already treat both the same way
+/// (drop the connection without taking the server down), so there is
+/// nothing a caller could usefully do differently between the two anyway.
+pub async fn accept_with_timeout<IO>(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: IO,
+    timeout: std::time::Duration,
+) -> Option<tokio_rustls::server::TlsStream<IO>>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(timeout, acceptor.accept(stream))
+        .await
+        .ok()?
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +329,67 @@ mod tests {
         let identity = protocol::tls::generate_self_signed_identity().unwrap();
         let approved = Arc::new(Mutex::new(ApprovedClients::new()));
         assert!(build_server_config(&identity, approved, test_client_trust()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn accept_with_timeout_returns_none_if_the_peer_never_completes_the_handshake() {
+        let identity = protocol::tls::generate_self_signed_identity().unwrap();
+        let server_config = build_server_config(
+            &identity,
+            Arc::new(Mutex::new(ApprovedClients::new())),
+            test_client_trust(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        // Nothing is ever written to this end, so the acceptor never even
+        // receives a ClientHello — the handshake can never complete on its
+        // own, only via the timeout.
+        let (server_side, _never_written_to) = tokio::io::duplex(1024);
+
+        let result =
+            accept_with_timeout(&acceptor, server_side, std::time::Duration::from_millis(20)).await;
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn accept_with_timeout_succeeds_for_a_real_handshake_within_the_timeout() {
+        let identity = protocol::tls::generate_self_signed_identity().unwrap();
+        let client_identity = protocol::tls::generate_self_signed_identity().unwrap();
+        let mut approved_clients = ApprovedClients::new();
+        approved_clients.insert(Fingerprint::of(&client_identity.public_key_der));
+        let server_config = build_server_config(
+            &identity,
+            Arc::new(Mutex::new(approved_clients)),
+            test_client_trust(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+
+        let server_task = tokio::spawn(async move {
+            let (tcp_stream, _peer) = listener.accept().await.unwrap();
+            accept_with_timeout(&acceptor, tcp_stream, std::time::Duration::from_secs(5)).await
+        });
+
+        let client_certificate = CertificateDer::from(client_identity.certificate_der);
+        let client_private_key = PrivateKeyDer::try_from(client_identity.private_key_der).unwrap();
+        let client_config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureAcceptAnyServerCert::new()))
+            .with_client_auth_cert(vec![client_certificate], client_private_key)
+            .unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let tcp_stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+        let _stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp_stream)
+            .await
+            .unwrap();
+
+        assert!(server_task.await.unwrap().is_some());
     }
 
     // `ApprovedFingerprintClientCertVerifier` tests below exercise

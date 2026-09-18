@@ -55,6 +55,13 @@ use tokio::net::TcpListener;
 use tokio_serial::SerialPortBuilderExt;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// Separate from REQUEST_TIMEOUT (Milestone U1): a peer that opens a TCP
+// connection but never completes the TLS handshake (or drags it out
+// deliberately) would otherwise tie up an accepted connection and its
+// spawned task indefinitely — this bounds that specific window, distinct
+// from the per-I/O-step timeout that only starts once a connection is
+// already serving real Modbus PDUs.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_IDENTITY_DIRECTORY: &str = "server-tls-identity";
 const ADMIN_SOCKET_PATH: &str = "server-admin.sock";
 const APPROVED_CLIENTS_PATH: &str = "approved-clients.toml";
@@ -246,11 +253,20 @@ fn start_serving(
                     let toml_source = Arc::clone(&toml_source);
                     let live_connections = Arc::clone(&live_connections);
                     tokio::spawn(async move {
-                        let Ok(stream) = acceptor.accept(tcp_stream).await else {
-                            // A failed handshake (e.g. a peer that isn't
-                            // actually speaking TLS) shouldn't take the whole
-                            // server down, same reasoning as a failed accept
-                            // above.
+                        // Covers both a failed handshake (e.g. a peer that
+                        // isn't actually speaking TLS) and one that never
+                        // completed within TLS_HANDSHAKE_TIMEOUT (Milestone
+                        // U1, e.g. a peer that opens the connection and then
+                        // sends nothing) — neither should take the whole
+                        // server down, same reasoning as a failed accept
+                        // above.
+                        let Some(stream) = server::tls::accept_with_timeout(
+                            &acceptor,
+                            tcp_stream,
+                            TLS_HANDSHAKE_TIMEOUT,
+                        )
+                        .await
+                        else {
                             return;
                         };
                         // mTLS is mandatory (build_server_config), so a
