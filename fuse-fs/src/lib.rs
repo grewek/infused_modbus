@@ -1,5 +1,6 @@
 pub mod client_trust;
 pub mod filesystem;
+pub mod permissions;
 pub mod register_encoding;
 
 use protocol::device_description::DataType;

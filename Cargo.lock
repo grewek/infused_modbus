@@ -204,6 +204,8 @@ dependencies = [
  "fuser",
  "libc",
  "protocol",
+ "serde",
+ "toml",
 ]
 
 [[package]]

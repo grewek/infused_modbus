@@ -7,3 +7,5 @@ edition = "2024"
 protocol = { path = "../protocol" }
 fuser = "0.18"
 libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
