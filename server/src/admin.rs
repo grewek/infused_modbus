@@ -2,16 +2,21 @@
 // technician-facing `server admin approve|revoke|list <fingerprint>` CLI
 // subcommand talks to, so approving/revoking a TLS client never requires
 // speaking the raw protocol by hand (see CLAUDE.md's "Approval/revocation
-// channel"). P1 scope only: the socket listener plus a trivial line
-// protocol (`APPROVE <fingerprint>` / `REVOKE <fingerprint>` / `LIST`)
-// that parses and acknowledges each command. It does not yet mutate
-// `ApprovedClients` (P2) or verify the caller's identity via `SO_PEERCRED`
-// (P3).
+// channel"). APPROVE/REVOKE mutate both `ApprovedClients` (N1, which the
+// real TLS `ClientCertVerifier` consults) and `fuse_fs::client_trust::
+// ClientTrustState` (the read-only `client-trust/approved/` FUSE mirror) —
+// keeping these in sync here is what closes O2's "known gap" note about
+// the two never being wired to the same writer. Still missing:
+// `SO_PEERCRED` verification of the connecting caller (P3), and the
+// `--max-clients` capacity check (Milestone Q).
 
+use crate::client_trust::ApprovedClients;
+use fuse_fs::client_trust::ClientTrustState;
 use protocol::tls::Fingerprint;
 use std::fmt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
@@ -80,15 +85,55 @@ impl AdminCommand {
     }
 }
 
+/// Applies a parsed command's effect and returns the response line (without
+/// a trailing newline). Approving/revoking are idempotent — re-approving an
+/// already-approved fingerprint, or revoking one that was never approved,
+/// is still a success, not an error, matching `ApprovedClients::insert`/
+/// `remove`'s own `bool` "was this newly true" return rather than treating
+/// it as a hard precondition.
+fn apply_command(
+    command: &AdminCommand,
+    approved: &Mutex<ApprovedClients>,
+    client_trust: &Mutex<ClientTrustState>,
+) -> String {
+    match command {
+        AdminCommand::Approve(fingerprint) => {
+            approved.lock().unwrap().insert(*fingerprint);
+            client_trust
+                .lock()
+                .unwrap()
+                .insert_approved(fingerprint.to_string());
+            format!("OK APPROVE {fingerprint}")
+        }
+        AdminCommand::Revoke(fingerprint) => {
+            approved.lock().unwrap().remove(fingerprint);
+            client_trust
+                .lock()
+                .unwrap()
+                .remove_approved(&fingerprint.to_string());
+            format!("OK REVOKE {fingerprint}")
+        }
+        AdminCommand::List => {
+            let fingerprints: Vec<String> = client_trust
+                .lock()
+                .unwrap()
+                .approved_entries()
+                .map(|(fingerprint, _ino)| fingerprint.to_string())
+                .collect();
+            format!("OK LIST {}", fingerprints.join(","))
+        }
+    }
+}
+
 /// Handles one line of admin-protocol input and returns the response line
-/// (without a trailing newline). P1 scope: acknowledges a syntactically
-/// valid command without acting on it yet — mutating `ApprovedClients` is
-/// P2.
-pub fn handle_line(line: &str) -> String {
+/// (without a trailing newline).
+fn handle_line(
+    line: &str,
+    approved: &Mutex<ApprovedClients>,
+    client_trust: &Mutex<ClientTrustState>,
+) -> String {
     match AdminCommand::parse(line.trim_end()) {
-        Ok(AdminCommand::Approve(fingerprint)) => format!("OK APPROVE {fingerprint}"),
-        Ok(AdminCommand::Revoke(fingerprint)) => format!("OK REVOKE {fingerprint}"),
-        Ok(AdminCommand::List) => "OK LIST".to_string(),
+        Ok(command) => apply_command(&command, approved, client_trust),
         Err(error) => format!("ERROR {error}"),
     }
 }
@@ -96,7 +141,11 @@ pub fn handle_line(line: &str) -> String {
 /// Binds the admin socket at `socket_path` (removing any stale leftover
 /// file first, e.g. left behind by an unclean shutdown) and serves the line
 /// protocol above on every connection, forever.
-pub async fn run_admin_socket(socket_path: &Path) -> std::io::Result<()> {
+pub async fn run_admin_socket(
+    socket_path: &Path,
+    approved: Arc<Mutex<ApprovedClients>>,
+    client_trust: Arc<Mutex<ClientTrustState>>,
+) -> std::io::Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(socket_path)?;
     }
@@ -113,11 +162,13 @@ pub async fn run_admin_socket(socket_path: &Path) -> std::io::Result<()> {
             // same reasoning as the Modbus TCP/TLS accept loops in main.rs.
             Err(_) => continue,
         };
+        let approved = Arc::clone(&approved);
+        let client_trust = Arc::clone(&client_trust);
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
             let mut lines = BufReader::new(reader).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let response = handle_line(&line);
+                let response = handle_line(&line, &approved, &client_trust);
                 if writer
                     .write_all(format!("{response}\n").as_bytes())
                     .await
@@ -194,36 +245,114 @@ mod tests {
         assert!(AdminCommand::parse("LIST extra").is_err());
     }
 
+    fn state() -> (Arc<Mutex<ApprovedClients>>, Arc<Mutex<ClientTrustState>>) {
+        (
+            Arc::new(Mutex::new(ApprovedClients::new())),
+            Arc::new(Mutex::new(ClientTrustState::new())),
+        )
+    }
+
     #[test]
-    fn handle_line_acknowledges_approve() {
+    fn handle_line_approve_marks_the_fingerprint_approved_in_both_stores() {
+        let (approved, client_trust) = state();
         let line = format!("APPROVE {}", fingerprint());
-        assert_eq!(handle_line(&line), format!("OK APPROVE {}", fingerprint()));
+
+        let response = handle_line(&line, &approved, &client_trust);
+
+        assert_eq!(response, format!("OK APPROVE {}", fingerprint()));
+        assert!(approved.lock().unwrap().contains(&fingerprint()));
+        assert!(
+            client_trust
+                .lock()
+                .unwrap()
+                .ino_by_fingerprint(&fingerprint().to_string())
+                .is_some()
+        );
     }
 
     #[test]
-    fn handle_line_acknowledges_revoke() {
-        let line = format!("REVOKE {}", fingerprint());
-        assert_eq!(handle_line(&line), format!("OK REVOKE {}", fingerprint()));
+    fn handle_line_approve_is_idempotent() {
+        let (approved, client_trust) = state();
+        let line = format!("APPROVE {}", fingerprint());
+
+        handle_line(&line, &approved, &client_trust);
+        let second_response = handle_line(&line, &approved, &client_trust);
+
+        assert_eq!(second_response, format!("OK APPROVE {}", fingerprint()));
+        assert_eq!(client_trust.lock().unwrap().approved_entries().count(), 1);
     }
 
     #[test]
-    fn handle_line_acknowledges_list() {
-        assert_eq!(handle_line("LIST"), "OK LIST");
+    fn handle_line_revoke_removes_the_fingerprint_from_both_stores() {
+        let (approved, client_trust) = state();
+        handle_line(
+            &format!("APPROVE {}", fingerprint()),
+            &approved,
+            &client_trust,
+        );
+
+        let response = handle_line(
+            &format!("REVOKE {}", fingerprint()),
+            &approved,
+            &client_trust,
+        );
+
+        assert_eq!(response, format!("OK REVOKE {}", fingerprint()));
+        assert!(!approved.lock().unwrap().contains(&fingerprint()));
+        assert!(
+            client_trust
+                .lock()
+                .unwrap()
+                .ino_by_fingerprint(&fingerprint().to_string())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn handle_line_revoke_of_an_unapproved_fingerprint_still_succeeds() {
+        let (approved, client_trust) = state();
+        let response = handle_line(
+            &format!("REVOKE {}", fingerprint()),
+            &approved,
+            &client_trust,
+        );
+        assert_eq!(response, format!("OK REVOKE {}", fingerprint()));
+    }
+
+    #[test]
+    fn handle_line_list_reflects_approved_fingerprints() {
+        let (approved, client_trust) = state();
+        assert_eq!(handle_line("LIST", &approved, &client_trust), "OK LIST ");
+
+        handle_line(
+            &format!("APPROVE {}", fingerprint()),
+            &approved,
+            &client_trust,
+        );
+
+        assert_eq!(
+            handle_line("LIST", &approved, &client_trust),
+            format!("OK LIST {}", fingerprint())
+        );
     }
 
     #[test]
     fn handle_line_reports_a_parse_error() {
-        assert!(handle_line("nonsense").starts_with("ERROR "));
+        let (approved, client_trust) = state();
+        assert!(handle_line("nonsense", &approved, &client_trust).starts_with("ERROR "));
     }
 
     #[tokio::test]
     async fn serves_a_list_command_over_a_real_socket() {
         let temporary_directory = tempfile::tempdir().unwrap();
         let socket_path = temporary_directory.path().join("admin.sock");
+        let (approved, client_trust) = state();
 
         let bound_path = socket_path.clone();
         tokio::spawn(async move {
-            run_admin_socket(&bound_path).await.unwrap();
+            run_admin_socket(&bound_path, approved, client_trust)
+                .await
+                .unwrap();
         });
         // The listener above binds asynchronously; poll for the socket file
         // to exist rather than a fixed sleep, since the exact bind timing
@@ -242,7 +371,41 @@ mod tests {
             .read_line(&mut response)
             .await
             .unwrap();
-        assert_eq!(response, "OK LIST\n");
+        assert_eq!(response, "OK LIST \n");
+    }
+
+    #[tokio::test]
+    async fn approving_over_the_real_socket_is_visible_to_a_later_list() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let socket_path = temporary_directory.path().join("admin.sock");
+        let (approved, client_trust) = state();
+
+        let bound_path = socket_path.clone();
+        tokio::spawn(async move {
+            run_admin_socket(&bound_path, approved, client_trust)
+                .await
+                .unwrap();
+        });
+        while !socket_path.exists() {
+            tokio::task::yield_now().await;
+        }
+
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let mut reader = BufReader::new(&mut stream);
+
+        reader
+            .get_mut()
+            .write_all(format!("APPROVE {}\n", fingerprint()).as_bytes())
+            .await
+            .unwrap();
+        let mut approve_response = String::new();
+        reader.read_line(&mut approve_response).await.unwrap();
+        assert_eq!(approve_response, format!("OK APPROVE {}\n", fingerprint()));
+
+        reader.get_mut().write_all(b"LIST\n").await.unwrap();
+        let mut list_response = String::new();
+        reader.read_line(&mut list_response).await.unwrap();
+        assert_eq!(list_response, format!("OK LIST {}\n", fingerprint()));
     }
 
     #[tokio::test]
@@ -250,10 +413,13 @@ mod tests {
         let temporary_directory = tempfile::tempdir().unwrap();
         let socket_path = temporary_directory.path().join("admin.sock");
         std::fs::write(&socket_path, b"leftover, not a real socket").unwrap();
+        let (approved, client_trust) = state();
 
         let bound_path = socket_path.clone();
         tokio::spawn(async move {
-            run_admin_socket(&bound_path).await.unwrap();
+            run_admin_socket(&bound_path, approved, client_trust)
+                .await
+                .unwrap();
         });
         while UnixStream::connect(&socket_path).await.is_err() {
             tokio::task::yield_now().await;
