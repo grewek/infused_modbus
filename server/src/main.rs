@@ -62,6 +62,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 // from the per-I/O-step timeout that only starts once a connection is
 // already serving real Modbus PDUs.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+// Milestone U2: bounds how many TLS connections (handshaking or already
+// serving) may exist at once, so an attacker opening far more connections
+// than any real deployment would ever need can't exhaust file
+// descriptors/threads by holding them all open simultaneously. Deliberately
+// a fixed constant, not yet CLI-configurable — see U1/U3's own constants
+// for the same precedent. A distributed flood from many source addresses
+// is explicitly out of scope for this application layer (CLAUDE.md).
+const MAX_CONCURRENT_TLS_CONNECTIONS: usize = 100;
 const TLS_IDENTITY_DIRECTORY: &str = "server-tls-identity";
 const ADMIN_SOCKET_PATH: &str = "server-admin.sock";
 const APPROVED_CLIENTS_PATH: &str = "approved-clients.toml";
@@ -239,6 +247,12 @@ fn start_serving(
             let listener = runtime
                 .block_on(TcpListener::bind(&bind_address))
                 .unwrap_or_else(|error| panic!("failed to bind {bind_address}: {error}"));
+            // Milestone U2: one permit per connection, held for its entire
+            // lifetime (handshake + serving), not just the handshake — an
+            // already-authenticated connection still consumes a file
+            // descriptor/task for as long as it stays open.
+            let connection_semaphore =
+                Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TLS_CONNECTIONS));
             runtime.spawn(async move {
                 loop {
                     let (tcp_stream, _peer_address) = match listener.accept().await {
@@ -252,7 +266,22 @@ fn start_serving(
                     let coil_store = Arc::clone(&coil_store);
                     let toml_source = Arc::clone(&toml_source);
                     let live_connections = Arc::clone(&live_connections);
+                    let connection_semaphore = Arc::clone(&connection_semaphore);
                     tokio::spawn(async move {
+                        // At the global concurrent-connection cap: drop
+                        // this connection outright (closing `tcp_stream` by
+                        // letting it go out of scope) rather than queuing
+                        // it — queuing would still let an attacker hold
+                        // arbitrarily many pending sockets open while
+                        // waiting for a permit, defeating the point of a
+                        // hard cap. `_permit`'s scope is this whole async
+                        // block, so it's held for the connection's entire
+                        // lifetime, released automatically once this task
+                        // ends (handshake failure/timeout, normal
+                        // completion, or revocation).
+                        let Ok(_permit) = connection_semaphore.try_acquire_owned() else {
+                            return;
+                        };
                         // Covers both a failed handshake (e.g. a peer that
                         // isn't actually speaking TLS) and one that never
                         // completed within TLS_HANDSHAKE_TIMEOUT (Milestone
