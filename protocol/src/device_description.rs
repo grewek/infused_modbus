@@ -89,6 +89,16 @@ pub struct RegisterDescription {
     pub access: AccessRight,
 }
 
+// Input registers (FC 4) are always read-only per the Modbus spec — no
+// Modbus function code ever lets a master write one, so unlike
+// `RegisterDescription` there is no `access` field to model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputRegisterDescription {
+    pub name: String,
+    pub address: u16,
+    pub data_type: DataType,
+}
+
 // Coils have no `data_type` (always 1 bit) and no `access` (assumed always
 // read/write for now, since that's what the Modbus spec's own coil object
 // is — see CLAUDE.md's FUSE layout section for the reasoning). Both are
@@ -100,14 +110,31 @@ pub struct CoilDescription {
     pub address: u16,
 }
 
+// Discrete inputs (FC 2) are the read-only counterpart to coils: always 1
+// bit, never writable by a Modbus master (same reasoning as
+// `InputRegisterDescription` above) — so, like `CoilDescription`, no
+// `data_type`/`access` fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscreteInputDescription {
+    pub name: String,
+    pub address: u16,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceDescription {
     pub registers: Vec<RegisterDescription>,
     pub coils: Vec<CoilDescription>,
+    pub discrete_inputs: Vec<DiscreteInputDescription>,
+    pub input_registers: Vec<InputRegisterDescription>,
     // Global for the whole device, not per-register: real devices bake
     // their word/byte order into firmware once, not per data point — see
     // MemLayout's own doc comment. Meaningless when `registers` is empty.
     pub mem_layout: MemLayout,
+    // Kept separate from `mem_layout` above rather than shared: nothing
+    // establishes that a device's input registers share the same wire
+    // convention as its holding registers, so each gets its own field.
+    // Meaningless when `input_registers` is empty.
+    pub input_register_mem_layout: MemLayout,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +154,21 @@ struct RawRegisterSection {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawInputRegisterEntry {
+    name: String,
+    offset: u16,
+    data_type: DataType,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawInputRegisterSection {
+    base_address: u16,
+    #[serde(rename = "mem-layout")]
+    mem_layout: MemLayout,
+    entries: Vec<RawInputRegisterEntry>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawCoilEntry {
     name: String,
     offset: u16,
@@ -138,17 +180,34 @@ struct RawCoilSection {
     entries: Vec<RawCoilEntry>,
 }
 
-// `registers`/`coils` are each optional at the top level (default: no
-// entries) so a device that only has one of the two doesn't need to spell
-// out an empty section for the other. Once a section *is* present, though,
-// its own `base_address` stays a required field — see `DeviceDescription`'s
-// existing `parse_rejects_missing_base_address` test.
+#[derive(Debug, Deserialize)]
+struct RawDiscreteInputEntry {
+    name: String,
+    offset: u16,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawDiscreteInputSection {
+    base_address: u16,
+    entries: Vec<RawDiscreteInputEntry>,
+}
+
+// `registers`/`coils`/`discrete-inputs`/`input-registers` are each optional
+// at the top level (default: no entries) so a device that only has some of
+// the four doesn't need to spell out empty sections for the rest. Once a
+// section *is* present, though, its own `base_address` stays a required
+// field — see `DeviceDescription`'s existing `parse_rejects_missing_base_address`
+// test.
 #[derive(Debug, Default, Deserialize)]
 struct RawDeviceDescription {
     #[serde(default)]
     registers: RawRegisterSection,
     #[serde(default)]
     coils: RawCoilSection,
+    #[serde(default, rename = "discrete-inputs")]
+    discrete_inputs: RawDiscreteInputSection,
+    #[serde(default, rename = "input-registers")]
+    input_registers: RawInputRegisterSection,
 }
 
 #[derive(Debug)]
@@ -243,10 +302,42 @@ impl DeviceDescription {
         })
         .collect();
 
+        let input_register_mem_layout = raw.input_registers.mem_layout;
+
+        let input_registers = resolve_addresses(
+            raw.input_registers.base_address,
+            raw.input_registers.entries,
+            |entry: &RawInputRegisterEntry| entry.offset,
+            |entry: &RawInputRegisterEntry| entry.name.clone(),
+        )?
+        .into_iter()
+        .map(|(entry, address)| InputRegisterDescription {
+            name: entry.name,
+            address,
+            data_type: entry.data_type,
+        })
+        .collect();
+
+        let discrete_inputs = resolve_addresses(
+            raw.discrete_inputs.base_address,
+            raw.discrete_inputs.entries,
+            |entry: &RawDiscreteInputEntry| entry.offset,
+            |entry: &RawDiscreteInputEntry| entry.name.clone(),
+        )?
+        .into_iter()
+        .map(|(entry, address)| DiscreteInputDescription {
+            name: entry.name,
+            address,
+        })
+        .collect();
+
         Ok(DeviceDescription {
             registers,
             coils,
+            discrete_inputs,
+            input_registers,
             mem_layout,
+            input_register_mem_layout,
         })
     }
 }
@@ -334,9 +425,180 @@ mod tests {
                         address: 2,
                     },
                 ],
+                discrete_inputs: vec![],
+                input_registers: vec![],
                 mem_layout: MemLayout::Abcd,
+                input_register_mem_layout: MemLayout::Abcd,
             }
         );
+    }
+
+    #[test]
+    fn parse_reads_discrete_inputs_and_input_registers() {
+        let toml_source = r#"
+            [discrete-inputs]
+            base_address = 10000
+
+            [[discrete-inputs.entries]]
+            name = "Door_Open_Sensor"
+            offset = 1
+
+            [[discrete-inputs.entries]]
+            name = "Emergency_Stop_Pressed"
+            offset = 2
+
+            [input-registers]
+            base_address = 30000
+            mem-layout = "cdab"
+
+            [[input-registers.entries]]
+            name = "Flow_Rate"
+            offset = 1
+            data_type = "f32"
+        "#;
+
+        let description = DeviceDescription::parse(toml_source).unwrap();
+
+        assert_eq!(
+            description.discrete_inputs,
+            vec![
+                DiscreteInputDescription {
+                    name: "Door_Open_Sensor".to_string(),
+                    address: 10001,
+                },
+                DiscreteInputDescription {
+                    name: "Emergency_Stop_Pressed".to_string(),
+                    address: 10002,
+                },
+            ]
+        );
+        assert_eq!(
+            description.input_registers,
+            vec![InputRegisterDescription {
+                name: "Flow_Rate".to_string(),
+                address: 30001,
+                data_type: DataType::F32,
+            }]
+        );
+        assert_eq!(description.input_register_mem_layout, MemLayout::Cdab);
+    }
+
+    #[test]
+    fn parse_treats_an_absent_discrete_inputs_section_as_no_discrete_inputs() {
+        let toml_source = r#"
+            [coils]
+            base_address = 0
+
+            [[coils.entries]]
+            name = "Motor_Running"
+            offset = 1
+        "#;
+
+        let description = DeviceDescription::parse(toml_source).unwrap();
+
+        assert!(description.discrete_inputs.is_empty());
+    }
+
+    #[test]
+    fn parse_treats_an_absent_input_registers_section_as_no_input_registers() {
+        let toml_source = r#"
+            [coils]
+            base_address = 0
+
+            [[coils.entries]]
+            name = "Motor_Running"
+            offset = 1
+        "#;
+
+        let description = DeviceDescription::parse(toml_source).unwrap();
+
+        assert!(description.input_registers.is_empty());
+    }
+
+    #[test]
+    fn parse_rejects_discrete_input_missing_base_address() {
+        let toml_source = r#"
+            [[discrete-inputs.entries]]
+            name = "Door_Open_Sensor"
+            offset = 1
+        "#;
+
+        assert!(DeviceDescription::parse(toml_source).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_input_register_missing_base_address() {
+        let toml_source = r#"
+            [[input-registers.entries]]
+            name = "Flow_Rate"
+            offset = 1
+            data_type = "f32"
+        "#;
+
+        assert!(DeviceDescription::parse(toml_source).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_input_register_missing_mem_layout() {
+        let toml_source = r#"
+            [input-registers]
+            base_address = 30000
+
+            [[input-registers.entries]]
+            name = "Flow_Rate"
+            offset = 1
+            data_type = "f32"
+        "#;
+
+        assert!(DeviceDescription::parse(toml_source).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_discrete_input_address_overflow() {
+        let toml_source = r#"
+            [discrete-inputs]
+            base_address = 65535
+
+            [[discrete-inputs.entries]]
+            name = "Door_Open_Sensor"
+            offset = 1
+        "#;
+
+        let error = DeviceDescription::parse(toml_source).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeviceDescriptionError::AddressOverflow {
+                base_address: 65535,
+                offset: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_input_register_address_overflow() {
+        let toml_source = r#"
+            [input-registers]
+            base_address = 65535
+            mem-layout = "abcd"
+
+            [[input-registers.entries]]
+            name = "Flow_Rate"
+            offset = 1
+            data_type = "f32"
+        "#;
+
+        let error = DeviceDescription::parse(toml_source).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeviceDescriptionError::AddressOverflow {
+                base_address: 65535,
+                offset: 1,
+                ..
+            }
+        ));
     }
 
     #[test]
