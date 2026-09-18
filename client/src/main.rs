@@ -226,6 +226,7 @@ fn main() {
     let discrete_inputs = description.discrete_inputs;
     let input_registers = description.input_registers;
     let mem_layout = description.mem_layout;
+    let input_register_mem_layout = description.input_register_mem_layout;
 
     // Shared, not owned outright: the polling loop and the transaction
     // consumer both need to talk to the device over this same connection,
@@ -265,6 +266,10 @@ fn main() {
     let polling_registers = registers.clone();
     let polling_coils = coils.clone();
     let polling_coil_store = Arc::clone(&coil_store);
+    let polling_discrete_inputs = discrete_inputs.clone();
+    let polling_discrete_input_store = Arc::clone(&discrete_input_store);
+    let polling_input_registers = input_registers.clone();
+    let polling_input_register_store = Arc::clone(&input_register_store);
     runtime.spawn(async move {
         run_polling_loop(
             polling_connection,
@@ -272,7 +277,12 @@ fn main() {
             polling_store,
             &polling_coils,
             polling_coil_store,
+            &polling_discrete_inputs,
+            polling_discrete_input_store,
+            &polling_input_registers,
+            polling_input_register_store,
             mem_layout,
+            input_register_mem_layout,
             unit_id,
             poll_interval,
             POLL_TIMEOUT,

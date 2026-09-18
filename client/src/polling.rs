@@ -24,26 +24,36 @@
 use crate::batching::{Batch, build_batches};
 use crate::connection::Connection;
 use fuse_fs::register_encoding::register_value_from_words;
-use fuse_fs::{CoilStore, CoilValue, RegisterStore};
-use protocol::device_description::{CoilDescription, MemLayout, RegisterDescription};
+use fuse_fs::{CoilStore, CoilValue, DiscreteInputStore, InputRegisterStore, RegisterStore};
+use protocol::device_description::{
+    CoilDescription, DiscreteInputDescription, InputRegisterDescription, MemLayout,
+    RegisterDescription,
+};
 use protocol::pdu::{
-    ReadCoilsRequest, ReadCoilsResponse, ReadHoldingRegistersRequest, ReadHoldingRegistersResponse,
+    ReadCoilsRequest, ReadCoilsResponse, ReadDiscreteInputsRequest, ReadDiscreteInputsResponse,
+    ReadHoldingRegistersRequest, ReadHoldingRegistersResponse, ReadInputRegistersRequest,
+    ReadInputRegistersResponse,
 };
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
 // Modbus's own limit on how many registers one Read Holding Registers
-// request may ask for (function code 0x03).
+// (0x03) or Read Input Registers (0x04) request may ask for — the same
+// wire constraint applies identically to both function codes.
 const MAX_READ_BATCH_SIZE: u16 = 125;
 
-// Modbus's own limit on how many coils one Read Coils request may ask for
-// (function code 0x01) — much higher than registers since coils are packed
-// 8-to-a-byte on the wire instead of 2 bytes each.
-const MAX_COIL_READ_BATCH_SIZE: u16 = 2000;
+// Modbus's own limit on how many bits one Read Coils (0x01) or Read
+// Discrete Inputs (0x02) request may ask for — much higher than registers
+// since both pack values 8-to-a-byte on the wire instead of 2 bytes each,
+// and the limit is identical for both function codes (same packed-bit
+// response shape).
+const MAX_PACKED_BIT_READ_BATCH_SIZE: u16 = 2000;
 
 pub type RegisterBatch = Batch<RegisterDescription>;
 pub type CoilBatch = Batch<CoilDescription>;
+pub type DiscreteInputBatch = Batch<DiscreteInputDescription>;
+pub type InputRegisterBatch = Batch<InputRegisterDescription>;
 
 /// Groups `registers` into the fewest Read Holding Registers requests
 /// needed to cover them all, each register counting as its own
@@ -58,6 +68,19 @@ pub fn build_read_batches(registers: &[RegisterDescription]) -> Vec<RegisterBatc
     )
 }
 
+/// Input-register counterpart of `build_read_batches` — same Read Holding
+/// Registers wire limit applies to Read Input Registers too.
+pub fn build_input_register_read_batches(
+    input_registers: &[InputRegisterDescription],
+) -> Vec<InputRegisterBatch> {
+    build_batches(
+        input_registers.to_vec(),
+        |input_register| input_register.address,
+        |input_register| input_register.data_type.register_count(),
+        MAX_READ_BATCH_SIZE,
+    )
+}
+
 /// Coil counterpart of `build_read_batches`, capped at Modbus's much
 /// higher per-request coil limit instead of the register one — every coil
 /// is exactly one wire slot, unlike registers.
@@ -66,7 +89,20 @@ pub fn build_coil_read_batches(coils: &[CoilDescription]) -> Vec<CoilBatch> {
         coils.to_vec(),
         |coil| coil.address,
         |_| 1,
-        MAX_COIL_READ_BATCH_SIZE,
+        MAX_PACKED_BIT_READ_BATCH_SIZE,
+    )
+}
+
+/// Discrete-input counterpart of `build_coil_read_batches` — same Read
+/// Coils wire limit applies to Read Discrete Inputs too.
+pub fn build_discrete_input_read_batches(
+    discrete_inputs: &[DiscreteInputDescription],
+) -> Vec<DiscreteInputBatch> {
+    build_batches(
+        discrete_inputs.to_vec(),
+        |discrete_input| discrete_input.address,
+        |_| 1,
+        MAX_PACKED_BIT_READ_BATCH_SIZE,
     )
 }
 
@@ -117,6 +153,64 @@ pub async fn poll_coils_once(
             Ok(_) | Err(_) => {
                 eprintln!(
                     "poll: unexpected response reading {} coil(s) at {}: {:02X?}",
+                    batch.quantity(),
+                    batch.starting_address,
+                    response_pdu
+                );
+            }
+        }
+    }
+}
+
+/// Discrete-input counterpart of `poll_coils_once`: identical shape, just
+/// backed by DiscreteInputStore and Read Discrete Inputs instead of
+/// CoilStore/Read Coils. No write path exists or is planned on the client
+/// for these (see CLAUDE.md's "read-only Modbus data types" section) — this
+/// is the only way their values ever reach `discrete-inputs/`.
+pub async fn poll_discrete_inputs_once(
+    connection: &Arc<AsyncMutex<Connection>>,
+    batches: &[DiscreteInputBatch],
+    discrete_input_store: &Arc<Mutex<DiscreteInputStore>>,
+    unit_id: u8,
+    timeout: Duration,
+) {
+    for batch in batches {
+        let request_pdu = ReadDiscreteInputsRequest {
+            starting_address: batch.starting_address,
+            quantity: batch.quantity(),
+        }
+        .encode();
+
+        let result = {
+            let mut connection = connection.lock().await;
+            connection.request(unit_id, request_pdu, timeout).await
+        };
+
+        let response_pdu = match result {
+            Ok(response_pdu) => response_pdu,
+            Err(error) => {
+                eprintln!(
+                    "poll: read of {} discrete input(s) at {} failed: {error}",
+                    batch.quantity(),
+                    batch.starting_address
+                );
+                continue;
+            }
+        };
+
+        match ReadDiscreteInputsResponse::decode(&response_pdu) {
+            Ok(decoded) if decoded.discrete_input_values.len() >= batch.items.len() => {
+                let mut discrete_input_store = discrete_input_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                for (discrete_input, value) in batch.items.iter().zip(decoded.discrete_input_values)
+                {
+                    discrete_input_store.set(discrete_input.name.clone(), CoilValue(value));
+                }
+            }
+            Ok(_) | Err(_) => {
+                eprintln!(
+                    "poll: unexpected response reading {} discrete input(s) at {}: {:02X?}",
                     batch.quantity(),
                     batch.starting_address,
                     response_pdu
@@ -191,6 +285,74 @@ pub async fn poll_once(
     }
 }
 
+/// Input-register counterpart of `poll_once`: identical shape, just backed
+/// by InputRegisterStore, Read Input Registers, and its own mem_layout
+/// instead of RegisterStore/Read Holding Registers/the holding-register
+/// mem_layout. No write path exists or is planned on the client for these,
+/// same reasoning as `poll_discrete_inputs_once`.
+pub async fn poll_input_registers_once(
+    connection: &Arc<AsyncMutex<Connection>>,
+    batches: &[InputRegisterBatch],
+    input_register_store: &Arc<Mutex<InputRegisterStore>>,
+    input_register_mem_layout: MemLayout,
+    unit_id: u8,
+    timeout: Duration,
+) {
+    for batch in batches {
+        let request_pdu = ReadInputRegistersRequest {
+            starting_address: batch.starting_address,
+            quantity: batch.quantity(),
+        }
+        .encode();
+
+        let result = {
+            let mut connection = connection.lock().await;
+            connection.request(unit_id, request_pdu, timeout).await
+        };
+
+        let response_pdu = match result {
+            Ok(response_pdu) => response_pdu,
+            Err(error) => {
+                eprintln!(
+                    "poll: read of {} input register(s) at {} failed: {error}",
+                    batch.quantity(),
+                    batch.starting_address
+                );
+                continue;
+            }
+        };
+
+        match ReadInputRegistersResponse::decode(&response_pdu) {
+            Ok(decoded) if decoded.register_values.len() == batch.quantity() as usize => {
+                let mut input_register_store = input_register_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let mut offset = 0usize;
+                for input_register in &batch.items {
+                    let register_count = input_register.data_type.register_count() as usize;
+                    let words = &decoded.register_values[offset..offset + register_count];
+                    if let Some(value) = register_value_from_words(
+                        input_register.data_type,
+                        words,
+                        input_register_mem_layout,
+                    ) {
+                        input_register_store.set(input_register.name.clone(), value);
+                    }
+                    offset += register_count;
+                }
+            }
+            Ok(_) | Err(_) => {
+                eprintln!(
+                    "poll: unexpected response reading {} input register(s) at {}: {:02X?}",
+                    batch.quantity(),
+                    batch.starting_address,
+                    response_pdu
+                );
+            }
+        }
+    }
+}
+
 /// Polls every register and coil batch on a fixed interval, forever —
 /// meant to run as its own tokio task alongside the transaction consumer,
 /// sharing the same connection (`stream`).
@@ -201,13 +363,20 @@ pub async fn run_polling_loop(
     store: Arc<Mutex<RegisterStore>>,
     coils: &[CoilDescription],
     coil_store: Arc<Mutex<CoilStore>>,
+    discrete_inputs: &[DiscreteInputDescription],
+    discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
+    input_registers: &[InputRegisterDescription],
+    input_register_store: Arc<Mutex<InputRegisterStore>>,
     mem_layout: MemLayout,
+    input_register_mem_layout: MemLayout,
     unit_id: u8,
     poll_interval: Duration,
     timeout: Duration,
 ) {
     let register_batches = build_read_batches(registers);
     let coil_batches = build_coil_read_batches(coils);
+    let discrete_input_batches = build_discrete_input_read_batches(discrete_inputs);
+    let input_register_batches = build_input_register_read_batches(input_registers);
     let mut ticker = tokio::time::interval(poll_interval);
     loop {
         ticker.tick().await;
@@ -221,6 +390,23 @@ pub async fn run_polling_loop(
         )
         .await;
         poll_coils_once(&connection, &coil_batches, &coil_store, unit_id, timeout).await;
+        poll_discrete_inputs_once(
+            &connection,
+            &discrete_input_batches,
+            &discrete_input_store,
+            unit_id,
+            timeout,
+        )
+        .await;
+        poll_input_registers_once(
+            &connection,
+            &input_register_batches,
+            &input_register_store,
+            input_register_mem_layout,
+            unit_id,
+            timeout,
+        )
+        .await;
     }
 }
 
@@ -244,6 +430,21 @@ mod tests {
         CoilDescription {
             name: name.to_string(),
             address,
+        }
+    }
+
+    fn discrete_input(name: &str, address: u16) -> DiscreteInputDescription {
+        DiscreteInputDescription {
+            name: name.to_string(),
+            address,
+        }
+    }
+
+    fn input_register(name: &str, address: u16, data_type: DataType) -> InputRegisterDescription {
+        InputRegisterDescription {
+            name: name.to_string(),
+            address,
+            data_type,
         }
     }
 
@@ -354,6 +555,76 @@ mod tests {
         let batches = build_coil_read_batches(&coils);
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].quantity(), 2000);
+        assert_eq!(batches[1].quantity(), 5);
+    }
+
+    #[test]
+    fn contiguous_discrete_inputs_are_grouped_into_one_batch() {
+        let discrete_inputs = vec![
+            discrete_input("A", 1),
+            discrete_input("B", 2),
+            discrete_input("C", 3),
+        ];
+        let batches = build_discrete_input_read_batches(&discrete_inputs);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].starting_address, 1);
+        assert_eq!(batches[0].quantity(), 3);
+    }
+
+    #[test]
+    fn a_gap_in_discrete_input_addresses_starts_a_new_batch() {
+        let discrete_inputs = vec![discrete_input("A", 1), discrete_input("B", 10)];
+        let batches = build_discrete_input_read_batches(&discrete_inputs);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].starting_address, 1);
+        assert_eq!(batches[1].starting_address, 10);
+    }
+
+    #[test]
+    fn a_discrete_input_batch_never_exceeds_the_modbus_read_limit() {
+        let discrete_inputs: Vec<DiscreteInputDescription> = (0..2005)
+            .map(|offset| discrete_input(&format!("D{offset}"), 1 + offset as u16))
+            .collect();
+        let batches = build_discrete_input_read_batches(&discrete_inputs);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].quantity(), 2000);
+        assert_eq!(batches[1].quantity(), 5);
+    }
+
+    #[test]
+    fn contiguous_input_registers_are_grouped_into_one_batch() {
+        let input_registers = vec![
+            input_register("A", 30001, DataType::U16),
+            input_register("B", 30002, DataType::U16),
+        ];
+        let batches = build_input_register_read_batches(&input_registers);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].starting_address, 30001);
+        assert_eq!(batches[0].quantity(), 2);
+    }
+
+    #[test]
+    fn a_gap_in_input_register_addresses_starts_a_new_batch() {
+        let input_registers = vec![
+            input_register("A", 30001, DataType::U16),
+            input_register("B", 30010, DataType::U16),
+        ];
+        let batches = build_input_register_read_batches(&input_registers);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].starting_address, 30001);
+        assert_eq!(batches[1].starting_address, 30010);
+    }
+
+    #[test]
+    fn an_input_register_batch_never_exceeds_the_modbus_read_limit() {
+        let input_registers: Vec<InputRegisterDescription> = (0..130)
+            .map(|offset| {
+                input_register(&format!("R{offset}"), 30001 + offset as u16, DataType::U16)
+            })
+            .collect();
+        let batches = build_input_register_read_batches(&input_registers);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].quantity(), 125);
         assert_eq!(batches[1].quantity(), 5);
     }
 
@@ -526,5 +797,138 @@ mod tests {
         .await;
 
         assert_eq!(coil_store.lock().unwrap().get("A"), None);
+    }
+
+    #[tokio::test]
+    async fn poll_discrete_inputs_once_applies_a_successful_batch_to_the_store() {
+        let (connection, mut device) = connected_pair().await;
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let batches =
+            build_discrete_input_read_batches(&[discrete_input("A", 1), discrete_input("B", 2)]);
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            device.read_exact(&mut header).await.unwrap();
+            let mut pdu = vec![0u8; 5];
+            device.read_exact(&mut pdu).await.unwrap();
+
+            let response_pdu = ReadDiscreteInputsResponse {
+                discrete_input_values: vec![true, false],
+            }
+            .encode();
+            let mut response = header;
+            let length = (response_pdu.len() + 1) as u16;
+            response[4..6].copy_from_slice(&length.to_be_bytes());
+            response.extend_from_slice(&response_pdu);
+            device.write_all(&response).await.unwrap();
+        });
+
+        poll_discrete_inputs_once(
+            &connection,
+            &batches,
+            &discrete_input_store,
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        device_task.await.unwrap();
+        assert_eq!(
+            discrete_input_store.lock().unwrap().get("A"),
+            Some(CoilValue(true))
+        );
+        assert_eq!(
+            discrete_input_store.lock().unwrap().get("B"),
+            Some(CoilValue(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_discrete_inputs_once_leaves_the_store_untouched_when_the_device_times_out() {
+        let (connection, _device) = connected_pair().await;
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let batches = build_discrete_input_read_batches(&[discrete_input("A", 1)]);
+
+        poll_discrete_inputs_once(
+            &connection,
+            &batches,
+            &discrete_input_store,
+            0x01,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert_eq!(discrete_input_store.lock().unwrap().get("A"), None);
+    }
+
+    #[tokio::test]
+    async fn poll_input_registers_once_applies_a_successful_batch_to_the_store() {
+        let (connection, mut device) = connected_pair().await;
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let batches = build_input_register_read_batches(&[
+            input_register("A", 30001, DataType::U16),
+            input_register("B", 30002, DataType::U16),
+        ]);
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            device.read_exact(&mut header).await.unwrap();
+            let mut pdu = vec![0u8; 5];
+            device.read_exact(&mut pdu).await.unwrap();
+
+            let response_pdu = ReadInputRegistersResponse {
+                register_values: vec![11, 22],
+            }
+            .encode();
+            let mut response = header;
+            let length = (response_pdu.len() + 1) as u16;
+            response[4..6].copy_from_slice(&length.to_be_bytes());
+            response.extend_from_slice(&response_pdu);
+            device.write_all(&response).await.unwrap();
+        });
+
+        poll_input_registers_once(
+            &connection,
+            &batches,
+            &input_register_store,
+            MemLayout::Abcd,
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        device_task.await.unwrap();
+        assert_eq!(
+            input_register_store.lock().unwrap().get("A"),
+            Some(RegisterValue::U16(11))
+        );
+        assert_eq!(
+            input_register_store.lock().unwrap().get("B"),
+            Some(RegisterValue::U16(22))
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_input_registers_once_leaves_the_store_untouched_when_the_device_times_out() {
+        let (connection, _device) = connected_pair().await;
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let batches =
+            build_input_register_read_batches(&[input_register("A", 30001, DataType::U16)]);
+
+        poll_input_registers_once(
+            &connection,
+            &batches,
+            &input_register_store,
+            MemLayout::Abcd,
+            0x01,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert_eq!(input_register_store.lock().unwrap().get("A"), None);
     }
 }
