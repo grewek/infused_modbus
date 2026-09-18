@@ -5,6 +5,7 @@ pub const FUNCTION_CODE_READ_DISCRETE_INPUTS: u8 = 0x02;
 pub const FUNCTION_CODE_WRITE_SINGLE_COIL: u8 = 0x05;
 pub const FUNCTION_CODE_WRITE_MULTIPLE_COILS: u8 = 0x0F;
 pub const FUNCTION_CODE_READ_HOLDING_REGISTERS: u8 = 0x03;
+pub const FUNCTION_CODE_READ_INPUT_REGISTERS: u8 = 0x04;
 pub const FUNCTION_CODE_WRITE_SINGLE_REGISTER: u8 = 0x06;
 pub const FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS: u8 = 0x10;
 pub const FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT: u8 = 0x2B;
@@ -110,6 +111,17 @@ pub struct ReadHoldingRegistersRequest {
     pub quantity: u16,
 }
 
+/// Same request shape as [`ReadHoldingRegistersRequest`] — Read Input
+/// Registers is the read-only counterpart of Read Holding Registers,
+/// distinguished only by function code and by addressing a separate
+/// input-register space on the device (same relationship as
+/// [`ReadDiscreteInputsRequest`] is to [`ReadCoilsRequest`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadInputRegistersRequest {
+    pub starting_address: u16,
+    pub quantity: u16,
+}
+
 /// Coil status bits, one `bool` per requested coil. The wire format packs
 /// these 8-to-a-byte (first coil = LSB of the first byte) and always sends
 /// a whole number of bytes, so a response whose coil count isn't a multiple
@@ -134,6 +146,14 @@ pub struct ReadDiscreteInputsResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadHoldingRegistersResponse {
+    pub register_values: Vec<u16>,
+}
+
+/// Same wire encoding as [`ReadHoldingRegistersResponse`] — see
+/// [`ReadInputRegistersRequest`] for why this is a separate type rather
+/// than a shared one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadInputRegistersResponse {
     pub register_values: Vec<u16>,
 }
 
@@ -312,6 +332,34 @@ impl ReadHoldingRegistersRequest {
     }
 }
 
+impl ReadInputRegistersRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(TWO_FIELD_PDU_LEN);
+        buffer.push(FUNCTION_CODE_READ_INPUT_REGISTERS);
+        buffer.extend_from_slice(&self.starting_address.to_be_bytes());
+        buffer.extend_from_slice(&self.quantity.to_be_bytes());
+        buffer
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < TWO_FIELD_PDU_LEN {
+            return Err(DecodeError::TooShort);
+        }
+        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_INPUT_REGISTERS {
+            return Err(DecodeError::UnexpectedFunctionCode {
+                expected: FUNCTION_CODE_READ_INPUT_REGISTERS,
+                actual: bytes[FUNCTION_CODE_BYTE],
+            });
+        }
+        let starting_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
+        let quantity = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
+        Ok(Self {
+            starting_address,
+            quantity,
+        })
+    }
+}
+
 impl ReadCoilsResponse {
     pub fn encode(&self) -> Vec<u8> {
         let byte_count = self.coil_values.len().div_ceil(8);
@@ -404,6 +452,43 @@ impl ReadHoldingRegistersResponse {
         if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_HOLDING_REGISTERS {
             return Err(DecodeError::UnexpectedFunctionCode {
                 expected: FUNCTION_CODE_READ_HOLDING_REGISTERS,
+                actual: bytes[FUNCTION_CODE_BYTE],
+            });
+        }
+        let byte_count = bytes[BYTE_COUNT_BYTE];
+        if !byte_count.is_multiple_of(2) {
+            return Err(DecodeError::OddByteCount { byte_count });
+        }
+        if bytes.len() < RESPONSE_DATA_START + byte_count as usize {
+            return Err(DecodeError::TooShort);
+        }
+        let register_values = bytes
+            [RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count as usize)]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect();
+        Ok(Self { register_values })
+    }
+}
+
+impl ReadInputRegistersResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(RESPONSE_HEADER_LEN + self.register_values.len() * 2);
+        buffer.push(FUNCTION_CODE_READ_INPUT_REGISTERS);
+        buffer.push((self.register_values.len() * 2) as u8);
+        for value in &self.register_values {
+            buffer.extend_from_slice(&value.to_be_bytes());
+        }
+        buffer
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < RESPONSE_HEADER_LEN {
+            return Err(DecodeError::TooShort);
+        }
+        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_INPUT_REGISTERS {
+            return Err(DecodeError::UnexpectedFunctionCode {
+                expected: FUNCTION_CODE_READ_INPUT_REGISTERS,
                 actual: bytes[FUNCTION_CODE_BYTE],
             });
         }
@@ -1126,6 +1211,104 @@ mod tests {
         let bytes = [0x03, 0x03, 0x00, 0x01, 0x00];
         assert_eq!(
             ReadHoldingRegistersResponse::decode(&bytes),
+            Err(DecodeError::OddByteCount { byte_count: 3 })
+        );
+    }
+
+    #[test]
+    fn read_input_registers_request_round_trip() {
+        let request = ReadInputRegistersRequest {
+            starting_address: 0x0001,
+            quantity: 10,
+        };
+        let encoded = request.encode();
+        let decoded = ReadInputRegistersRequest::decode(&encoded).unwrap();
+        assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn read_input_registers_request_encode_produces_expected_bytes() {
+        let request = ReadInputRegistersRequest {
+            starting_address: 0x0001,
+            quantity: 0x0002,
+        };
+        assert_eq!(request.encode(), vec![0x04, 0x00, 0x01, 0x00, 0x02]);
+    }
+
+    #[test]
+    fn read_input_registers_request_decode_rejects_too_short_buffer() {
+        let bytes = [0x04, 0x00, 0x01, 0x00];
+        assert_eq!(
+            ReadInputRegistersRequest::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn read_input_registers_request_decode_rejects_wrong_function_code() {
+        let bytes = [0x03, 0x00, 0x01, 0x00, 0x02];
+        assert_eq!(
+            ReadInputRegistersRequest::decode(&bytes),
+            Err(DecodeError::UnexpectedFunctionCode {
+                expected: 0x04,
+                actual: 0x03
+            })
+        );
+    }
+
+    #[test]
+    fn read_input_registers_response_round_trip() {
+        let response = ReadInputRegistersResponse {
+            register_values: vec![0x0001, 0xBEEF, 0x0000],
+        };
+        let encoded = response.encode();
+        let decoded = ReadInputRegistersResponse::decode(&encoded).unwrap();
+        assert_eq!(response, decoded);
+    }
+
+    #[test]
+    fn read_input_registers_response_encode_produces_expected_bytes() {
+        let response = ReadInputRegistersResponse {
+            register_values: vec![0x0001, 0x0002],
+        };
+        assert_eq!(response.encode(), vec![0x04, 0x04, 0x00, 0x01, 0x00, 0x02]);
+    }
+
+    #[test]
+    fn read_input_registers_response_decode_rejects_too_short_header() {
+        let bytes = [0x04];
+        assert_eq!(
+            ReadInputRegistersResponse::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn read_input_registers_response_decode_rejects_declared_byte_count_exceeding_buffer() {
+        let bytes = [0x04, 0x04, 0x00, 0x01];
+        assert_eq!(
+            ReadInputRegistersResponse::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn read_input_registers_response_decode_rejects_wrong_function_code() {
+        let bytes = [0x03, 0x00];
+        assert_eq!(
+            ReadInputRegistersResponse::decode(&bytes),
+            Err(DecodeError::UnexpectedFunctionCode {
+                expected: 0x04,
+                actual: 0x03
+            })
+        );
+    }
+
+    #[test]
+    fn read_input_registers_response_decode_rejects_odd_byte_count() {
+        let bytes = [0x04, 0x03, 0x00, 0x01, 0x00];
+        assert_eq!(
+            ReadInputRegistersResponse::decode(&bytes),
             Err(DecodeError::OddByteCount { byte_count: 3 })
         );
     }
