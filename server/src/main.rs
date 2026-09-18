@@ -159,6 +159,7 @@ fn start_serving(
     toml_source: Arc<String>,
     client_trust: Arc<Mutex<fuse_fs::client_trust::ClientTrustState>>,
     approved_clients: Arc<Mutex<server::client_trust::ApprovedClients>>,
+    live_connections: Arc<Mutex<server::live_connections::LiveConnections>>,
 ) {
     let target =
         parse_connection_string(connection_string).unwrap_or_else(|error| panic!("{error}"));
@@ -241,6 +242,7 @@ fn start_serving(
                     let coils = Arc::clone(&coils);
                     let coil_store = Arc::clone(&coil_store);
                     let toml_source = Arc::clone(&toml_source);
+                    let live_connections = Arc::clone(&live_connections);
                     tokio::spawn(async move {
                         let Ok(stream) = acceptor.accept(tcp_stream).await else {
                             // A failed handshake (e.g. a peer that isn't
@@ -249,17 +251,54 @@ fn start_serving(
                             // above.
                             return;
                         };
-                        serve_tcp_connection(
-                            stream,
-                            registers,
-                            store,
-                            coils,
-                            coil_store,
-                            mem_layout,
-                            toml_source,
-                            REQUEST_TIMEOUT,
-                        )
-                        .await;
+                        // mTLS is mandatory (build_server_config), so a
+                        // completed handshake always presented and verified
+                        // a client certificate — `None` here would mean
+                        // that invariant broke somehow; served but
+                        // untracked (unrevocable) rather than dropped, same
+                        // "don't take the connection down over this"
+                        // reasoning as the failed-accept/-handshake cases
+                        // above.
+                        let fingerprint = {
+                            let (_io, connection) = stream.get_ref();
+                            server::tls::peer_fingerprint(connection)
+                        };
+                        let Some(fingerprint) = fingerprint else {
+                            serve_tcp_connection(
+                                stream,
+                                registers,
+                                store,
+                                coils,
+                                coil_store,
+                                mem_layout,
+                                toml_source,
+                                REQUEST_TIMEOUT,
+                            )
+                            .await;
+                            return;
+                        };
+                        let (handle, cancelled) =
+                            live_connections.lock().unwrap().register(fingerprint);
+                        tokio::select! {
+                            _ = serve_tcp_connection(
+                                stream,
+                                registers,
+                                store,
+                                coils,
+                                coil_store,
+                                mem_layout,
+                                toml_source,
+                                REQUEST_TIMEOUT,
+                            ) => {}
+                            // Resolves once `server admin revoke` drops this
+                            // connection's sender (Milestone R) — dropping
+                            // `stream` here (as the select branch exits)
+                            // closes the TCP connection, actually
+                            // terminating it rather than just marking it
+                            // revoked somewhere.
+                            _ = cancelled => {}
+                        }
+                        live_connections.lock().unwrap().deregister(handle);
                     });
                 }
             });
@@ -358,6 +397,11 @@ fn main() {
         Some(max_clients) => server::client_trust::ApprovedClients::with_max_clients(max_clients),
         None => server::client_trust::ApprovedClients::new(),
     }));
+    // Shared between the TLS accept loop (which registers/deregisters each
+    // connection as it opens/closes) and the admin socket below (which
+    // calls `revoke` on it) — see Milestone R: `REVOKE` must terminate an
+    // already-open connection, not just block future handshakes.
+    let live_connections = Arc::new(Mutex::new(server::live_connections::LiveConnections::new()));
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");
 
@@ -369,11 +413,13 @@ fn main() {
     runtime.spawn({
         let approved_clients = Arc::clone(&approved_clients);
         let client_trust = Arc::clone(&client_trust);
+        let live_connections = Arc::clone(&live_connections);
         async move {
             if let Err(error) = server::admin::run_admin_socket(
                 Path::new(ADMIN_SOCKET_PATH),
                 approved_clients,
                 client_trust,
+                live_connections,
             )
             .await
             {
@@ -393,6 +439,7 @@ fn main() {
         Arc::new(toml_source.clone()),
         Arc::clone(&client_trust),
         approved_clients,
+        live_connections,
     );
 
     std::fs::create_dir_all(&mountpoint).ok();

@@ -91,6 +91,32 @@ impl ApprovedFingerprintClientCertVerifier {
     }
 }
 
+/// Parses `cert` and computes its public-key fingerprint — shared by
+/// `verify_client_cert` below (during the handshake) and `peer_fingerprint`
+/// (after it, see R2's connection-tracking accept loop in `server::main`),
+/// since both need exactly the same "raw certificate bytes -> `Fingerprint`"
+/// step.
+fn fingerprint_of_certificate(cert: &CertificateDer<'_>) -> Option<Fingerprint> {
+    let parsed = webpki::EndEntityCert::try_from(cert).ok()?;
+    Some(Fingerprint::of(parsed.subject_public_key_info().as_ref()))
+}
+
+/// The client certificate fingerprint of an already-completed handshake —
+/// used by the TLS accept loop (R2) to know which `LiveConnections` entry a
+/// newly-served connection belongs to. `build_server_config` always makes
+/// a client certificate mandatory, so a successfully completed handshake
+/// has always verified and parsed one already; this only re-derives the
+/// same fingerprint from the now-established connection rather than
+/// threading it out of `ApprovedFingerprintClientCertVerifier` by hand.
+/// `None` should therefore never actually happen in practice, but callers
+/// still have to handle it (no certificate at all, or one that somehow
+/// doesn't parse here despite having passed verification).
+pub fn peer_fingerprint(connection: &rustls::ServerConnection) -> Option<Fingerprint> {
+    let certificates = connection.peer_certificates()?;
+    let end_entity = certificates.first()?;
+    fingerprint_of_certificate(end_entity)
+}
+
 impl ClientCertVerifier for ApprovedFingerprintClientCertVerifier {
     // Empty: this server has no CA/trust-anchor concept at all (matches the
     // project's fingerprint-only design), so there is nothing meaningful to
@@ -106,7 +132,7 @@ impl ClientCertVerifier for ApprovedFingerprintClientCertVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, TlsError> {
-        let Ok(parsed) = webpki::EndEntityCert::try_from(end_entity) else {
+        let Some(presented_fingerprint) = fingerprint_of_certificate(end_entity) else {
             // No fingerprint to log here — parsing failed before one could
             // be computed at all, a genuinely different failure mode from
             // "valid certificate, just not approved" (see `log_rejected`'s
@@ -119,7 +145,6 @@ impl ClientCertVerifier for ApprovedFingerprintClientCertVerifier {
                 rustls::CertificateError::BadEncoding,
             ));
         };
-        let presented_fingerprint = Fingerprint::of(parsed.subject_public_key_info().as_ref());
         let is_approved = self
             .approved
             .lock()
@@ -495,6 +520,44 @@ mod tests {
         let mut received = vec![0u8; expected_bytes.len()];
         stream.read_exact(&mut received).await.unwrap();
         assert_eq!(received, expected_bytes);
+    }
+
+    #[tokio::test]
+    async fn peer_fingerprint_returns_the_clients_own_fingerprint_after_a_real_handshake() {
+        let identity = protocol::tls::generate_self_signed_identity().unwrap();
+        let client_identity = protocol::tls::generate_self_signed_identity().unwrap();
+        let client_fingerprint = Fingerprint::of(&client_identity.public_key_der);
+        let mut approved_clients = ApprovedClients::new();
+        approved_clients.insert(client_fingerprint);
+        let approved = Arc::new(Mutex::new(approved_clients));
+        let server_config = build_server_config(&identity, approved, test_client_trust()).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+
+        let server_task = tokio::spawn(async move {
+            let (tcp_stream, _peer) = listener.accept().await.unwrap();
+            let tls_stream = acceptor.accept(tcp_stream).await.unwrap();
+            let (_io, connection) = tls_stream.get_ref();
+            peer_fingerprint(connection)
+        });
+
+        let client_certificate = CertificateDer::from(client_identity.certificate_der);
+        let client_private_key = PrivateKeyDer::try_from(client_identity.private_key_der).unwrap();
+        let client_config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureAcceptAnyServerCert::new()))
+            .with_client_auth_cert(vec![client_certificate], client_private_key)
+            .unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let tcp_stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+        let _stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp_stream)
+            .await
+            .unwrap();
+
+        assert_eq!(server_task.await.unwrap(), Some(client_fingerprint));
     }
 
     #[tokio::test]
