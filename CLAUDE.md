@@ -56,6 +56,145 @@ The mounted filesystem (per client or server instance) exposes at least:
 
 This transactional, filesystem-native interface is the core "twist" of the project — treating Modbus reads/writes as file operations rather than requiring a dedicated client API.
 
+## Planned: server direct-write model, replacing server-side transactions (design resolved 2026-09-18, not yet implemented)
+
+**This revises the server's half of "TRANSACTION_END confirmation semantics" above** — the client's half (staging, `report/`, poll-lag) is unchanged. Nothing in this section exists in code yet; it supersedes currently-shipped server behavior once implemented.
+
+**Why revisit an already-shipped decision:** questioning whether the transactional (`transactions/`+`TRANSACTION_END`) model actually earns its keep on the server surfaced two things on reflection: (1) the model's real justification was always the *client's* round-trip-to-a-real-device axis — stage several edits, commit, confirm asynchronously via `report/` since the write can genuinely fail against real hardware. The server has never had that axis: its own in-memory state is authoritative, a "write" is just a local `store.set()`, there is no device to fail against. It only inherited staging because `fuse-fs` built one shared mechanism for both roles, not because the server independently needed it. (2) Even on the client, staged writes were never wire-atomic — `transaction_consumer` sends one write per register sequentially, not a single bundled PDU — so "staging" was always local UX (assemble related edits, then commit in quick succession, each confirmed independently), never a hard atomicity guarantee. That weakens the case for keeping it server-side even for the "hide a coordinated multi-value change until it's fully applied" argument.
+
+**New server model:** `holding-registers/<name>` and `coils/<name>` become **directly writable on the server only** (still strictly read-only on the client, unchanged) — `echo 5 > holding-registers/Setpoint` applies immediately, no staging step. Implementation-wise this slots into the existing architecture without touching `server::transaction_consumer` at all: a single direct write is handed off over the same `transaction_sender` channel as an implicit one-item transaction, so the consumer side can't tell the difference from today's drained multi-item transactions. `transactions/`/`TRANSACTION_END` are removed from the **server's** FUSE tree entirely (client keeps them exactly as-is).
+
+**Extends directly to FC 2 / FC 4** (see the read-only-register-types section below): once `discrete-inputs/`/`input-registers/` exist, their server-side write path (for whoever locally simulates/feeds those otherwise-device-only values) uses this exact same direct-write, one-item-transaction mechanism — no separate mechanism needed, resolving that design question at the same time.
+
+**Explicitly deferred, not decided here:** whether `report/` still earns its keep on the server once a parse failure can surface synchronously as a real `write()`/`release()` errno instead of today's async, silently-dropped-then-reported failure mode. Revisit once direct-write is actually being implemented, not before.
+
+**Accepted consequence:** this is a breaking change to already-shipped, tested server behavior (Milestones H1–H3's server half), not just an unimplemented schema — deliberate, per this project's established "explicit/simple over preserving existing behavior while nothing is deployed" stance (see the multi-machine schema and `server-options.toml` sections above for the same call made the same day).
+
+## Planned: read-only Modbus data types — Discrete Inputs (FC 2) & Input Registers (FC 4) (design resolved 2026-09-18, not yet implemented)
+
+**TOML schema**, structurally identical to `[coils]`/`[registers]`:
+
+```toml
+[discrete-inputs]
+base_address = 10000
+
+[[discrete-inputs.entries]]
+name = "Door_Open_Sensor"
+offset = 1
+
+[input-registers]
+base_address = 30000
+mem-layout = "abcd"
+
+[[input-registers.entries]]
+name = "Flow_Rate"
+offset = 1
+data_type = "f32"
+```
+
+Discrete inputs mirror `CoilDescription` (`name`+`offset` only, always 1 bit). Input registers mirror `RegisterDescription` minus `access` (always read-only) — still need their own `mem-layout`, since values can span multiple registers exactly like holding registers.
+
+**New stores:** `DiscreteInputStore` (`HashMap<String, bool>`) and an `InputRegisterStore` reusing the existing `RegisterValue` shape — neither exposes a write method to `protocol`/wire code, since no Modbus function code ever lets a master write these; only a local operator (server) or polling (client) ever populates them.
+
+**FUSE:** two new sibling directories, `discrete-inputs/` and `input-registers/`, read-only on both client and server via the same `lookup`/`getattr`/`read`/`readdir` shape `holding-registers/` already has.
+
+**Client:** populated exclusively by polling (same batching approach as `build_read_batches` already uses for holding registers) — no write path exists or is planned on the client, consistent with [[feedback-no-optimistic-writes]] and the fact that these values only ever come from a real device.
+
+**Server:** each configured entry starts at a default (`false`/`0`) until directly written — see the direct-write model above, which also governs these two new directories. A server exposing only the read path (no local writes wired up yet) is already spec-valid and useful on its own — real masters can read it, they'll just see the default until Phase B (the write path) is implemented.
+
+## Planned: custom (vendor-specific) function codes (design resolved 2026-09-18, not yet implemented)
+
+Motivation: real devices sometimes implement genuinely non-standard function codes outside anything the Modbus spec's public FC table covers — the user's own concrete prior experience is an inverter encountered at work with entirely custom FC definitions, which he previously handled in Node-RED via `node-red-contrib-modbus`'s `flex-fc` node (a JSON-driven request/response field-map: `name`/`offset`/`type` per field, loaded from an external file). This section adapts that idea, stricter, for this project. Nothing in this section exists in code yet.
+
+**Scope, for now: vendor-specific FC number range only** (0x41-0x48 / 65-72 and 0x64-0x6E / 100-110, per spec's own user-defined-function reservation) — reinterpreting an existing *standard* FC number (which some real devices, like the inverter, apparently do anyway) is deliberately out of scope for this first pass, revisit later if a real device actually needs it. `function_code` outside this range is a hard parse error.
+
+**Config: new `custom-function-codes.toml`**, one file, `[[custom-function-codes]]` array-of-tables, each with `name`, `function_code`, and nested `[request]`/`[response]` field lists — consolidated into one file/one entry per FC (not separate request/response files, unlike `flex-fc`'s two separate map editors):
+
+```toml
+[[custom-function-codes]]
+name = "InverterStatus"
+function_code = 65
+
+[[custom-function-codes.request.fields]]
+name = "Query_Type"
+data_type = "u8"
+value = 1              # fixed value the client always sends for this field
+
+[[custom-function-codes.response.fields]]
+name = "Frequency"
+data_type = "u16"
+
+[[custom-function-codes.response.fields]]
+name = "Status_Flags"
+data_type = "u8"
+```
+
+**Stricter than `flex-fc` by design:** fields are **sequential and contiguous**, no explicit `offset` — field N+1's position is derived from field N's end, eliminating the whole class of overlapping/gapped/contradictory layouts an offset-per-field scheme like `flex-fc`'s permits. Field types reuse the existing `DataType` enum rather than inventing a narrower one. Not yet resolved: `DataType`'s multi-register byte width (e.g. `u24` occupying two padded 16-bit registers = 4 bytes) is a holding-register-framing convention that doesn't obviously apply to a raw custom-FC byte layout (a real device's `u24` field here might just be 3 raw bytes, no padding) — needs its own byte-width mapping, to be settled once this is actually implemented. Also not yet resolved: whether defining a custom FC here additionally requires enabling it via `server-options.toml`'s `[function-codes]` table for consistency with that section's explicit-opt-in stance, or whether being defined here is itself sufficient.
+
+**Client role (master, always initiates):** builds the request PDU from the request fields' fixed `value`s, decodes the response fields into new read-only FUSE files (`custom/<name>/<field-name>`), refreshed via polling exactly like `holding-registers/` today.
+
+**Server role (never initiates — Modbus stays strictly master-initiated, same constraint noted throughout this file):** dispatch recognizes the configured `function_code`, decodes the incoming request into read-only FUSE files under `custom/<name>/` (showing what was last asked), and the **response fields become directly writable** — reusing the exact "server direct-write model" above unchanged (an operator's write becomes an implicit one-item transaction over the same `transaction_sender` channel), so whatever was last written is what the server replies with on the next matching request. Only new state needed is a `CustomFunctionCodeStore` (keyed by field name, holding `RegisterValue`-shaped data) — no changes to the write-hand-off mechanism itself.
+
+**FUSE layout:** a new top-level `custom/<fc-name>/` directory tree, since this data doesn't fit `holding-registers/`/`coils/`/`discrete-inputs/`/`input-registers/` at all — it isn't Modbus register/coil-addressed data, just named byte fields.
+
+## Planned: multi-machine device description & FUSE layout (design resolved 2026-09-18, not yet implemented)
+
+Motivation: the user's stated direction is for a single `server` (and eventually `client`) instance to manage several machines at once — e.g. one RTU multi-drop link or several TCP targets — from one file, rather than one process per machine. This supersedes the earlier open "Multi-machine TOML schema" question: instead of a discovery-layer-only solution (Milestone V's FC43-directory + FC20-per-machine idea further below), the schema itself now natively describes multiple machines. Nothing in this section exists in code yet.
+
+**Schema: `[[machines]]` array-of-tables**, one entry per machine, each carrying:
+- `name` — a String identifying the machine, used directly as its FUSE top-level directory name. Must be **unique across the file** and restricted to ASCII alphanumeric characters plus `_`/`-` (no other characters, no empty string) — enforced as a parse error, not a runtime surprise, since two machines sharing a name would collide on one FUSE inode and other characters could break path handling.
+- `unit_id` (`u8`) — which Modbus Unit ID on the shared link this machine answers to. This is a deliberate, explicitly-flagged exception to this file's established "TOML describes data shape, CLI/config describes connection" separation (see "Key technical decisions" below): a Unit ID is normally connection/wire-addressing information, but it's needed here to tell multiple machines described in one file apart, so it lives in the device description rather than CLI/config.
+- Nested per machine, structurally identical to today's single-machine sections just moved one level down: `[machines.registers]` (`base_address`, `mem-layout`, `[[machines.registers.entries]]`) and `[machines.coils]` (`base_address`, `[[machines.coils.entries]]`).
+
+This is a **breaking change** to the existing single-machine TOML format (today's top-level `[registers]`/`[coils]` stop being valid) — accepted deliberately, no backward-compatibility shim, since the project isn't deployed anywhere yet.
+
+**FUSE layout:** each machine gets its own top-level directory named after `name`, containing the existing per-machine directory set — `holding-registers/`, `coils/`, and whatever future sibling directories land for other Modbus data types (`discrete-inputs/`, `input-registers/`, ...), plus `transactions/`+`report/` **on the client only** (see "server direct-write model" above — the server writes directly into `holding-registers/<name>`/`coils/<name>` per machine instead) — e.g. `/PumpA/holding-registers/`, `/PumpB/transactions/` (client). The server's `client-trust/` subtree (see the TLS section below) stays exactly where it is at the filesystem root, unaffected — it's about which clients may connect at all, not about any one machine.
+
+**Client mounting scope:** the `client` mounts **all** machines described in its (possibly FC43-fetched) TOML by default — the concrete, simplest case first, per this file's own Extraction-Based Programming convention. Letting the user choose a subset is a real desired feature but the mechanism isn't decided yet; a plain CLI allowlist flag (e.g. `--machines PumpA,PumpB`, all machines mounted if omitted) is the leading candidate, planned as a small additive follow-up once "mount all" works, not built alongside it.
+
+**Unit-ID dispatch — asymmetric client/server effort:** `client/src/connection.rs`'s `Connection::request(unit_id, pdu, timeout)` already takes the Unit ID as a per-call parameter (confirmed 2026-09-18 by reading the code, not assumed) — so per-machine dispatch on the client side is a wiring task (routing each machine's requests through its own `unit_id`), not a protocol change. On the server side, `unit_id` is currently decoded off the incoming ADU only to be echoed back into the response — `handle_request` never receives it at all, so server-side multi-machine routing is real, non-trivial work. This confirms Milestone V1's original scope (below) rather than replacing it.
+
+**Relationship to FC43/FC20 wire transfer (Milestone V below):** the on-disk schema shape (one file, multiple machines) is orthogonal to how it's transferred over the wire at client startup — a single multi-machine TOML could still be served either as one FC43 blob (while it stays under the ~31KB ceiling) or split server-side per machine behind an FC43-directory + FC20-per-machine fetch, independent of the fact that the source file itself is no longer split per machine on disk. Not yet decided which; revisit once FC20 itself (Write/Read File Record) has been discussed.
+
+## Planned: `server-options.toml` — explicit per-function-code opt-in (design resolved 2026-09-18, not yet implemented)
+
+Motivation: the goal is to eventually cover as much of the Modbus function-code space as practical (see the README's function-code support table for the full list and current status), but every function code `server` implements is attack surface it exposes to *any* reachable Modbus master, not just a trusted one — this is a `server`-only concern, since `client` only ever issues function codes it itself chooses to send, never accepts arbitrary incoming ones. This surfaced concretely while discussing FC 21 (Write File Record, 0x15): unlike every other FC implemented so far, a generic file-write primitive is dangerous less because of what it does on the wire and more because of what a server implementation might eventually back "file" with (e.g. if it were ever wired to something interpreted afterward, it becomes a remote config-injection primitive, not just a bad register value) — see the FC 21 discussion this section grew out of. Rather than deciding "implement it or don't" per FC, the resolution is to make *every* FC's availability an explicit technician choice.
+
+**Schema:** a new `server-options.toml`, `[function-codes]` table, one boolean per function code, named after the operation rather than a code number (matches this project's existing snake_case TOML style, e.g. `mem-layout`, `access`):
+
+```toml
+[function-codes]
+read_coils = false                     # 0x01
+read_discrete_inputs = false           # 0x02
+read_holding_registers = false         # 0x03
+read_input_registers = false           # 0x04
+write_single_coil = false              # 0x05
+write_single_register = false          # 0x06
+write_multiple_coils = false           # 0x0F
+write_multiple_registers = false       # 0x10
+report_server_id = false               # 0x11
+read_file_record = false               # 0x14
+write_file_record = false              # 0x15
+mask_write_register = false            # 0x16
+read_write_multiple_registers = false  # 0x17
+read_fifo_queue = false                # 0x18
+read_device_identification = false     # 0x2B / MEI 0x0E (FC 43)
+```
+
+The four out-of-scope serial-diagnostic FCs (0x07/0x08/0x0B/0x0C, see the FUSE/README notes on why they're excluded) never appear here — there's nothing to toggle for a FC that will never be implemented at all.
+
+**Default policy: strict default-deny, explicit over implicit, no legacy exemption (confirmed 2026-09-18).** Every function code — including the ones already fully implemented today (Read/Write Coils, Read/Write Holding Registers, Write Multiple Coils/Registers, FC 43) — defaults to disabled unless its key is present and `true`. This is a deliberate behavior-breaking decision: an existing deployment adopting this feature must list what it actually needs, or the server rejects every single incoming request. Consistent with this project's general stance of accepting breaking changes rather than carrying compatibility shims while nothing is deployed yet (see the multi-machine schema section above for the same call made the same day).
+
+**Unknown keys under `[function-codes]` are a hard parse error**, not silently ignored — same discipline as `fuse-permissions.toml`'s rejection of a `client-trust` key, so a typo doesn't leave a technician wrongly believing a function code is enabled (or disabled).
+
+**CLI wiring:** `--server-options <path>`, optional — analogous to `--fuse-permissions <path>`. If omitted, behaves exactly like a present-but-empty file (everything disabled), not a startup error. Because "the server starts fine but answers nothing" is a real footgun for a forgotten flag, `server` prints a loud startup warning whenever zero function codes end up enabled.
+
+**Wire behavior for a disabled FC:** the server responds with the same `ILLEGAL_FUNCTION` exception already used for a function code that isn't implemented at all — deliberately indistinguishable on the wire, so a remote peer can't fingerprint "implemented but disabled" apart from "never implemented" from the response alone.
+
+**Composes cleanly with FC 43's existing fallback:** disabling `read_device_identification` needs no special-casing — the client's FC 43 fetch already treats every failure mode identically as "fall back to the local TOML", including an `ILLEGAL_FUNCTION` exception, which is exactly what a disabled FC 43 now produces.
+
+**This is what makes FC 21 (Write File Record) implementable at all.** Its risk — a semantically-unscoped write primitive, more dangerous than an ordinary register write once/if "file" ever means something real — is mitigated by requiring an explicit technician opt-in rather than the on-by-default posture every other FC has had until now. No concrete use case for FC 21 exists yet; this mechanism just removes the reason it had to stay categorically out of scope.
+
 ## Planned: TLS transport security & client trust (design resolved 2026-09-17, not yet implemented)
 
 Motivation: Modbus TCP is unencrypted and trivially sniffable. A full CA-based TLS setup was rejected as too much certificate-management burden for a technician just trying to get two devices talking — this design gets real TLS's cryptography without a CA hierarchy, plus a way for a technician to control *which* clients may connect to a `server`. This section is captured ahead of implementation, per this file's own "real design conversation before implementing" convention below — nothing in this section exists in code yet.
