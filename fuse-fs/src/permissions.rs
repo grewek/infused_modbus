@@ -88,8 +88,12 @@ impl From<toml::de::Error> for FusePermissionsError {
 /// The process's own real UID/GID (not the effective or FUSE-caller one) —
 /// the default owner for any directory a technician doesn't explicitly
 /// configure, matching the "owned by the server's own service account"
-/// discipline used elsewhere (TLS private key, admin socket).
-fn real_uid_and_gid() -> (u32, u32) {
+/// discipline used elsewhere (TLS private key, admin socket). `pub(crate)`
+/// so `filesystem::InfusedFilesystem` can reuse it to hardcode
+/// `client-trust/`'s owner too (see its `directory_attr`) — that subtree
+/// is never configurable via `FusePermissions` at all, so it needs this
+/// value directly rather than going through `parse`/`DirectoryPermissions`.
+pub(crate) fn real_uid_and_gid() -> (u32, u32) {
     // SAFETY: getuid()/getgid() take no arguments, perform no memory
     // access, and cannot fail.
     unsafe { (libc::getuid(), libc::getgid()) }

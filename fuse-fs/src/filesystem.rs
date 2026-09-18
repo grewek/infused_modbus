@@ -308,7 +308,9 @@ impl InfusedFilesystem {
     // belongs to one of the 4 configurable subtrees (their own directory
     // inode, or any file inside it) — `None` for `root`/`client-trust/*`,
     // which `directory_attr`/`file_attr` fall back to their pre-T2 default
-    // for (client-trust/'s own hardcoded attrs are T3, not this).
+    // for (client-trust/'s own root directory gets its T3 hardcoded
+    // override instead — see `client_trust_root_attr_override` — since
+    // that subtree can never appear in this schema at all).
     fn permissions_for(&self, ino: INodeNo) -> Option<DirectoryPermissions> {
         if ino == HOLDING_REGISTERS_INO || self.register_by_ino(ino).is_some() {
             Some(self.permissions.holding_registers)
@@ -321,6 +323,25 @@ impl InfusedFilesystem {
             || self.report_coil_by_ino(ino).is_some()
         {
             Some(self.permissions.report)
+        } else {
+            None
+        }
+    }
+
+    // `client-trust/`'s own root directory attrs, hardcoded to maximum
+    // restriction regardless of `fuse-permissions.toml` (CLAUDE.md: that
+    // subtree "cannot appear in this file's schema at all"). Gating just
+    // this one top directory at `0o700`/the server's own real UID+GID is
+    // sufficient to lock the whole subtree down — nothing nested beneath
+    // it (`approved/`, `connection_attempts/`, ...) is reachable by any
+    // other uid regardless of its own reported mode/owner, since traversal
+    // is blocked here first; those nested entries keep their pre-T3
+    // attrs unchanged. `None` for every other ino, including client-trust's
+    // own nested directories/files.
+    fn client_trust_root_attr_override(&self, ino: INodeNo) -> Option<(u16, u32, u32)> {
+        if self.client_trust.is_some() && ino == self.client_trust_ino {
+            let (uid, gid) = crate::permissions::real_uid_and_gid();
+            Some((0o700, uid, gid))
         } else {
             None
         }
@@ -451,8 +472,9 @@ impl InfusedFilesystem {
     // `ino`'s owner/group: the configured `fuse-permissions.toml` value if
     // `ino` belongs to one of the 4 configurable subtrees, otherwise the
     // pre-T2 fallback (whichever uid/gid is making this particular
-    // request) — covers `root` and `client-trust/*` unchanged, the latter
-    // pending its own hardcoded T3 treatment.
+    // request) — covers `root` and every `client-trust/*` ino except its
+    // own root directory (handled separately in `directory_attr`, see
+    // `client_trust_root_attr_override`).
     fn owner_for(&self, ino: INodeNo, req: &Request) -> (u32, u32) {
         match self.permissions_for(ino) {
             Some(permissions) => (permissions.uid, permissions.gid),
@@ -462,11 +484,17 @@ impl InfusedFilesystem {
 
     fn directory_attr(&self, ino: INodeNo, req: &Request) -> FileAttr {
         let now = SystemTime::now();
-        let mode = self
-            .permissions_for(ino)
-            .map(|permissions| permissions.mode)
-            .unwrap_or(0o755);
-        let (uid, gid) = self.owner_for(ino, req);
+        let (mode, uid, gid) = match self.client_trust_root_attr_override(ino) {
+            Some((mode, uid, gid)) => (mode, uid, gid),
+            None => {
+                let mode = self
+                    .permissions_for(ino)
+                    .map(|permissions| permissions.mode)
+                    .unwrap_or(0o755);
+                let (uid, gid) = self.owner_for(ino, req);
+                (mode, uid, gid)
+            }
+        };
         FileAttr {
             ino,
             size: 0,
@@ -1400,6 +1428,54 @@ mod tests {
         );
         assert_eq!(
             filesystem.permissions_for(filesystem.client_trust_approved_ino),
+            None
+        );
+    }
+
+    #[test]
+    fn client_trust_root_attr_override_hardcodes_the_client_trust_root_directory() {
+        let filesystem = test_filesystem_with_client_trust();
+        let (real_uid, real_gid) = crate::permissions::real_uid_and_gid();
+
+        assert_eq!(
+            filesystem.client_trust_root_attr_override(filesystem.client_trust_ino),
+            Some((0o700, real_uid, real_gid))
+        );
+    }
+
+    #[test]
+    fn client_trust_root_attr_override_does_not_apply_to_nested_client_trust_inodes() {
+        let filesystem = test_filesystem_with_client_trust();
+
+        assert_eq!(
+            filesystem.client_trust_root_attr_override(filesystem.client_trust_approved_ino),
+            None
+        );
+        assert_eq!(
+            filesystem.client_trust_root_attr_override(filesystem.connection_attempts_ino),
+            None
+        );
+        assert_eq!(
+            filesystem.client_trust_root_attr_override(filesystem.approved_log_ino),
+            None
+        );
+    }
+
+    #[test]
+    fn client_trust_root_attr_override_does_not_apply_to_unrelated_inodes() {
+        let filesystem = test_filesystem_with_client_trust();
+        assert_eq!(filesystem.client_trust_root_attr_override(ROOT_INO), None);
+    }
+
+    #[test]
+    fn client_trust_root_attr_override_is_none_when_client_trust_is_absent() {
+        let (filesystem, _receiver) = test_filesystem();
+        // On the client (client_trust: None), there is no client-trust/ at
+        // all — even passing this instance's own client_trust_ino value
+        // must never trigger the override, since the directory it would
+        // refer to doesn't actually exist here.
+        assert_eq!(
+            filesystem.client_trust_root_attr_override(filesystem.client_trust_ino),
             None
         );
     }
