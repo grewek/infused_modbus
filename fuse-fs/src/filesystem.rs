@@ -155,10 +155,8 @@ pub struct InfusedFilesystem {
     // (see `permissions_for`) — deliberately does not cover `client-trust/`
     // at all (T3 hardcodes that subtree's attrs regardless of this field).
     permissions: FusePermissions,
-    // Not yet consulted anywhere — see `WriteMode`'s own doc comment. Pure
-    // plumbing for now, ahead of the direct-write behavior it will
-    // eventually gate.
-    #[allow(dead_code)]
+    // See `WriteMode`'s own doc comment — governs whether
+    // `holding-registers/`/`coils/` files are directly writable.
     write_mode: WriteMode,
 }
 
@@ -454,6 +452,30 @@ impl InfusedFilesystem {
         } else {
             None
         }
+    }
+
+    // `holding-registers/`/`coils/` files are read-only on the client
+    // (WriteMode::Staged — writes go through transactions/) but directly
+    // writable on the server (WriteMode::Direct — see CLAUDE.md's "server
+    // direct-write model"). Reported via `getattr`/`lookup` so the kernel's
+    // own `default_permissions` check (which runs before `write` is ever
+    // called) doesn't reject a write the FUSE layer would otherwise accept.
+    fn writable_data_file_mode(&self) -> u16 {
+        match self.write_mode {
+            WriteMode::Direct => 0o644,
+            WriteMode::Staged => 0o444,
+        }
+    }
+
+    // Whether `ino` is a holding-register/coil file that's directly
+    // writable in the current WriteMode — used by `write`/`release`/
+    // `setattr` to accept a write to `holding-registers/<name>`/
+    // `coils/<name>` alongside the existing `transactions/` staging path.
+    // `false` on the client (WriteMode::Staged) regardless of whether `ino`
+    // names a real register/coil.
+    fn direct_writable_by_ino(&self, ino: INodeNo) -> bool {
+        self.write_mode == WriteMode::Direct
+            && (self.register_by_ino(ino).is_some() || self.coil_by_ino(ino).is_some())
     }
 
     fn register_by_name(&self, name: &str) -> Option<&RegisterDescription> {
@@ -801,7 +823,12 @@ impl Filesystem for InfusedFilesystem {
                     let content = self.register_content(register);
                     reply.entry(
                         &ATTR_TTL,
-                        &self.file_attr(ino, content.len() as u64, 0o444, req),
+                        &self.file_attr(
+                            ino,
+                            content.len() as u64,
+                            self.writable_data_file_mode(),
+                            req,
+                        ),
                         Generation(0),
                     );
                 }
@@ -820,7 +847,12 @@ impl Filesystem for InfusedFilesystem {
                     let content = self.coil_content(coil);
                     reply.entry(
                         &ATTR_TTL,
-                        &self.file_attr(ino, content.len() as u64, 0o444, req),
+                        &self.file_attr(
+                            ino,
+                            content.len() as u64,
+                            self.writable_data_file_mode(),
+                            req,
+                        ),
                         Generation(0),
                     );
                 }
@@ -972,7 +1004,12 @@ impl Filesystem for InfusedFilesystem {
             let content = self.register_content(register);
             reply.attr(
                 &ATTR_TTL,
-                &self.file_attr(ino, content.len() as u64, 0o444, req),
+                &self.file_attr(
+                    ino,
+                    content.len() as u64,
+                    self.writable_data_file_mode(),
+                    req,
+                ),
             );
             return;
         }
@@ -981,7 +1018,12 @@ impl Filesystem for InfusedFilesystem {
             let content = self.coil_content(coil);
             reply.attr(
                 &ATTR_TTL,
-                &self.file_attr(ino, content.len() as u64, 0o444, req),
+                &self.file_attr(
+                    ino,
+                    content.len() as u64,
+                    self.writable_data_file_mode(),
+                    req,
+                ),
             );
             return;
         }
@@ -1052,12 +1094,13 @@ impl Filesystem for InfusedFilesystem {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        // Only meaningful case here: `> transactions/Foo` truncating an
-        // already-staged file before writing its new value (O_CREAT on an
-        // existing name goes through open+setattr, not create). There's no
-        // real backing buffer to shrink — the next `write` replaces the
-        // staged value outright — so this just has to succeed and report
-        // an attr back.
+        // Only meaningful case here: `> transactions/Foo` (or, in
+        // WriteMode::Direct, `> holding-registers/Foo`/`> coils/Foo`)
+        // truncating an existing file before writing its new value
+        // (O_CREAT on an existing name goes through open+setattr, not
+        // create). There's no real backing buffer to shrink — the next
+        // `write` replaces the value outright — so this just has to
+        // succeed and report an attr back.
         let name = self.transaction_name_by_ino(ino);
         if ino == self.transactions_ino || name.is_some() {
             let content_len = name
@@ -1065,6 +1108,22 @@ impl Filesystem for InfusedFilesystem {
                 .unwrap_or(0);
             let reported_size = size.unwrap_or(content_len);
             reply.attr(&ATTR_TTL, &self.file_attr(ino, reported_size, 0o644, req));
+            return;
+        }
+
+        if self.direct_writable_by_ino(ino) {
+            let content_len = if let Some(register) = self.register_by_ino(ino) {
+                self.register_content(register).len() as u64
+            } else if let Some(coil) = self.coil_by_ino(ino) {
+                self.coil_content(coil).len() as u64
+            } else {
+                0
+            };
+            let reported_size = size.unwrap_or(content_len);
+            reply.attr(
+                &ATTR_TTL,
+                &self.file_attr(ino, reported_size, self.writable_data_file_mode(), req),
+            );
             return;
         }
 
@@ -1418,7 +1477,7 @@ impl Filesystem for InfusedFilesystem {
         reply: ReplyWrite,
     ) {
         let mut state = self.transactions_lock();
-        if !state.ino_to_name.contains_key(&ino) {
+        if !state.ino_to_name.contains_key(&ino) && !self.direct_writable_by_ino(ino) {
             reply.error(Errno::ENOENT);
             return;
         }
@@ -1467,7 +1526,41 @@ impl Filesystem for InfusedFilesystem {
             if let Some(staged) = staged {
                 state.pending.stage(name, staged);
             }
+            drop(state);
+            reply.ok();
+            return;
         }
+
+        // WriteMode::Direct: `holding-registers/<name>`/`coils/<name>`
+        // written directly, not staged. Sent as an implicit one-item
+        // transaction over the same `transaction_sender` channel
+        // `commit_transaction` already uses — the receiving consumer can't
+        // tell the difference from a drained multi-item transaction, so it
+        // needs no changes, and every write to `store`/`coil_store` keeps
+        // going through that one consumer thread regardless of how it was
+        // triggered (see CLAUDE.md's "server direct-write model" for why
+        // that's what keeps this race-free).
+        if self.direct_writable_by_ino(ino)
+            && let Some(buffer) = state.buffers.remove(&ino)
+            && let Ok(text) = String::from_utf8(buffer)
+        {
+            let direct = if let Some(register) = self.register_by_ino(ino) {
+                Self::parse_register_value(register.data_type, &text)
+                    .map(|value| (register.name.clone(), StagedValue::Register(value)))
+            } else if let Some(coil) = self.coil_by_ino(ino) {
+                Self::parse_coil_value(&text)
+                    .map(|value| (coil.name.clone(), StagedValue::Coil(value)))
+            } else {
+                None
+            };
+            drop(state);
+            if let Some((name, value)) = direct {
+                let _ = self.transaction_sender.send(HashMap::from([(name, value)]));
+            }
+            reply.ok();
+            return;
+        }
+        drop(state);
         reply.ok();
     }
 
@@ -1513,6 +1606,16 @@ mod tests {
         InfusedFilesystem,
         mpsc::Receiver<HashMap<String, StagedValue>>,
     ) {
+        test_filesystem_with_permissions_and_write_mode(permissions, WriteMode::Staged)
+    }
+
+    fn test_filesystem_with_permissions_and_write_mode(
+        permissions: FusePermissions,
+        write_mode: WriteMode,
+    ) -> (
+        InfusedFilesystem,
+        mpsc::Receiver<HashMap<String, StagedValue>>,
+    ) {
         let registers = vec![RegisterDescription {
             name: "Stop_Process".to_string(),
             address: 40001,
@@ -1543,7 +1646,7 @@ mod tests {
                 report,
                 None,
                 permissions,
-                WriteMode::Staged,
+                write_mode,
             ),
             receiver,
         )
@@ -1673,6 +1776,64 @@ mod tests {
             filesystem.permissions_for(report_coil_ino),
             Some(permissions.report)
         );
+    }
+
+    #[test]
+    fn writable_data_file_mode_is_read_only_when_staged() {
+        let (filesystem, _receiver) = test_filesystem_with_permissions_and_write_mode(
+            FusePermissions::default(),
+            WriteMode::Staged,
+        );
+        assert_eq!(filesystem.writable_data_file_mode(), 0o444);
+    }
+
+    #[test]
+    fn writable_data_file_mode_is_writable_when_direct() {
+        let (filesystem, _receiver) = test_filesystem_with_permissions_and_write_mode(
+            FusePermissions::default(),
+            WriteMode::Direct,
+        );
+        assert_eq!(filesystem.writable_data_file_mode(), 0o644);
+    }
+
+    #[test]
+    fn direct_writable_by_ino_is_true_for_a_register_in_direct_mode() {
+        let (filesystem, _receiver) = test_filesystem_with_permissions_and_write_mode(
+            FusePermissions::default(),
+            WriteMode::Direct,
+        );
+        let register_ino = *filesystem.name_to_ino.get("Stop_Process").unwrap();
+        assert!(filesystem.direct_writable_by_ino(register_ino));
+    }
+
+    #[test]
+    fn direct_writable_by_ino_is_true_for_a_coil_in_direct_mode() {
+        let (filesystem, _receiver) = test_filesystem_with_permissions_and_write_mode(
+            FusePermissions::default(),
+            WriteMode::Direct,
+        );
+        let coil_ino = *filesystem.coil_name_to_ino.get("Motor_Running").unwrap();
+        assert!(filesystem.direct_writable_by_ino(coil_ino));
+    }
+
+    #[test]
+    fn direct_writable_by_ino_is_false_in_staged_mode() {
+        let (filesystem, _receiver) = test_filesystem_with_permissions_and_write_mode(
+            FusePermissions::default(),
+            WriteMode::Staged,
+        );
+        let register_ino = *filesystem.name_to_ino.get("Stop_Process").unwrap();
+        assert!(!filesystem.direct_writable_by_ino(register_ino));
+    }
+
+    #[test]
+    fn direct_writable_by_ino_is_false_for_an_unrelated_ino() {
+        let (filesystem, _receiver) = test_filesystem_with_permissions_and_write_mode(
+            FusePermissions::default(),
+            WriteMode::Direct,
+        );
+        assert!(!filesystem.direct_writable_by_ino(ROOT_INO));
+        assert!(!filesystem.direct_writable_by_ino(filesystem.transactions_ino));
     }
 
     #[test]
