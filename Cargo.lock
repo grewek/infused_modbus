@@ -780,6 +780,7 @@ dependencies = [
  "protocol",
  "rustls",
  "rustls-webpki",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-serial",
