@@ -423,7 +423,9 @@ impl InfusedFilesystem {
             Some(self.permissions.holding_registers)
         } else if ino == self.coils_ino || self.coil_by_ino(ino).is_some() {
             Some(self.permissions.coils)
-        } else if ino == self.transactions_ino || self.transaction_name_by_ino(ino).is_some() {
+        } else if self.transactions_enabled()
+            && (ino == self.transactions_ino || self.transaction_name_by_ino(ino).is_some())
+        {
             Some(self.permissions.transactions)
         } else if ino == self.report_ino
             || self.report_register_by_ino(ino).is_some()
@@ -476,6 +478,18 @@ impl InfusedFilesystem {
     fn direct_writable_by_ino(&self, ino: INodeNo) -> bool {
         self.write_mode == WriteMode::Direct
             && (self.register_by_ino(ino).is_some() || self.coil_by_ino(ino).is_some())
+    }
+
+    // `transactions/`+`TRANSACTION_END` only exist in WriteMode::Staged
+    // (the client) — the server writes directly into `holding-registers/`/
+    // `coils/` instead (see `direct_writable_by_ino`), so it has no use for
+    // a staging directory at all. `transactions_ino` itself is still always
+    // computed the same way regardless of mode (same precedent as
+    // `client_trust_ino`, which is always computed but only exposed when
+    // `client_trust.is_some()`), so this is the single place that decides
+    // whether it's ever actually reachable.
+    fn transactions_enabled(&self) -> bool {
+        self.write_mode == WriteMode::Staged
     }
 
     fn register_by_name(&self, name: &str) -> Option<&RegisterDescription> {
@@ -714,7 +728,7 @@ impl Filesystem for InfusedFilesystem {
                         Generation(0),
                     );
                 }
-                Some("transactions") => {
+                Some("transactions") if self.transactions_enabled() => {
                     reply.entry(
                         &ATTR_TTL,
                         &self.directory_attr(self.transactions_ino, req),
@@ -905,7 +919,7 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
-        if parent == self.transactions_ino {
+        if parent == self.transactions_ino && self.transactions_enabled() {
             let Some(name) = name.to_str() else {
                 reply.error(Errno::ENOENT);
                 return;
@@ -965,7 +979,7 @@ impl Filesystem for InfusedFilesystem {
             || ino == self.coils_ino
             || ino == self.discrete_inputs_ino
             || ino == self.input_registers_ino
-            || ino == self.transactions_ino
+            || (ino == self.transactions_ino && self.transactions_enabled())
             || ino == self.report_ino
             || (ino == self.client_trust_ino && self.client_trust.is_some())
             || (ino == self.client_trust_approved_ino && self.client_trust.is_some())
@@ -1102,7 +1116,7 @@ impl Filesystem for InfusedFilesystem {
         // `write` replaces the value outright — so this just has to
         // succeed and report an attr back.
         let name = self.transaction_name_by_ino(ino);
-        if ino == self.transactions_ino || name.is_some() {
+        if (ino == self.transactions_ino && self.transactions_enabled()) || name.is_some() {
             let content_len = name
                 .map(|name| self.transaction_content(&name).len() as u64)
                 .unwrap_or(0);
@@ -1231,14 +1245,14 @@ impl Filesystem for InfusedFilesystem {
                     FileType::Directory,
                     "input-registers".to_string(),
                 ),
-                (
-                    self.transactions_ino,
-                    FileType::Directory,
-                    "transactions".to_string(),
-                ),
                 (self.report_ino, FileType::Directory, "report".to_string()),
             ]
             .into_iter()
+            .chain(self.transactions_enabled().then_some((
+                self.transactions_ino,
+                FileType::Directory,
+                "transactions".to_string(),
+            )))
             .chain(self.client_trust.is_some().then_some((
                 self.client_trust_ino,
                 FileType::Directory,
@@ -1355,7 +1369,7 @@ impl Filesystem for InfusedFilesystem {
                 ));
             }
             entries
-        } else if ino == self.transactions_ino {
+        } else if ino == self.transactions_ino && self.transactions_enabled() {
             let mut entries = vec![
                 (self.transactions_ino, FileType::Directory, ".".to_string()),
                 (ROOT_INO, FileType::Directory, "..".to_string()),
@@ -1405,7 +1419,7 @@ impl Filesystem for InfusedFilesystem {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        if parent != self.transactions_ino {
+        if parent != self.transactions_ino || !self.transactions_enabled() {
             reply.error(Errno::EPERM);
             return;
         }
@@ -1565,7 +1579,7 @@ impl Filesystem for InfusedFilesystem {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        if parent != self.transactions_ino {
+        if parent != self.transactions_ino || !self.transactions_enabled() {
             reply.error(Errno::ENOENT);
             return;
         }
@@ -1834,6 +1848,24 @@ mod tests {
         );
         assert!(!filesystem.direct_writable_by_ino(ROOT_INO));
         assert!(!filesystem.direct_writable_by_ino(filesystem.transactions_ino));
+    }
+
+    #[test]
+    fn transactions_enabled_is_true_when_staged() {
+        let (filesystem, _receiver) = test_filesystem_with_permissions_and_write_mode(
+            FusePermissions::default(),
+            WriteMode::Staged,
+        );
+        assert!(filesystem.transactions_enabled());
+    }
+
+    #[test]
+    fn transactions_enabled_is_false_when_direct() {
+        let (filesystem, _receiver) = test_filesystem_with_permissions_and_write_mode(
+            FusePermissions::default(),
+            WriteMode::Direct,
+        );
+        assert!(!filesystem.transactions_enabled());
     }
 
     #[test]
