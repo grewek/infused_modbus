@@ -59,10 +59,12 @@ const ADMIN_SOCKET_PATH: &str = "server-admin.sock";
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: server <mountpoint> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>]\n\
+        "Usage: server <mountpoint> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>]\n\
          <connection> is tcp://<bind-address:port>, tls+tcp://<bind-address:port>, or rtu://<serial-path>:<baud-rate>\n\
          --fuse-permissions sets custom mode/uid/gid per top-level FUSE directory — \
          without it, every directory keeps its historical hardcoded behavior.\n\
+         --max-clients bounds how many TLS client fingerprints can be approved at once \
+         (tls+tcp:// only) — without it, there is no limit.\n\
          \n\
          Usage: server admin approve|revoke <fingerprint>\n\
          Usage: server admin list"
@@ -88,6 +90,24 @@ fn extract_fuse_permissions(args: &mut Vec<String>) -> fuse_fs::permissions::Fus
         .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
     fuse_fs::permissions::FusePermissions::parse(&toml_source)
         .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
+}
+
+/// Pulls `--max-clients <n>` out of `args` if present (order-independent,
+/// same shape as `--fuse-permissions`), leaving the rest of `args`
+/// untouched. Absent entirely, `None` means unlimited — matches every
+/// pre-Q server's behavior exactly (see `ApprovedClients::new`).
+fn extract_max_clients(args: &mut Vec<String>) -> Option<usize> {
+    let flag_index = args.iter().position(|arg| arg == "--max-clients")?;
+    if flag_index + 1 >= args.len() {
+        panic!("--max-clients requires a value");
+    }
+    args.remove(flag_index);
+    let value = args.remove(flag_index);
+    Some(
+        value
+            .parse()
+            .unwrap_or_else(|error| panic!("invalid --max-clients value {value:?}: {error}")),
+    )
 }
 
 fn admin_usage() -> ! {
@@ -280,6 +300,7 @@ fn start_serving(
 fn main() {
     let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
     let fuse_permissions = extract_fuse_permissions(&mut raw_args);
+    let max_clients = extract_max_clients(&mut raw_args);
     let mut args = raw_args.into_iter();
     let Some(first_argument) = args.next() else {
         usage();
@@ -331,8 +352,12 @@ fn main() {
     // the admin socket below (which is the only thing that ever mutates
     // it) — same one-writer-per-piece-of-state precedent as `client_trust`
     // just above. Starts empty on every run; not persisted yet (Milestone
-    // S).
-    let approved_clients = Arc::new(Mutex::new(server::client_trust::ApprovedClients::new()));
+    // S). `--max-clients` (Milestone Q) is stored here too (Q1 scope: not
+    // yet enforced by `insert` — that's Q2).
+    let approved_clients = Arc::new(Mutex::new(match max_clients {
+        Some(max_clients) => server::client_trust::ApprovedClients::with_max_clients(max_clients),
+        None => server::client_trust::ApprovedClients::new(),
+    }));
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");
 

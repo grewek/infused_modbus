@@ -13,11 +13,32 @@ use std::collections::HashSet;
 #[derive(Debug, Default)]
 pub struct ApprovedClients {
     fingerprints: HashSet<Fingerprint>,
+    // `--max-clients` (Milestone Q): bounds the number of *currently
+    // valid* approved fingerprints at once, not total approvals ever
+    // granted — revoking one frees the slot for a new approval (Q3).
+    // `None` (the `Default`/`new()` case) means unlimited, matching every
+    // pre-Q server's behavior exactly. Q1 scope only: stored and queryable
+    // via `is_at_capacity`, not yet consulted by `insert` — that's Q2.
+    max_clients: Option<usize>,
 }
 
 impl ApprovedClients {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_max_clients(max_clients: usize) -> Self {
+        Self {
+            max_clients: Some(max_clients),
+            ..Self::default()
+        }
+    }
+
+    /// Whether the approved set currently holds `max_clients` (if any)
+    /// entries already — always `false` when unlimited (`new()`).
+    pub fn is_at_capacity(&self) -> bool {
+        self.max_clients
+            .is_some_and(|max_clients| self.fingerprints.len() >= max_clients)
     }
 
     /// Returns whether `fingerprint` was newly inserted (`false` if it was
@@ -90,5 +111,35 @@ mod tests {
         approved.insert(fingerprint(b"client-a"));
 
         assert!(!approved.contains(&fingerprint(b"client-b")));
+    }
+
+    #[test]
+    fn unlimited_approved_clients_is_never_at_capacity() {
+        let mut approved = ApprovedClients::new();
+        for seed in 0u8..10 {
+            approved.insert(fingerprint(&[seed]));
+        }
+        assert!(!approved.is_at_capacity());
+    }
+
+    #[test]
+    fn with_max_clients_is_not_at_capacity_below_the_limit() {
+        let mut approved = ApprovedClients::with_max_clients(2);
+        approved.insert(fingerprint(b"client-a"));
+        assert!(!approved.is_at_capacity());
+    }
+
+    #[test]
+    fn with_max_clients_is_at_capacity_once_the_limit_is_reached() {
+        let mut approved = ApprovedClients::with_max_clients(2);
+        approved.insert(fingerprint(b"client-a"));
+        approved.insert(fingerprint(b"client-b"));
+        assert!(approved.is_at_capacity());
+    }
+
+    #[test]
+    fn with_max_clients_of_zero_starts_at_capacity() {
+        let approved = ApprovedClients::with_max_clients(0);
+        assert!(approved.is_at_capacity());
     }
 }
