@@ -41,7 +41,7 @@
 // device_identification.rs for the object layout.
 
 use fuse_fs::filesystem::InfusedFilesystem;
-use fuse_fs::{CoilStore, RegisterStore, WriteReport};
+use fuse_fs::{CoilStore, DiscreteInputStore, InputRegisterStore, RegisterStore, WriteReport};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::{
     CoilDescription, DeviceDescription, MemLayout, RegisterDescription,
@@ -425,10 +425,18 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed to parse {device_description_path}: {error}"));
     let registers = description.registers;
     let coils = description.coils;
+    // Not yet wired into `handle_request`/the direct-write model (see
+    // CLAUDE.md's "read-only Modbus data types" and "server direct-write
+    // model" sections) — the directories exist and show the right file
+    // names, just with empty content until that lands.
+    let discrete_inputs = description.discrete_inputs;
+    let input_registers = description.input_registers;
     let mem_layout = description.mem_layout;
 
     let store = Arc::new(Mutex::new(RegisterStore::new()));
     let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+    let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+    let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
     let report = Arc::new(Mutex::new(WriteReport::new()));
     let (transaction_sender, transaction_receiver) = mpsc::channel();
 
@@ -540,8 +548,12 @@ fn main() {
     let filesystem = InfusedFilesystem::new(
         registers,
         coils,
+        discrete_inputs,
+        input_registers,
         store,
         coil_store,
+        discrete_input_store,
+        input_register_store,
         transaction_sender,
         report,
         Some(client_trust),

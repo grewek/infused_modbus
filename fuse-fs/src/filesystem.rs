@@ -1,15 +1,18 @@
 use crate::client_trust::ClientTrustState;
 use crate::permissions::{DirectoryPermissions, FusePermissions};
 use crate::{
-    CoilStore, CoilValue, PendingTransaction, RegisterStore, RegisterValue, StagedValue,
-    WriteReport,
+    CoilStore, CoilValue, DiscreteInputStore, InputRegisterStore, PendingTransaction,
+    RegisterStore, RegisterValue, StagedValue, WriteReport,
 };
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner, OpenFlags,
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request,
     TimeOrNow,
 };
-use protocol::device_description::{CoilDescription, DataType, RegisterDescription};
+use protocol::device_description::{
+    CoilDescription, DataType, DiscreteInputDescription, InputRegisterDescription,
+    RegisterDescription,
+};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::sync::mpsc;
@@ -108,6 +111,18 @@ pub struct InfusedFilesystem {
     coil_name_to_ino: HashMap<String, INodeNo>,
     coil_store: Arc<Mutex<CoilStore>>,
     coils_ino: INodeNo,
+    // Discrete inputs (FC 2) / input registers (FC 4): read-only on both
+    // client and server today (no `create`/`write` wiring — see CLAUDE.md's
+    // "read-only Modbus data types" section), so unlike `transactions_ino`
+    // these fixed directories have no dynamic/writable counterpart yet.
+    discrete_inputs: Vec<DiscreteInputDescription>,
+    discrete_input_name_to_ino: HashMap<String, INodeNo>,
+    discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
+    discrete_inputs_ino: INodeNo,
+    input_registers: Vec<InputRegisterDescription>,
+    input_register_name_to_ino: HashMap<String, INodeNo>,
+    input_register_store: Arc<Mutex<InputRegisterStore>>,
+    input_registers_ino: INodeNo,
     transactions_ino: INodeNo,
     transactions: Mutex<TransactionFsState>,
     transaction_sender: mpsc::Sender<HashMap<String, StagedValue>>,
@@ -130,11 +145,16 @@ pub struct InfusedFilesystem {
 
 impl InfusedFilesystem {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         registers: Vec<RegisterDescription>,
         coils: Vec<CoilDescription>,
+        discrete_inputs: Vec<DiscreteInputDescription>,
+        input_registers: Vec<InputRegisterDescription>,
         store: Arc<Mutex<RegisterStore>>,
         coil_store: Arc<Mutex<CoilStore>>,
+        discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
+        input_register_store: Arc<Mutex<InputRegisterStore>>,
         transaction_sender: mpsc::Sender<HashMap<String, StagedValue>>,
         report: Arc<Mutex<WriteReport>>,
         client_trust: Option<Arc<Mutex<ClientTrustState>>>,
@@ -157,7 +177,31 @@ impl InfusedFilesystem {
             .enumerate()
             .map(|(index, coil)| (coil.name.clone(), INodeNo(first_coil_ino + index as u64)))
             .collect();
-        let transactions_ino = INodeNo(first_coil_ino + coils.len() as u64);
+        let discrete_inputs_ino = INodeNo(first_coil_ino + coils.len() as u64);
+        let first_discrete_input_ino = discrete_inputs_ino.0 + 1;
+        let discrete_input_name_to_ino = discrete_inputs
+            .iter()
+            .enumerate()
+            .map(|(index, discrete_input)| {
+                (
+                    discrete_input.name.clone(),
+                    INodeNo(first_discrete_input_ino + index as u64),
+                )
+            })
+            .collect();
+        let input_registers_ino = INodeNo(first_discrete_input_ino + discrete_inputs.len() as u64);
+        let first_input_register_ino = input_registers_ino.0 + 1;
+        let input_register_name_to_ino = input_registers
+            .iter()
+            .enumerate()
+            .map(|(index, input_register)| {
+                (
+                    input_register.name.clone(),
+                    INodeNo(first_input_register_ino + index as u64),
+                )
+            })
+            .collect();
+        let transactions_ino = INodeNo(first_input_register_ino + input_registers.len() as u64);
         let report_ino = INodeNo(transactions_ino.0 + 1);
         let first_report_ino = report_ino.0 + 1;
         // report/'s coil files sit right after its register files — see
@@ -196,6 +240,14 @@ impl InfusedFilesystem {
             coil_name_to_ino,
             coil_store,
             coils_ino,
+            discrete_inputs,
+            discrete_input_name_to_ino,
+            discrete_input_store,
+            discrete_inputs_ino,
+            input_registers,
+            input_register_name_to_ino,
+            input_register_store,
+            input_registers_ino,
             transactions_ino,
             transactions,
             transaction_sender,
@@ -228,6 +280,18 @@ impl InfusedFilesystem {
 
     fn coil_store_lock(&self) -> MutexGuard<'_, CoilStore> {
         self.coil_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn discrete_input_store_lock(&self) -> MutexGuard<'_, DiscreteInputStore> {
+        self.discrete_input_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn input_register_store_lock(&self) -> MutexGuard<'_, InputRegisterStore> {
+        self.input_register_store
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -287,6 +351,30 @@ impl InfusedFilesystem {
     fn coil_by_ino(&self, ino: INodeNo) -> Option<&CoilDescription> {
         let index = ino.0.checked_sub(self.first_coil_ino())?;
         self.coils.get(index as usize)
+    }
+
+    // discrete-inputs/'s file inodes sit right after the fixed
+    // discrete-inputs/ directory inode itself — same pattern as
+    // `first_coil_ino`.
+    fn first_discrete_input_ino(&self) -> u64 {
+        self.discrete_inputs_ino.0 + 1
+    }
+
+    fn discrete_input_by_ino(&self, ino: INodeNo) -> Option<&DiscreteInputDescription> {
+        let index = ino.0.checked_sub(self.first_discrete_input_ino())?;
+        self.discrete_inputs.get(index as usize)
+    }
+
+    // input-registers/'s file inodes sit right after the fixed
+    // input-registers/ directory inode itself — same pattern as
+    // `first_coil_ino`.
+    fn first_input_register_ino(&self) -> u64 {
+        self.input_registers_ino.0 + 1
+    }
+
+    fn input_register_by_ino(&self, ino: INodeNo) -> Option<&InputRegisterDescription> {
+        let index = ino.0.checked_sub(self.first_input_register_ino())?;
+        self.input_registers.get(index as usize)
     }
 
     fn report_register_by_ino(&self, ino: INodeNo) -> Option<&RegisterDescription> {
@@ -364,6 +452,20 @@ impl InfusedFilesystem {
 
     fn coil_content(&self, coil: &CoilDescription) -> String {
         match self.coil_store_lock().get(&coil.name) {
+            Some(value) => format!("{value}\n"),
+            None => String::new(),
+        }
+    }
+
+    fn discrete_input_content(&self, discrete_input: &DiscreteInputDescription) -> String {
+        match self.discrete_input_store_lock().get(&discrete_input.name) {
+            Some(value) => format!("{value}\n"),
+            None => String::new(),
+        }
+    }
+
+    fn input_register_content(&self, input_register: &InputRegisterDescription) -> String {
+        match self.input_register_store_lock().get(&input_register.name) {
             Some(value) => format!("{value}\n"),
             None => String::new(),
         }
@@ -555,6 +657,20 @@ impl Filesystem for InfusedFilesystem {
                         Generation(0),
                     );
                 }
+                Some("discrete-inputs") => {
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.directory_attr(self.discrete_inputs_ino, req),
+                        Generation(0),
+                    );
+                }
+                Some("input-registers") => {
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.directory_attr(self.input_registers_ino, req),
+                        Generation(0),
+                    );
+                }
                 Some("transactions") => {
                     reply.entry(
                         &ATTR_TTL,
@@ -692,6 +808,50 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
+        if parent == self.discrete_inputs_ino {
+            let discrete_input = name
+                .to_str()
+                .and_then(|name| self.discrete_input_name_to_ino.get(name))
+                .and_then(|&ino| {
+                    self.discrete_input_by_ino(ino)
+                        .map(|discrete_input| (ino, discrete_input))
+                });
+            match discrete_input {
+                Some((ino, discrete_input)) => {
+                    let content = self.discrete_input_content(discrete_input);
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.file_attr(ino, content.len() as u64, 0o444, req),
+                        Generation(0),
+                    );
+                }
+                None => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
+        if parent == self.input_registers_ino {
+            let input_register = name
+                .to_str()
+                .and_then(|name| self.input_register_name_to_ino.get(name))
+                .and_then(|&ino| {
+                    self.input_register_by_ino(ino)
+                        .map(|input_register| (ino, input_register))
+                });
+            match input_register {
+                Some((ino, input_register)) => {
+                    let content = self.input_register_content(input_register);
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.file_attr(ino, content.len() as u64, 0o444, req),
+                        Generation(0),
+                    );
+                }
+                None => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
         if parent == self.transactions_ino {
             let Some(name) = name.to_str() else {
                 reply.error(Errno::ENOENT);
@@ -750,6 +910,8 @@ impl Filesystem for InfusedFilesystem {
         if ino == ROOT_INO
             || ino == HOLDING_REGISTERS_INO
             || ino == self.coils_ino
+            || ino == self.discrete_inputs_ino
+            || ino == self.input_registers_ino
             || ino == self.transactions_ino
             || ino == self.report_ino
             || (ino == self.client_trust_ino && self.client_trust.is_some())
@@ -796,6 +958,24 @@ impl Filesystem for InfusedFilesystem {
 
         if let Some(coil) = self.coil_by_ino(ino) {
             let content = self.coil_content(coil);
+            reply.attr(
+                &ATTR_TTL,
+                &self.file_attr(ino, content.len() as u64, 0o444, req),
+            );
+            return;
+        }
+
+        if let Some(discrete_input) = self.discrete_input_by_ino(ino) {
+            let content = self.discrete_input_content(discrete_input);
+            reply.attr(
+                &ATTR_TTL,
+                &self.file_attr(ino, content.len() as u64, 0o444, req),
+            );
+            return;
+        }
+
+        if let Some(input_register) = self.input_register_by_ino(ino) {
+            let content = self.input_register_content(input_register);
             reply.attr(
                 &ATTR_TTL,
                 &self.file_attr(ino, content.len() as u64, 0o444, req),
@@ -901,6 +1081,10 @@ impl Filesystem for InfusedFilesystem {
             self.register_content(register)
         } else if let Some(coil) = self.coil_by_ino(ino) {
             self.coil_content(coil)
+        } else if let Some(discrete_input) = self.discrete_input_by_ino(ino) {
+            self.discrete_input_content(discrete_input)
+        } else if let Some(input_register) = self.input_register_by_ino(ino) {
+            self.input_register_content(input_register)
         } else if let Some(register) = self.report_register_by_ino(ino) {
             self.report_content(&register.name)
         } else if let Some(coil) = self.report_coil_by_ino(ino) {
@@ -957,6 +1141,16 @@ impl Filesystem for InfusedFilesystem {
                     "holding-registers".to_string(),
                 ),
                 (self.coils_ino, FileType::Directory, "coils".to_string()),
+                (
+                    self.discrete_inputs_ino,
+                    FileType::Directory,
+                    "discrete-inputs".to_string(),
+                ),
+                (
+                    self.input_registers_ino,
+                    FileType::Directory,
+                    "input-registers".to_string(),
+                ),
                 (
                     self.transactions_ino,
                     FileType::Directory,
@@ -1043,6 +1237,42 @@ impl Filesystem for InfusedFilesystem {
             for coil in &self.coils {
                 let coil_ino = self.coil_name_to_ino[&coil.name];
                 entries.push((coil_ino, FileType::RegularFile, coil.name.clone()));
+            }
+            entries
+        } else if ino == self.discrete_inputs_ino {
+            let mut entries = vec![
+                (
+                    self.discrete_inputs_ino,
+                    FileType::Directory,
+                    ".".to_string(),
+                ),
+                (ROOT_INO, FileType::Directory, "..".to_string()),
+            ];
+            for discrete_input in &self.discrete_inputs {
+                let discrete_input_ino = self.discrete_input_name_to_ino[&discrete_input.name];
+                entries.push((
+                    discrete_input_ino,
+                    FileType::RegularFile,
+                    discrete_input.name.clone(),
+                ));
+            }
+            entries
+        } else if ino == self.input_registers_ino {
+            let mut entries = vec![
+                (
+                    self.input_registers_ino,
+                    FileType::Directory,
+                    ".".to_string(),
+                ),
+                (ROOT_INO, FileType::Directory, "..".to_string()),
+            ];
+            for input_register in &self.input_registers {
+                let input_register_ino = self.input_register_name_to_ino[&input_register.name];
+                entries.push((
+                    input_register_ino,
+                    FileType::RegularFile,
+                    input_register.name.clone(),
+                ));
             }
             entries
         } else if ino == self.transactions_ino {
@@ -1274,14 +1504,20 @@ mod tests {
         }];
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, receiver) = mpsc::channel();
         (
             InfusedFilesystem::new(
                 registers,
                 coils,
+                Vec::new(),
+                Vec::new(),
                 store,
                 coil_store,
+                discrete_input_store,
+                input_register_store,
                 sender,
                 report,
                 None,
@@ -1294,14 +1530,20 @@ mod tests {
     fn test_filesystem_with_client_trust() -> InfusedFilesystem {
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, _receiver) = mpsc::channel();
         let client_trust = Arc::new(Mutex::new(ClientTrustState::new()));
         InfusedFilesystem::new(
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
             store,
             coil_store,
+            discrete_input_store,
+            input_register_store,
             sender,
             report,
             Some(client_trust),

@@ -24,7 +24,8 @@
 
 use fuse_fs::filesystem::InfusedFilesystem;
 use fuse_fs::{
-    CoilStore, CoilValue, RegisterStore, RegisterValue, StagedValue, WriteReport, WriteStatus,
+    CoilStore, CoilValue, DiscreteInputStore, InputRegisterStore, RegisterStore, RegisterValue,
+    StagedValue, WriteReport, WriteStatus,
 };
 use protocol::device_description::{
     AccessRight, CoilDescription, DataType, DeviceDescription, RegisterDescription,
@@ -68,15 +69,20 @@ fn main() {
         std::process::exit(1);
     };
 
-    let (registers, coils) = match args.next() {
+    let (registers, coils, discrete_inputs, input_registers) = match args.next() {
         Some(path) => {
             let toml_source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
             let description = DeviceDescription::parse(&toml_source)
                 .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"));
-            (description.registers, description.coils)
+            (
+                description.registers,
+                description.coils,
+                description.discrete_inputs,
+                description.input_registers,
+            )
         }
-        None => (demo_registers(), demo_coils()),
+        None => (demo_registers(), demo_coils(), Vec::new(), Vec::new()),
     };
 
     let store = Arc::new(Mutex::new(RegisterStore::new()));
@@ -143,11 +149,18 @@ fn main() {
     println!();
     println!("Ctrl+C to stop (the kernel unmounts automatically on exit).");
 
+    let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+    let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+
     let filesystem = InfusedFilesystem::new(
         registers,
         coils,
+        discrete_inputs,
+        input_registers,
         store,
         coil_store,
+        discrete_input_store,
+        input_register_store,
         transaction_sender,
         report,
         None,

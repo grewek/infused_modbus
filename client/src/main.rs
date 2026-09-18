@@ -54,7 +54,7 @@ use client::device_identification::fetch_device_description;
 use client::polling::run_polling_loop;
 use client::transaction_consumer::run_transaction_consumer;
 use fuse_fs::filesystem::InfusedFilesystem;
-use fuse_fs::{CoilStore, RegisterStore, WriteReport};
+use fuse_fs::{CoilStore, DiscreteInputStore, InputRegisterStore, RegisterStore, WriteReport};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::DeviceDescription;
 use std::sync::{Arc, Mutex, mpsc};
@@ -219,6 +219,12 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed to parse device description: {error}"));
     let registers = description.registers;
     let coils = description.coils;
+    // Not yet fed by polling (see CLAUDE.md's "read-only Modbus data
+    // types" section) — the discrete-inputs/input-registers directories
+    // exist and show the right file names, just with empty content until
+    // that wiring lands.
+    let discrete_inputs = description.discrete_inputs;
+    let input_registers = description.input_registers;
     let mem_layout = description.mem_layout;
 
     // Shared, not owned outright: the polling loop and the transaction
@@ -230,6 +236,8 @@ fn main() {
 
     let store = Arc::new(Mutex::new(RegisterStore::new()));
     let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+    let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+    let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
     let report = Arc::new(Mutex::new(WriteReport::new()));
     let (transaction_sender, transaction_receiver) = mpsc::channel();
 
@@ -280,8 +288,12 @@ fn main() {
     let filesystem = InfusedFilesystem::new(
         registers,
         coils,
+        discrete_inputs,
+        input_registers,
         store,
         coil_store,
+        discrete_input_store,
+        input_register_store,
         transaction_sender,
         report,
         // client-trust/ only exists on the server — see CLAUDE.md's TLS
