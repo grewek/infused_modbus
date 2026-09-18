@@ -20,9 +20,10 @@
 //
 // tls+tcp:// requires a client certificate and checks its fingerprint
 // against an approved set (see server::tls::build_server_config /
-// server::client_trust::ApprovedClients). The set starts empty on every
-// run (not yet persisted — that's Milestone S) and is populated via the
-// `admin` subcommand above, which talks to a Unix domain socket
+// server::client_trust::ApprovedClients). The set is seeded at startup from
+// APPROVED_CLIENTS_PATH below (Milestone S1; empty if the file doesn't
+// exist yet — see server::persistence) and is populated via the `admin`
+// subcommand above, which talks to a Unix domain socket
 // (ADMIN_SOCKET_PATH below, fixed and not yet CLI-configurable) that this
 // process always serves in the background, regardless of which connection
 // type it was started with — the same "always present regardless of
@@ -56,6 +57,7 @@ use tokio_serial::SerialPortBuilderExt;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TLS_IDENTITY_DIRECTORY: &str = "server-tls-identity";
 const ADMIN_SOCKET_PATH: &str = "server-admin.sock";
+const APPROVED_CLIENTS_PATH: &str = "approved-clients.toml";
 
 fn usage() -> ! {
     eprintln!(
@@ -390,13 +392,34 @@ fn main() {
     // Shared between the TLS client-cert verifier (which enforces it) and
     // the admin socket below (which is the only thing that ever mutates
     // it) — same one-writer-per-piece-of-state precedent as `client_trust`
-    // just above. Starts empty on every run; not persisted yet (Milestone
-    // S). `--max-clients` (Milestone Q) is stored here too (Q1 scope: not
-    // yet enforced by `insert` — that's Q2).
-    let approved_clients = Arc::new(Mutex::new(match max_clients {
+    // just above. `--max-clients` (Milestone Q) is stored here too.
+    let mut approved_clients = match max_clients {
         Some(max_clients) => server::client_trust::ApprovedClients::with_max_clients(max_clients),
         None => server::client_trust::ApprovedClients::new(),
-    }));
+    };
+    // Seeded from disk (Milestone S1) — `seed` bypasses the `--max-clients`
+    // check deliberately, see its own doc comment: a fingerprint approved
+    // before this restart must not silently vanish just because the limit
+    // was lowered in the meantime. Read once, here, at startup only — see
+    // server::persistence's module doc comment for why this file is never
+    // hot-reloaded afterwards. Also seeds `client_trust`'s own mirror in
+    // the same loop — otherwise `admin list`/`client-trust/approved/`
+    // would show nothing approved right after a restart even though the
+    // TLS verifier (which only consults `approved_clients`) would already
+    // accept a previously-approved client; the same "two stores, one
+    // writer" discipline O2/P2 established for the admin channel applies
+    // here too.
+    let approved_clients_path = Path::new(APPROVED_CLIENTS_PATH);
+    for fingerprint in server::persistence::load(approved_clients_path)
+        .unwrap_or_else(|error| panic!("failed to load {approved_clients_path:?}: {error}"))
+    {
+        approved_clients.seed(fingerprint);
+        client_trust
+            .lock()
+            .unwrap()
+            .insert_approved(fingerprint.to_string());
+    }
+    let approved_clients = Arc::new(Mutex::new(approved_clients));
     // Shared between the TLS accept loop (which registers/deregisters each
     // connection as it opens/closes) and the admin socket below (which
     // calls `revoke` on it) — see Milestone R: `REVOKE` must terminate an

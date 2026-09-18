@@ -76,6 +76,17 @@ impl ApprovedClients {
         ApprovalOutcome::Approved
     }
 
+    /// Inserts `fingerprint` unconditionally, bypassing the `--max-clients`
+    /// capacity check `insert` enforces. Used only to seed the set from
+    /// `approved-clients.toml` at startup (Milestone S1): a fingerprint
+    /// that was already validly approved before a restart must not be
+    /// silently dropped just because `--max-clients` happens to have been
+    /// lowered in the meantime — an operator who actually wants to shrink
+    /// the roster can revoke specific entries by hand instead.
+    pub fn seed(&mut self, fingerprint: Fingerprint) {
+        self.fingerprints.insert(fingerprint);
+    }
+
     pub fn contains(&self, fingerprint: &Fingerprint) -> bool {
         self.fingerprints.contains(fingerprint)
     }
@@ -209,6 +220,27 @@ mod tests {
         assert!(approved.remove(&fp_a));
 
         assert_eq!(approved.insert(fp_b), ApprovalOutcome::Approved);
+    }
+
+    #[test]
+    fn seed_makes_a_fingerprint_contained() {
+        let mut approved = ApprovedClients::new();
+        let fp = fingerprint(b"client-a");
+
+        approved.seed(fp);
+
+        assert!(approved.contains(&fp));
+    }
+
+    #[test]
+    fn seed_bypasses_the_max_clients_capacity_check() {
+        let mut approved = ApprovedClients::with_max_clients(1);
+        approved.seed(fingerprint(b"client-a"));
+
+        approved.seed(fingerprint(b"client-b"));
+
+        assert!(approved.contains(&fingerprint(b"client-a")));
+        assert!(approved.contains(&fingerprint(b"client-b")));
     }
 
     #[test]
