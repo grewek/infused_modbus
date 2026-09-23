@@ -207,6 +207,15 @@ echo 1 > transactions/Motor_Running         # stage turning it on
 touch transactions/TRANSACTION_END
 ```
 
+A `transactions/<name>` file can also stage a Mask Write Register (FC 0x16) instead of a plain value, by writing `MASK <and_mask> <or_mask>` as its content — sets/clears specific bits in a single-register-wide value atomically on the real device, without needing to know its current contents:
+
+```sh
+echo "MASK 0x00F2 0x0025" > transactions/Stop_Process
+touch transactions/TRANSACTION_END
+```
+
+This is client-only (the server has no local use for it — see the README's function-code table and `CLAUDE.md` for why) and, like every write, can only ever target a single-register-wide value (`u8`/`i8`/`u16`/`i16`).
+
 Unmount with Ctrl+C or `SIGTERM` — both `client` and `server` unmount cleanly on shutdown.
 
 ### Device description discovery (FC 43)
