@@ -203,6 +203,14 @@ pub enum StagedValue {
     // all for discrete inputs/input registers, staged or direct.
     DiscreteInput(CoilValue),
     InputRegister(RegisterValue),
+    // Staged via `transactions/<name>`'s `MASK <and_mask> <or_mask>`
+    // content form (see InfusedFilesystem::parse_masked_register_value) —
+    // client-only, mirroring Modbus's own Mask Write Register (FC 0x16),
+    // which only a master ever sends. The server never constructs this:
+    // its direct-write path (WriteMode::Direct) has no `transactions/` to
+    // stage one from, and doesn't try MASK-parsing on a plain
+    // `holding-registers/<name>` write either.
+    MaskedRegister { and_mask: u16, or_mask: u16 },
 }
 
 impl fmt::Display for StagedValue {
@@ -212,6 +220,9 @@ impl fmt::Display for StagedValue {
             StagedValue::Coil(value) => write!(formatter, "{value}"),
             StagedValue::DiscreteInput(value) => write!(formatter, "{value}"),
             StagedValue::InputRegister(value) => write!(formatter, "{value}"),
+            StagedValue::MaskedRegister { and_mask, or_mask } => {
+                write!(formatter, "MASK 0x{and_mask:04X} 0x{or_mask:04X}")
+            }
         }
     }
 }
@@ -562,6 +573,18 @@ mod tests {
         assert_eq!(
             StagedValue::InputRegister(RegisterValue::F32(3.5)).to_string(),
             "3.5"
+        );
+    }
+
+    #[test]
+    fn staged_value_masked_register_displays_as_mask_with_hex_masks() {
+        assert_eq!(
+            StagedValue::MaskedRegister {
+                and_mask: 0x00F2,
+                or_mask: 0x0025,
+            }
+            .to_string(),
+            "MASK 0x00F2 0x0025"
         );
     }
 

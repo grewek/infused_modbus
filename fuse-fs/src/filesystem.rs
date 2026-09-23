@@ -624,6 +624,37 @@ impl InfusedFilesystem {
         }
     }
 
+    // `MASK <and_mask> <or_mask>` (case-insensitive keyword, whitespace
+    // separated, each mask a plain `0x`-hex or decimal u16 exactly like a
+    // U16 register value) — the one-file syntax for staging a Mask Write
+    // Register (FC 0x16) instead of a plain overwrite. Deliberately doesn't
+    // check the target register's DataType here (this function only sees
+    // text, not which register it's for): a MASK staged against a register
+    // wider than one wire word parses fine but is rejected later, with a
+    // real reason, by client::transaction_consumer when it tries to send
+    // it — matching how encode_write_request already rejects an
+    // over-wide plain write at send time rather than at parse time.
+    fn parse_masked_register_value(text: &str) -> Option<(u16, u16)> {
+        let mut tokens = text.split_whitespace();
+        if !tokens.next()?.eq_ignore_ascii_case("MASK") {
+            return None;
+        }
+        let and_mask = parse_hex_or_decimal(
+            tokens.next()?,
+            |hex| u16::from_str_radix(hex, 16),
+            |decimal| decimal.parse(),
+        )?;
+        let or_mask = parse_hex_or_decimal(
+            tokens.next()?,
+            |hex| u16::from_str_radix(hex, 16),
+            |decimal| decimal.parse(),
+        )?;
+        if tokens.next().is_some() {
+            return None;
+        }
+        Some((and_mask, or_mask))
+    }
+
     fn parse_coil_value(text: &str) -> Option<CoilValue> {
         match text.trim() {
             "0" => Some(CoilValue(false)),
@@ -1559,7 +1590,11 @@ impl Filesystem for InfusedFilesystem {
             && let Ok(text) = String::from_utf8(buffer)
         {
             let staged = if let Some(register) = self.register_by_name(&name) {
-                Self::parse_register_value(register.data_type, &text).map(StagedValue::Register)
+                if let Some((and_mask, or_mask)) = Self::parse_masked_register_value(&text) {
+                    Some(StagedValue::MaskedRegister { and_mask, or_mask })
+                } else {
+                    Self::parse_register_value(register.data_type, &text).map(StagedValue::Register)
+                }
             } else if self.coil_by_name(&name).is_some() {
                 Self::parse_coil_value(&text).map(StagedValue::Coil)
             } else {
@@ -2299,6 +2334,58 @@ mod tests {
         );
         assert_eq!(
             InfusedFilesystem::parse_register_value(DataType::F64, "not a number"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_masked_register_value_accepts_hex_masks() {
+        assert_eq!(
+            InfusedFilesystem::parse_masked_register_value("MASK 0x00F2 0x0025"),
+            Some((0x00F2, 0x0025))
+        );
+    }
+
+    #[test]
+    fn parse_masked_register_value_accepts_decimal_masks() {
+        assert_eq!(
+            InfusedFilesystem::parse_masked_register_value("MASK 242 37"),
+            Some((242, 37))
+        );
+    }
+
+    #[test]
+    fn parse_masked_register_value_is_case_insensitive_and_trims_whitespace() {
+        assert_eq!(
+            InfusedFilesystem::parse_masked_register_value("  mask 0x00F2 0x0025  \n"),
+            Some((0x00F2, 0x0025))
+        );
+    }
+
+    #[test]
+    fn parse_masked_register_value_rejects_missing_keyword() {
+        assert_eq!(
+            InfusedFilesystem::parse_masked_register_value("0x00F2 0x0025"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_masked_register_value_rejects_wrong_token_count() {
+        assert_eq!(
+            InfusedFilesystem::parse_masked_register_value("MASK 0x00F2"),
+            None
+        );
+        assert_eq!(
+            InfusedFilesystem::parse_masked_register_value("MASK 0x00F2 0x0025 0x0000"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_masked_register_value_rejects_garbage_masks() {
+        assert_eq!(
+            InfusedFilesystem::parse_masked_register_value("MASK not-a-mask 0x0025"),
             None
         );
     }

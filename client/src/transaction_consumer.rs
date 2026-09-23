@@ -54,7 +54,8 @@
 use crate::batching::{Batch, build_batches};
 use crate::connection::Connection;
 use crate::write_confirmation::{
-    confirm_coil_write, confirm_coil_write_multiple, confirm_write, confirm_write_multiple,
+    confirm_coil_write, confirm_coil_write_multiple, confirm_mask_write, confirm_write,
+    confirm_write_multiple,
 };
 use fuse_fs::register_encoding::register_value_to_words;
 use fuse_fs::{CoilValue, RegisterValue, StagedValue, WriteReport, WriteStatus};
@@ -118,6 +119,7 @@ pub fn run_transaction_consumer(
     for transaction in transaction_receiver {
         let mut register_entries: Vec<(RegisterDescription, RegisterValue)> = Vec::new();
         let mut coil_entries: Vec<(CoilDescription, bool)> = Vec::new();
+        let mut masked_register_entries: Vec<(RegisterDescription, u16, u16)> = Vec::new();
 
         // Resolve every staged name against the known registers/coils
         // first, reporting anything unknown or mismatched immediately —
@@ -182,6 +184,35 @@ pub fn run_transaction_consumer(
                         .lock()
                         .unwrap()
                         .set(name, WriteStatus::Failed(reason));
+                }
+                // Collected separately from register_entries, not batched:
+                // Mask Write Register (FC 0x16) has no "multiple" variant,
+                // so each masked write always goes out as its own request
+                // (see confirm_mask_write's doc comment).
+                StagedValue::MaskedRegister { and_mask, or_mask } => {
+                    match registers.iter().find(|register| register.name == name) {
+                        Some(register) if register.data_type.register_count() == 1 => {
+                            masked_register_entries.push((register.clone(), and_mask, or_mask));
+                        }
+                        Some(register) => {
+                            let reason = format!(
+                                "register {name}: {:?} needs {} registers, Mask Write Register can only target a single register",
+                                register.data_type,
+                                register.data_type.register_count()
+                            );
+                            report
+                                .lock()
+                                .unwrap()
+                                .set(name, WriteStatus::Failed(reason));
+                        }
+                        None => {
+                            let reason = format!("unknown register: {name}");
+                            report
+                                .lock()
+                                .unwrap()
+                                .set(name, WriteStatus::Failed(reason));
+                        }
+                    }
                 }
             }
         }
@@ -261,6 +292,22 @@ pub fn run_transaction_consumer(
                     .unwrap()
                     .set(coil.name.clone(), status.clone());
             }
+        }
+
+        for (register, and_mask, or_mask) in masked_register_entries {
+            let status = handle.block_on(async {
+                let mut connection = connection.lock().await;
+                confirm_mask_write(
+                    &mut connection,
+                    &register,
+                    and_mask,
+                    or_mask,
+                    unit_id,
+                    timeout,
+                )
+                .await
+            });
+            report.lock().unwrap().set(register.name.clone(), status);
         }
     }
 }
@@ -964,6 +1011,168 @@ mod tests {
 
         // Nothing was ever sent to the "device" — dropping it without a
         // pending read (which would panic on EOF) confirms that.
+        drop(device);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn confirms_a_masked_write_and_updates_report() {
+        let (connection, mut device) = connected_pair().await;
+        let (transaction_sender, transaction_receiver) = mpsc::channel();
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let registers = vec![u16_register()];
+        let coils: Vec<CoilDescription> = vec![];
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut header)
+                .await
+                .unwrap();
+            // Mask Write Register request PDU: function code (1) +
+            // reference address (2) + and_mask (2) + or_mask (2) = 7 bytes.
+            let mut pdu = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut pdu)
+                .await
+                .unwrap();
+            assert_eq!(pdu, vec![0x16, 0x9C, 0x41, 0x00, 0xF2, 0x00, 0x25]);
+            let mut response = header;
+            response.extend_from_slice(&pdu);
+            tokio::io::AsyncWriteExt::write_all(&mut device, &response)
+                .await
+                .unwrap();
+        });
+
+        let handle = Handle::current();
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let consumer_report = Arc::clone(&report);
+        let consumer_thread = std::thread::spawn(move || {
+            run_transaction_consumer(
+                &handle,
+                &connection,
+                &registers,
+                &coils,
+                &consumer_report,
+                MemLayout::Abcd,
+                transaction_receiver,
+                0x01,
+                Duration::from_secs(1),
+            );
+        });
+
+        let mut transaction = HashMap::new();
+        transaction.insert(
+            "Stop_Process".to_string(),
+            StagedValue::MaskedRegister {
+                and_mask: 0x00F2,
+                or_mask: 0x0025,
+            },
+        );
+        transaction_sender.send(transaction).unwrap();
+        drop(transaction_sender);
+
+        device_task.await.unwrap();
+        consumer_thread.join().unwrap();
+
+        assert_eq!(
+            report.lock().unwrap().get("Stop_Process"),
+            Some(&WriteStatus::Ok)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_masked_write_of_a_multi_register_type_is_reported_as_failed_without_sending_anything()
+     {
+        let (connection, device) = connected_pair().await;
+        let (transaction_sender, transaction_receiver) = mpsc::channel();
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        // Flow_Rate is F32 (2 registers wide) — Mask Write Register can
+        // only ever carry one wire word, so this can never be sent no
+        // matter the access rights.
+        let registers = vec![f32_register()];
+        let coils: Vec<CoilDescription> = vec![];
+
+        let handle = Handle::current();
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let consumer_report = Arc::clone(&report);
+        let consumer_thread = std::thread::spawn(move || {
+            run_transaction_consumer(
+                &handle,
+                &connection,
+                &registers,
+                &coils,
+                &consumer_report,
+                MemLayout::Abcd,
+                transaction_receiver,
+                0x01,
+                Duration::from_secs(1),
+            );
+        });
+
+        let mut transaction = HashMap::new();
+        transaction.insert(
+            "Flow_Rate".to_string(),
+            StagedValue::MaskedRegister {
+                and_mask: 0x00F2,
+                or_mask: 0x0025,
+            },
+        );
+        transaction_sender.send(transaction).unwrap();
+        drop(transaction_sender);
+
+        consumer_thread.join().unwrap();
+
+        assert!(matches!(
+            report.lock().unwrap().get("Flow_Rate"),
+            Some(WriteStatus::Failed(_))
+        ));
+
+        // Nothing was ever sent to the "device" — dropping it without a
+        // pending read (which would panic on EOF) confirms that.
+        drop(device);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_masked_register_is_reported_as_failed_without_sending_anything() {
+        let (connection, device) = connected_pair().await;
+        let (transaction_sender, transaction_receiver) = mpsc::channel();
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let registers: Vec<RegisterDescription> = vec![];
+        let coils: Vec<CoilDescription> = vec![];
+
+        let handle = Handle::current();
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let consumer_report = Arc::clone(&report);
+        let consumer_thread = std::thread::spawn(move || {
+            run_transaction_consumer(
+                &handle,
+                &connection,
+                &registers,
+                &coils,
+                &consumer_report,
+                MemLayout::Abcd,
+                transaction_receiver,
+                0x01,
+                Duration::from_secs(1),
+            );
+        });
+
+        let mut transaction = HashMap::new();
+        transaction.insert(
+            "Ghost_Register".to_string(),
+            StagedValue::MaskedRegister {
+                and_mask: 0x00F2,
+                or_mask: 0x0025,
+            },
+        );
+        transaction_sender.send(transaction).unwrap();
+        drop(transaction_sender);
+
+        consumer_thread.join().unwrap();
+
+        assert!(matches!(
+            report.lock().unwrap().get("Ghost_Register"),
+            Some(WriteStatus::Failed(_))
+        ));
+
         drop(device);
     }
 }

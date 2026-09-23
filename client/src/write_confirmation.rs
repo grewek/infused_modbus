@@ -7,8 +7,8 @@ use fuse_fs::{CoilValue, RegisterValue, WriteStatus};
 use protocol::DecodeError;
 use protocol::device_description::{CoilDescription, MemLayout, RegisterDescription};
 use protocol::pdu::{
-    ExceptionResponse, WriteMultipleCoilsRequest, WriteMultipleRegistersRequest,
-    WriteSingleCoilRequest, WriteSingleRegisterRequest,
+    ExceptionResponse, MaskWriteRegisterRequest, WriteMultipleCoilsRequest,
+    WriteMultipleRegistersRequest, WriteSingleCoilRequest, WriteSingleRegisterRequest,
 };
 use std::time::Duration;
 
@@ -136,6 +136,38 @@ pub async fn confirm_write_multiple(
     let pdu = WriteMultipleRegistersRequest {
         starting_address,
         register_values: values.to_vec(),
+    }
+    .encode();
+    match connection.request(unit_id, pdu, timeout).await {
+        Ok(response_pdu) => interpret_write_response(&response_pdu),
+        Err(error) => WriteStatus::Failed(format!("write failed: {error}")),
+    }
+}
+
+/// Sends a Mask Write Register (FC 0x16) request for `register` — the
+/// counterpart of `confirm_write` for a `transactions/<name>` file staged
+/// with the `MASK <and_mask> <or_mask>` content form (see
+/// fuse_fs::filesystem::InfusedFilesystem::parse_masked_register_value)
+/// instead of a plain value. Unlike a plain write, this can never be
+/// batched with anything else — Modbus has no "mask write multiple
+/// registers" function code — so `client::transaction_consumer` sends one
+/// of these per staged mask, never through `build_register_write_batches`.
+/// Callers are expected to have already checked
+/// `register.data_type.register_count() == 1`: the function code
+/// physically can't address more than one wire word, the same restriction
+/// `encode_write_request` enforces for Write Single Register.
+pub async fn confirm_mask_write(
+    connection: &mut Connection,
+    register: &RegisterDescription,
+    and_mask: u16,
+    or_mask: u16,
+    unit_id: u8,
+    timeout: Duration,
+) -> WriteStatus {
+    let pdu = MaskWriteRegisterRequest {
+        reference_address: register.address,
+        and_mask,
+        or_mask,
     }
     .encode();
     match connection.request(unit_id, pdu, timeout).await {
@@ -385,6 +417,98 @@ mod tests {
             MemLayout::Abcd,
             0x01,
             Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(status, WriteStatus::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn confirm_mask_write_returns_ok_when_device_echoes_the_request() {
+        let (mut connection, mut device) = connected_pair().await;
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut header)
+                .await
+                .unwrap();
+            let mut pdu = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut pdu)
+                .await
+                .unwrap();
+            let mut response = header;
+            response.extend_from_slice(&pdu);
+            tokio::io::AsyncWriteExt::write_all(&mut device, &response)
+                .await
+                .unwrap();
+        });
+
+        let status = confirm_mask_write(
+            &mut connection,
+            &u16_register(),
+            0x00F2,
+            0x0025,
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(status, WriteStatus::Ok);
+        device_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirm_mask_write_returns_failed_when_device_returns_an_exception() {
+        let (mut connection, mut device) = connected_pair().await;
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut header)
+                .await
+                .unwrap();
+            let mut pdu = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut pdu)
+                .await
+                .unwrap();
+            let exception = ExceptionResponse {
+                function_code: 0x16,
+                exception_code: 0x02,
+            }
+            .encode();
+            let mut response = header;
+            let length = (exception.len() + 1) as u16;
+            response[4..6].copy_from_slice(&length.to_be_bytes());
+            response.extend_from_slice(&exception);
+            tokio::io::AsyncWriteExt::write_all(&mut device, &response)
+                .await
+                .unwrap();
+        });
+
+        let status = confirm_mask_write(
+            &mut connection,
+            &u16_register(),
+            0x00F2,
+            0x0025,
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(status, WriteStatus::Failed(_)));
+        device_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirm_mask_write_returns_failed_when_the_device_never_responds() {
+        let (mut connection, _device) = connected_pair().await;
+
+        let status = confirm_mask_write(
+            &mut connection,
+            &u16_register(),
+            0x00F2,
+            0x0025,
+            0x01,
+            Duration::from_millis(50),
         )
         .await;
 

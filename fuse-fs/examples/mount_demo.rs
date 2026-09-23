@@ -134,6 +134,15 @@ fn main() {
                             // model" doc comment.
                             println!("(demo) unreachable in WriteMode::Staged: {name}");
                         }
+                        StagedValue::MaskedRegister { .. } => {
+                            println!("(demo) mask writes aren't wired up yet: {name}");
+                            report.set(
+                                name,
+                                WriteStatus::Failed(
+                                    "mask writes not supported yet in this demo".to_string(),
+                                ),
+                            );
+                        }
                     }
                 }
             }
