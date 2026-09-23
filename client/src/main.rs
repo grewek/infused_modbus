@@ -227,6 +227,7 @@ fn main() {
     let input_registers = description.input_registers;
     let mem_layout = description.mem_layout;
     let input_register_mem_layout = description.input_register_mem_layout;
+    let server_id = description.server_id;
 
     // Shared, not owned outright: the polling loop and the transaction
     // consumer both need to talk to the device over this same connection,
@@ -311,6 +312,7 @@ fn main() {
         None,
         fuse_permissions,
         WriteMode::Staged,
+        server_id,
     );
     // spawn_mount (not the blocking mount()) so Ctrl+C/SIGTERM below can
     // unmount cleanly instead of just killing the process and leaving a

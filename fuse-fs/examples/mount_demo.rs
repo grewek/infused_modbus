@@ -182,6 +182,7 @@ fn main() {
         None,
         fuse_fs::permissions::FusePermissions::default(),
         WriteMode::Staged,
+        None,
     );
     let mut config = fuser::Config::default();
     config.mount_options = vec![fuser::MountOption::DefaultPermissions];

@@ -151,6 +151,17 @@ pub struct InfusedFilesystem {
     approved_log_ino: INodeNo,
     pending_log_ino: INodeNo,
     rejected_log_ino: INodeNo,
+    // Client-only (see CLAUDE.md's "FC 0x11 (Report Server ID)" section) —
+    // the server answers real FC11 requests with its own device
+    // description's `server_id` directly in `server::handler`, but never
+    // exposes it through this FUSE tree at all, so `server` always passes
+    // `None` here regardless of what its own TOML has configured. Mirrors
+    // whatever ended up in the client's own effective device description
+    // (local file or FC43-fetched), read-only, static for the process's
+    // whole lifetime — unlike every other content-bearing field in this
+    // struct, never touched again after construction.
+    server_id: Option<String>,
+    server_id_ino: INodeNo,
     // Per-top-level-directory mode/uid/gid from `fuse-permissions.toml`
     // (see `permissions_for`) — deliberately does not cover `client-trust/`
     // at all (T3 hardcodes that subtree's attrs regardless of this field).
@@ -177,6 +188,7 @@ impl InfusedFilesystem {
         client_trust: Option<Arc<Mutex<ClientTrustState>>>,
         permissions: FusePermissions,
         write_mode: WriteMode,
+        server_id: Option<String>,
     ) -> Self {
         let name_to_ino = registers
             .iter()
@@ -250,6 +262,11 @@ impl InfusedFilesystem {
                 .unwrap_or_else(PoisonError::into_inner)
                 .set_next_ino(rejected_log_ino.0 + 1);
         }
+        // Always computed, same "always allocate the inode, only
+        // conditionally expose the name" precedent as client_trust_ino —
+        // keeps every fixed inode's number independent of which optional
+        // features happen to be in use.
+        let server_id_ino = INodeNo(rejected_log_ino.0 + 1);
         Self {
             registers,
             name_to_ino,
@@ -280,6 +297,8 @@ impl InfusedFilesystem {
             rejected_log_ino,
             permissions,
             write_mode,
+            server_id,
+            server_id_ino,
         }
     }
 
@@ -345,6 +364,16 @@ impl InfusedFilesystem {
             state.rejected_log_content()
         } else {
             String::new()
+        }
+    }
+
+    // Callers are expected to have already confirmed `server_id.is_some()`,
+    // same convention as `connection_attempts_log_content` — this just
+    // formats what's there.
+    fn server_id_content(&self) -> String {
+        match &self.server_id {
+            Some(server_id) => format!("{server_id}\n"),
+            None => String::new(),
         }
     }
 
@@ -788,6 +817,18 @@ impl Filesystem for InfusedFilesystem {
                         Generation(0),
                     );
                 }
+                // Only exists when the effective device description (local
+                // or FC43-fetched) configured a `server-id` — absent means
+                // this file genuinely doesn't exist, same "exists vs.
+                // exists-but-empty" distinction as `client-trust` above.
+                Some("server-id") if self.server_id.is_some() => {
+                    let content = self.server_id_content();
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.file_attr(self.server_id_ino, content.len() as u64, 0o444, req),
+                        Generation(0),
+                    );
+                }
                 _ => reply.error(Errno::ENOENT),
             }
             return;
@@ -1047,6 +1088,15 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
+        if self.server_id.is_some() && ino == self.server_id_ino {
+            let content = self.server_id_content();
+            reply.attr(
+                &ATTR_TTL,
+                &self.file_attr(ino, content.len() as u64, 0o444, req),
+            );
+            return;
+        }
+
         if let Some(fingerprint) = self
             .client_trust_lock()
             .and_then(|state| state.fingerprint_by_ino(ino).map(str::to_string))
@@ -1261,6 +1311,8 @@ impl Filesystem for InfusedFilesystem {
                 || ino == self.rejected_log_ino)
         {
             self.connection_attempts_log_content(ino)
+        } else if self.server_id.is_some() && ino == self.server_id_ino {
+            self.server_id_content()
         } else {
             reply.error(Errno::ENOENT);
             return;
@@ -1316,6 +1368,11 @@ impl Filesystem for InfusedFilesystem {
                 self.client_trust_ino,
                 FileType::Directory,
                 "client-trust".to_string(),
+            )))
+            .chain(self.server_id.is_some().then_some((
+                self.server_id_ino,
+                FileType::RegularFile,
+                "server-id".to_string(),
             )))
             .collect()
         } else if ino == self.client_trust_ino && self.client_trust.is_some() {
@@ -1700,9 +1757,33 @@ mod tests {
         test_filesystem_with_permissions_and_write_mode(permissions, WriteMode::Staged)
     }
 
+    fn test_filesystem_with_server_id(
+        server_id: Option<String>,
+    ) -> (
+        InfusedFilesystem,
+        mpsc::Receiver<HashMap<String, StagedValue>>,
+    ) {
+        test_filesystem_with_permissions_write_mode_and_server_id(
+            FusePermissions::default(),
+            WriteMode::Staged,
+            server_id,
+        )
+    }
+
     fn test_filesystem_with_permissions_and_write_mode(
         permissions: FusePermissions,
         write_mode: WriteMode,
+    ) -> (
+        InfusedFilesystem,
+        mpsc::Receiver<HashMap<String, StagedValue>>,
+    ) {
+        test_filesystem_with_permissions_write_mode_and_server_id(permissions, write_mode, None)
+    }
+
+    fn test_filesystem_with_permissions_write_mode_and_server_id(
+        permissions: FusePermissions,
+        write_mode: WriteMode,
+        server_id: Option<String>,
     ) -> (
         InfusedFilesystem,
         mpsc::Receiver<HashMap<String, StagedValue>>,
@@ -1738,6 +1819,7 @@ mod tests {
                 None,
                 permissions,
                 write_mode,
+                server_id,
             ),
             receiver,
         )
@@ -1765,6 +1847,7 @@ mod tests {
             Some(client_trust),
             FusePermissions::default(),
             WriteMode::Direct,
+            None,
         )
     }
 
@@ -2447,6 +2530,33 @@ mod tests {
             .unwrap()
             .insert_approved("aa:bb");
         assert!(ino.0 > filesystem.client_trust_approved_ino.0);
+    }
+
+    #[test]
+    fn server_id_ino_is_calibrated_past_every_fixed_inode() {
+        let filesystem = test_filesystem_with_client_trust();
+        assert_ne!(filesystem.server_id_ino, filesystem.client_trust_ino);
+        assert_ne!(
+            filesystem.server_id_ino,
+            filesystem.client_trust_approved_ino
+        );
+        assert_ne!(filesystem.server_id_ino, filesystem.connection_attempts_ino);
+        assert_ne!(filesystem.server_id_ino, filesystem.approved_log_ino);
+        assert_ne!(filesystem.server_id_ino, filesystem.pending_log_ino);
+        assert_ne!(filesystem.server_id_ino, filesystem.rejected_log_ino);
+    }
+
+    #[test]
+    fn server_id_content_is_empty_when_not_configured() {
+        let (filesystem, _receiver) = test_filesystem_with_server_id(None);
+        assert_eq!(filesystem.server_id_content(), "");
+    }
+
+    #[test]
+    fn server_id_content_is_the_configured_value_with_a_trailing_newline() {
+        let (filesystem, _receiver) =
+            test_filesystem_with_server_id(Some("infused_modbus-demo-plc".to_string()));
+        assert_eq!(filesystem.server_id_content(), "infused_modbus-demo-plc\n");
     }
 
     #[test]
