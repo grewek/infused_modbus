@@ -23,20 +23,23 @@ Nothing here shipped without a human decision behind it, but essentially all of 
 
 - **No separate client API — the filesystem is the interface.** Reading a register's current value is `cat holding-registers/Tank_Temperature`. Writing one is `echo 55 > transactions/Stop_Process`.
 - **Transactions are filesystem-native, multi-value commits.** Stage register writes as files under `transactions/`, then create a sentinel file `TRANSACTION_END` to commit them all as one batch. `ls`, `cat`, and `rm` work for inspecting or un-staging what's pending.
-- **Writes are not applied optimistically.** On the client, `report/<name>` confirms a write immediately, but `holding-registers/<name>` only updates on the *next poll* of the connected device — polling is deliberately the client's only writer of its own mirror, to avoid a race where an in-flight poll response could otherwise land after a commit and overwrite the freshly-confirmed value with a stale one. On the server, its own in-memory state is the data an external Modbus master reads, so a locally staged write applies immediately; there's no separate device to wait on.
-- **Per-register write status.** `report/<register-name>` shows the outcome of that register's most recent write attempt (`OK` or `FAILED: <reason>`), independent of every other register.
+- **Writes are not applied optimistically.** On the client, `report/<name>` confirms a write immediately, but `holding-registers/<name>` only updates on the *next poll* of the connected device — polling is deliberately the client's only writer of its own mirror, to avoid a race where an in-flight poll response could otherwise land after a commit and overwrite the freshly-confirmed value with a stale one. On the server, its own in-memory state *is* the data an external Modbus master reads, so a write applies immediately with no separate device to wait on.
+- **Client and server write differently — staged vs. direct.** The client stages writes in `transactions/`, committed together via `TRANSACTION_END` (see below). The server has no `transactions/` at all: `holding-registers/`, `coils/`, `discrete-inputs/`, and `input-registers/` are directly writable there — `echo 5 > holding-registers/Setpoint` applies immediately, since the server's own state doesn't need staging or round-tripping to a separate device.
+- **Per-register write status.** `report/<register-name>` shows the outcome of that register's most recent write attempt (`OK` or `FAILED: <reason>`), independent of every other register. Client-only, and scoped to registers/coils (not discrete-inputs/input-registers, whose only failure signal is the direct write's own return code).
+- **Discrete inputs and input registers are read-only mirrors of FC 2/FC 4 data.** `discrete-inputs/` and `input-registers/` sit alongside `holding-registers/`/`coils/`, populated by the client's polling loop or the server's own direct writes — never writable on the client, since no Modbus function code lets a master write either kind.
 - **TCP and RTU use the same code paths.** Both `client` and `server` accept a connection string in the form `tcp://<address:port>` or `rtu://<serial-path>:<baud-rate>`; transactions, polling, and device-description discovery are implemented once and dispatch to whichever transport was chosen.
 - **The server can advertise its own register description.** Instead of the client needing a hand-maintained copy of the server's register description, the client can fetch it at startup over Modbus function code 43 (Read Device Identification) — see [Device description discovery](#device-description-discovery-fc-43) below. A local fallback file is still required in case the server doesn't support this.
 - **Modbus implemented from scratch.** The `protocol` crate implements Modbus TCP/RTU framing, CRC16, and PDU encode/decode directly, rather than wrapping an existing crate like `tokio-modbus`. Some individual inputs read from the wire (declared lengths/counts) are checked against the actual remaining buffer before being used for allocation or indexing — this reduces a few specific classes of bugs, but is not a substitute for a real security review, which this project has not had (see the warning above).
 - **Polling batches register reads.** The client keeps its local mirror fresh by polling, grouping contiguous register addresses into a single `Read Holding Registers` request (up to Modbus's 125-register limit) instead of one request per register. Standard Modbus has no mechanism for a device to push updates on its own — polling is the only option the protocol allows.
 - **Every register data type is read and written over the wire**, including ones spanning more than one 16-bit Modbus register (`u32`, `f64`, ...) — see [Device description TOML format](#device-description-toml-format) for the full type list and how `mem-layout` controls their byte order.
+- **A `transactions/<name>` file can stage a Mask Write Register instead of a plain value**, atomically setting/clearing specific bits in a real device's register without needing to know its current contents first — client-only, see [Interacting with the filesystem](#interacting-with-the-filesystem).
 - **Client TLS certificates require server-side approval.** Over `tls+tcp://`, the server requires every connecting client to present a certificate, and only ones an operator has explicitly approved are allowed through — via a local admin channel kept separate from the FUSE mount itself, not through the filesystem. Approvals are persisted to disk, bounded by an optional `--max-clients` limit, and revoking one immediately disconnects it if it's already connected, not just future attempts. See [Connecting over TLS](#connecting-over-tls).
 - **FUSE directory permissions are configurable.** An optional `fuse-permissions.toml` sets `mode`/`uid`/`gid` per top-level directory, enforced by the kernel rather than just displayed — see [FUSE directory permissions](#fuse-directory-permissions).
 
 ## Client vs. server
 
-- **`client`** acts as a Modbus master against a connected device. It polls the device to keep `holding-registers/` fresh, and turns `transactions/` commits into Modbus writes, updating the local mirror only once the device confirms them.
-- **`server`** acts as a Modbus slave that external Modbus masters query and write against. Its own in-memory register store is the state being served: an external write applies immediately and is reflected into `holding-registers/`, and a locally staged `transactions/` commit is visible to external masters on their next read. `server`'s mount also has a `client-trust/` directory that `client`'s never has — see [Connecting over TLS](#connecting-over-tls).
+- **`client`** acts as a Modbus master against a connected device. It polls the device to keep `holding-registers/`/`discrete-inputs/`/`input-registers/` fresh, and turns `transactions/` commits into Modbus writes, updating the local mirror only once the device confirms them.
+- **`server`** acts as a Modbus slave that external Modbus masters query and write against. Its own in-memory state is what's being served: an external write applies immediately and is reflected into `holding-registers/`/`coils/`/`discrete-inputs/`/`input-registers/`, and a direct local write to any of those same files is visible to external masters on their very next read — no `transactions/` staging on the server at all (see [Design overview](#design-overview)). `server`'s mount also has a `client-trust/` directory that `client`'s never has — see [Connecting over TLS](#connecting-over-tls).
 
 This has been tested against this project's own client/server implementations and against virtual serial ports, not against third-party PLC or SCADA hardware or software — whether it interoperates with a specific real-world device or system has not been verified.
 
@@ -54,7 +57,7 @@ A given `client`/`server` instance uses exactly one of these at a time — they 
 
 ## Supported Modbus function codes
 
-This lists every public function code defined by the Modbus Application Protocol specification, not just the ones this project implements — so the gaps are visible rather than silently omitted. "Decoded, not wired" means `protocol` can encode/decode the PDU, but `client`/`server` don't call it yet; support for everything else marked "Not implemented yet" will be added later. "Out of scope" means this project has decided not to implement it at all — see the note below the table.
+This lists every public function code defined by the Modbus Application Protocol specification, not just the ones this project implements — so the gaps are visible rather than silently omitted. "Not implemented yet" will be added later. "Out of scope" means this project has decided not to implement it at all — see the notes below the table.
 
 | Code | Name | Status |
 | ---- | ---- | ------ |
@@ -201,7 +204,15 @@ touch transactions/TRANSACTION_END          # commit everything staged
 cat report/Stop_Process                     # OK, or FAILED: <reason>
 ```
 
-Coils work the same way, under `coils/` instead of `holding-registers/` — `transactions/` and `report/` are shared across both (one register and one coil can even be staged in the same commit). A coil's value is `0` or `1`:
+**This is the client's write path — `transactions/`, `TRANSACTION_END`, and `report/` don't exist on the server at all.** The server writes directly into `holding-registers/<name>` (or `coils/`/`discrete-inputs/`/`input-registers/`) instead — `echo 55 > holding-registers/Stop_Process` applies immediately, since the server's own state doesn't need staging or a round trip to confirm:
+
+```sh
+echo 55 > holding-registers/Stop_Process    # server only — applies immediately, no transactions/
+```
+
+`discrete-inputs/` and `input-registers/` (FC 2/FC 4 data) sit alongside `holding-registers/`, same `ls`/`cat` shape — read-only on the client (populated by polling), directly writable on the server exactly like `holding-registers/` above.
+
+Coils work the same way as holding registers, under `coils/` instead — `transactions/` and `report/` are shared across both on the client (one register and one coil can even be staged in the same commit). A coil's value is `0` or `1`:
 
 ```sh
 cat coils/Motor_Running                     # 0 or 1
@@ -264,7 +275,7 @@ access = "read_write"
 
 Each entry's actual Modbus address is `base_address + offset` — `Tank_Temperature` above lives at 40001.
 
-- `name` — the human-readable name used as the filename under `holding-registers/`, `transactions/`, and `report/`.
+- `name` — the human-readable name used as the filename under `holding-registers/` and, on the client, `transactions/`/`report/` too.
 - `offset` — added to the section's `base_address` to get the register's real Modbus address.
 - `data_type` — one of `u8`, `i8`, `u16`, `i16`, `u24`, `i24`, `u32`, `i32`, `u64`, `i64`, `f32`, `f64`. Anything wider than one 16-bit register (`u24` and up) spans consecutive registers, in the byte order `mem-layout` describes. `u24`/`i24` have no native Modbus width — they occupy two registers (32 bits) with the top byte always zero (`u24`) or sign-extended (`i24`).
 - `access` — `"read_only"` or `"read_write"`.
@@ -334,6 +345,32 @@ name = "Alarm_Reset"
 offset = 2
 ```
 
+Discrete inputs (FC 0x02) mirror coils — same `base_address`/`offset`/`name` shape, always exactly 1 bit — but are always read-only, since no Modbus function code ever lets a master write one:
+
+```toml
+[discrete-inputs]
+base_address = 10000
+
+[[discrete-inputs.entries]]
+name = "Door_Open_Sensor"
+offset = 1
+```
+
+Input registers (FC 0x04) mirror `[registers]` minus `access` (always read-only) — they still need their own `mem-layout`, since a value can span multiple registers exactly like holding registers:
+
+```toml
+[input-registers]
+base_address = 30000
+mem-layout = "abcd"
+
+[[input-registers.entries]]
+name = "Flow_Rate"
+offset = 1
+data_type = "f32"
+```
+
+All four sections (`[registers]`, `[coils]`, `[discrete-inputs]`, `[input-registers]`) are independently optional — a device only declares the ones it actually has.
+
 ## FUSE directory permissions
 
 By default every top-level FUSE directory (`holding-registers/`, `transactions/`, `report/`, `coils/`) is mode `0755`, owned by whoever made a given filesystem request — the same behavior as before this option existed. An optional `fuse-permissions.toml`, passed to either binary via `--fuse-permissions <path>` (see [Getting started](#getting-started)), overrides `mode`/`uid`/`gid` per directory. Every field, and every directory section, is optional — only what actually needs restricting has to be spelled out:
@@ -356,8 +393,8 @@ Both binaries mount with the kernel's `default_permissions` option, so these val
 
 This project is under active development. As of now:
 
-- Read Discrete Inputs (FC 0x02) is decoded by `protocol` but not wired into `client`/`server` yet — there's no discrete-input device model in the TOML schema (see the function code table above). The same goes for Input Registers (FC 0x04), which isn't implemented at the protocol level at all yet.
 - `u8`/`i8` registers each occupy a whole 16-bit register (in the low byte) rather than two of them being packed into one — no real device was found that packs independent named values that way, so the simpler representation was kept.
+- The server's direct-write FUSE path (`holding-registers/<name>` and friends) doesn't check a register's TOML-declared `access = "read_only"` — every wire-facing write handler does enforce it, but a local write via the server's own mount currently doesn't. Not yet fixed.
 - FC 43 (device identification) only supports "Extended" access serving custom private objects (the mechanism used for description discovery above) — the standard VendorName/ProductCode/etc. objects and Basic/Regular/Individual access aren't implemented yet.
 - RTU serial parameters beyond baud rate (data bits, parity, stop bits) aren't configurable yet; fixed defaults (8 data bits, no parity, 1 stop bit) are used.
 - `tls+tcp://`'s admin socket path, TLS identity directories, `approved-clients.toml`'s own path, and DoS-hardening limits (handshake timeout, connection caps — see [Connecting over TLS](#connecting-over-tls)) are all fixed constants, not yet configurable via a CLI flag. Protection against a flood from many different source addresses is explicitly out of scope for the application layer itself. RTU's serial link remains a separate, unauthenticated threat model that TLS does nothing to address.
