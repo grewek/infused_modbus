@@ -8,6 +8,7 @@ pub const FUNCTION_CODE_READ_HOLDING_REGISTERS: u8 = 0x03;
 pub const FUNCTION_CODE_READ_INPUT_REGISTERS: u8 = 0x04;
 pub const FUNCTION_CODE_WRITE_SINGLE_REGISTER: u8 = 0x06;
 pub const FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS: u8 = 0x10;
+pub const FUNCTION_CODE_MASK_WRITE_REGISTER: u8 = 0x16;
 pub const FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT: u8 = 0x2B;
 
 // Function code 0x2B is itself a container for different "MEI" (Modbus
@@ -45,6 +46,13 @@ const QUANTITY_OR_VALUE_FIELD_BYTE: usize = 3;
 
 // Length of any PDU that is just function code + two u16 fields (see above).
 const TWO_FIELD_PDU_LEN: usize = 5;
+
+// Mask Write Register (FC 0x16) reuses ADDRESS_FIELD_BYTE (reference
+// address) and QUANTITY_OR_VALUE_FIELD_BYTE (and_mask) above, but has a
+// third u16 field (or_mask) beyond what either of the other two-field PDUs
+// carry, hence its own offset/length pair.
+const OR_MASK_FIELD_BYTE: usize = 5;
+const MASK_WRITE_REGISTER_PDU_LEN: usize = 7;
 
 const BYTE_COUNT_BYTE: usize = 1;
 // Byte 2 is where the payload starts in any response shaped as
@@ -179,6 +187,26 @@ pub struct WriteSingleRegisterRequest {
 pub struct WriteSingleRegisterResponse {
     pub register_address: u16,
     pub register_value: u16,
+}
+
+/// Mask Write Register (Modbus Application Protocol V1.1b3, section 6.8):
+/// applies `result = (current_contents AND and_mask) OR (or_mask AND (NOT
+/// and_mask))` to a single register in place, rather than replacing its
+/// contents outright. Request and response share this exact shape — a
+/// successful response just echoes back the request unchanged, same pattern
+/// as [`WriteSingleRegisterRequest`]/[`WriteSingleRegisterResponse`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskWriteRegisterRequest {
+    pub reference_address: u16,
+    pub and_mask: u16,
+    pub or_mask: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskWriteRegisterResponse {
+    pub reference_address: u16,
+    pub and_mask: u16,
+    pub or_mask: u16,
 }
 
 /// Same packed-bit wire encoding as [`ReadCoilsResponse`]/`WriteSingleCoil`'s
@@ -616,6 +644,61 @@ impl WriteSingleRegisterResponse {
         Ok(Self {
             register_address,
             register_value,
+        })
+    }
+}
+
+fn encode_mask_write_register(reference_address: u16, and_mask: u16, or_mask: u16) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(MASK_WRITE_REGISTER_PDU_LEN);
+    buffer.push(FUNCTION_CODE_MASK_WRITE_REGISTER);
+    buffer.extend_from_slice(&reference_address.to_be_bytes());
+    buffer.extend_from_slice(&and_mask.to_be_bytes());
+    buffer.extend_from_slice(&or_mask.to_be_bytes());
+    buffer
+}
+
+fn decode_mask_write_register(bytes: &[u8]) -> Result<(u16, u16, u16), DecodeError> {
+    if bytes.len() < MASK_WRITE_REGISTER_PDU_LEN {
+        return Err(DecodeError::TooShort);
+    }
+    if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_MASK_WRITE_REGISTER {
+        return Err(DecodeError::UnexpectedFunctionCode {
+            expected: FUNCTION_CODE_MASK_WRITE_REGISTER,
+            actual: bytes[FUNCTION_CODE_BYTE],
+        });
+    }
+    let reference_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
+    let and_mask = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
+    let or_mask = read_u16_be(bytes, OR_MASK_FIELD_BYTE);
+    Ok((reference_address, and_mask, or_mask))
+}
+
+impl MaskWriteRegisterRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        encode_mask_write_register(self.reference_address, self.and_mask, self.or_mask)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let (reference_address, and_mask, or_mask) = decode_mask_write_register(bytes)?;
+        Ok(Self {
+            reference_address,
+            and_mask,
+            or_mask,
+        })
+    }
+}
+
+impl MaskWriteRegisterResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        encode_mask_write_register(self.reference_address, self.and_mask, self.or_mask)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let (reference_address, and_mask, or_mask) = decode_mask_write_register(bytes)?;
+        Ok(Self {
+            reference_address,
+            and_mask,
+            or_mask,
         })
     }
 }
@@ -1497,6 +1580,98 @@ mod tests {
             Err(DecodeError::UnexpectedFunctionCode {
                 expected: 0x06,
                 actual: 0x03
+            })
+        );
+    }
+
+    #[test]
+    fn mask_write_register_request_round_trip() {
+        let request = MaskWriteRegisterRequest {
+            reference_address: 0x0004,
+            and_mask: 0x00F2,
+            or_mask: 0x0025,
+        };
+        let encoded = request.encode();
+        let decoded = MaskWriteRegisterRequest::decode(&encoded).unwrap();
+        assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn mask_write_register_request_encode_produces_expected_bytes() {
+        let request = MaskWriteRegisterRequest {
+            reference_address: 0x0004,
+            and_mask: 0x00F2,
+            or_mask: 0x0025,
+        };
+        assert_eq!(
+            request.encode(),
+            vec![0x16, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25]
+        );
+    }
+
+    #[test]
+    fn mask_write_register_request_decode_rejects_too_short_buffer() {
+        let bytes = [0x16, 0x00, 0x04, 0x00, 0xF2, 0x00];
+        assert_eq!(
+            MaskWriteRegisterRequest::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn mask_write_register_request_decode_rejects_wrong_function_code() {
+        let bytes = [0x06, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25];
+        assert_eq!(
+            MaskWriteRegisterRequest::decode(&bytes),
+            Err(DecodeError::UnexpectedFunctionCode {
+                expected: 0x16,
+                actual: 0x06
+            })
+        );
+    }
+
+    #[test]
+    fn mask_write_register_response_round_trip() {
+        let response = MaskWriteRegisterResponse {
+            reference_address: 0x0004,
+            and_mask: 0x00F2,
+            or_mask: 0x0025,
+        };
+        let encoded = response.encode();
+        let decoded = MaskWriteRegisterResponse::decode(&encoded).unwrap();
+        assert_eq!(response, decoded);
+    }
+
+    #[test]
+    fn mask_write_register_response_encode_produces_expected_bytes() {
+        let response = MaskWriteRegisterResponse {
+            reference_address: 0x0004,
+            and_mask: 0x00F2,
+            or_mask: 0x0025,
+        };
+        assert_eq!(
+            response.encode(),
+            vec![0x16, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25]
+        );
+    }
+
+    #[test]
+    fn mask_write_register_response_decode_rejects_too_short_buffer() {
+        let bytes = [0x16, 0x00, 0x04, 0x00, 0xF2, 0x00];
+        assert_eq!(
+            MaskWriteRegisterResponse::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn mask_write_register_response_decode_rejects_wrong_function_code() {
+        let bytes = [0x06, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25];
+        assert_eq!(
+            MaskWriteRegisterResponse::decode(&bytes),
+            Err(DecodeError::UnexpectedFunctionCode {
+                expected: 0x16,
+                actual: 0x06
             })
         );
     }

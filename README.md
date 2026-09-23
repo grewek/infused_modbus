@@ -59,9 +59,9 @@ This lists every public function code defined by the Modbus Application Protocol
 | Code | Name | Status |
 | ---- | ---- | ------ |
 | 0x01 | Read Coils | Supported |
-| 0x02 | Read Discrete Inputs | Decoded, not wired |
+| 0x02 | Read Discrete Inputs | Supported |
 | 0x03 | Read Holding Registers | Supported |
-| 0x04 | Read Input Registers | Not implemented yet |
+| 0x04 | Read Input Registers | Supported |
 | 0x05 | Write Single Coil | Supported |
 | 0x06 | Write Single Register | Supported |
 | 0x07 | Read Exception Status | Out of scope |
@@ -73,7 +73,7 @@ This lists every public function code defined by the Modbus Application Protocol
 | 0x11 | Report Server ID | Not implemented yet |
 | 0x14 | Read File Record | Not implemented yet |
 | 0x15 | Write File Record | Not implemented yet |
-| 0x16 | Mask Write Register | Not implemented yet |
+| 0x16 | Mask Write Register | Supported |
 | 0x17 | Read/Write Multiple Registers | Not implemented yet |
 | 0x18 | Read FIFO Queue | Not implemented yet |
 | 0x2B / MEI 0x0E | Encapsulated Interface Transport — Read Device Identification | Supported (Extended access only — see [Device description discovery](#device-description-discovery-fc-43)) |

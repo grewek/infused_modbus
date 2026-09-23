@@ -40,16 +40,18 @@ use protocol::device_description::{
 };
 use protocol::pdu::{
     EXCEPTION_ILLEGAL_DATA_ADDRESS, EXCEPTION_ILLEGAL_DATA_VALUE, EXCEPTION_ILLEGAL_FUNCTION,
-    ExceptionResponse, FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT, FUNCTION_CODE_READ_COILS,
+    ExceptionResponse, FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
+    FUNCTION_CODE_MASK_WRITE_REGISTER, FUNCTION_CODE_READ_COILS,
     FUNCTION_CODE_READ_DISCRETE_INPUTS, FUNCTION_CODE_READ_HOLDING_REGISTERS,
     FUNCTION_CODE_READ_INPUT_REGISTERS, FUNCTION_CODE_WRITE_MULTIPLE_COILS,
     FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS, FUNCTION_CODE_WRITE_SINGLE_COIL,
-    FUNCTION_CODE_WRITE_SINGLE_REGISTER, ReadCoilsRequest, ReadCoilsResponse,
-    ReadDeviceIdentificationRequest, ReadDiscreteInputsRequest, ReadDiscreteInputsResponse,
-    ReadHoldingRegistersRequest, ReadHoldingRegistersResponse, ReadInputRegistersRequest,
-    ReadInputRegistersResponse, WriteMultipleCoilsRequest, WriteMultipleCoilsResponse,
-    WriteMultipleRegistersRequest, WriteMultipleRegistersResponse, WriteSingleCoilRequest,
-    WriteSingleCoilResponse, WriteSingleRegisterRequest, WriteSingleRegisterResponse,
+    FUNCTION_CODE_WRITE_SINGLE_REGISTER, MaskWriteRegisterRequest, MaskWriteRegisterResponse,
+    ReadCoilsRequest, ReadCoilsResponse, ReadDeviceIdentificationRequest,
+    ReadDiscreteInputsRequest, ReadDiscreteInputsResponse, ReadHoldingRegistersRequest,
+    ReadHoldingRegistersResponse, ReadInputRegistersRequest, ReadInputRegistersResponse,
+    WriteMultipleCoilsRequest, WriteMultipleCoilsResponse, WriteMultipleRegistersRequest,
+    WriteMultipleRegistersResponse, WriteSingleCoilRequest, WriteSingleCoilResponse,
+    WriteSingleRegisterRequest, WriteSingleRegisterResponse,
 };
 use std::sync::{Mutex, PoisonError};
 
@@ -83,6 +85,9 @@ pub fn handle_request(
         }
         FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS => {
             handle_write_multiple_registers(pdu, registers, store, mem_layout)
+        }
+        FUNCTION_CODE_MASK_WRITE_REGISTER => {
+            handle_mask_write_register(pdu, registers, store, mem_layout)
         }
         FUNCTION_CODE_READ_COILS => handle_read_coils(pdu, coils, coil_store),
         FUNCTION_CODE_WRITE_SINGLE_COIL => handle_write_single_coil(pdu, coils, coil_store),
@@ -251,6 +256,67 @@ fn handle_write_single(
         // can't write here [this way]".
         None => ExceptionResponse {
             function_code: FUNCTION_CODE_WRITE_SINGLE_REGISTER,
+            exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+        }
+        .encode(),
+    }
+}
+
+// Mask Write Register (FC 0x16) modifies a single existing register's
+// contents in place — `result = (current AND and_mask) OR (or_mask AND (NOT
+// and_mask))` — rather than replacing them outright. Same 1-register-wide
+// scope as Write Single Register (FC6, handle_write_single above), for the
+// same reason: the function code has no way to address more than one wire
+// word. The read of the current value and the write of the new one happen
+// under one held lock, not two separate lock acquisitions, so a concurrent
+// write to the same register can't land between them and get silently
+// overwritten.
+fn handle_mask_write_register(
+    pdu: &[u8],
+    registers: &[RegisterDescription],
+    store: &Mutex<RegisterStore>,
+    mem_layout: MemLayout,
+) -> Vec<u8> {
+    let Ok(request) = MaskWriteRegisterRequest::decode(pdu) else {
+        return ExceptionResponse {
+            function_code: FUNCTION_CODE_MASK_WRITE_REGISTER,
+            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+        }
+        .encode();
+    };
+
+    let register = registers.iter().find(|register| {
+        register.address == request.reference_address
+            && register.data_type.register_count() == 1
+            && register.access == AccessRight::ReadWrite
+    });
+    match register {
+        Some(register) => {
+            let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
+            let current_value = match store.get(&register.name) {
+                Some(value) if value.data_type() == register.data_type => value,
+                _ => default_register_value(register.data_type),
+            };
+            // Always exactly one word: register_count() == 1 was just
+            // checked above.
+            let current_word = register_value_to_words(current_value, mem_layout)[0];
+            let new_word =
+                (current_word & request.and_mask) | (request.or_mask & !request.and_mask);
+            let new_value = register_value_from_words(register.data_type, &[new_word], mem_layout)
+                .expect("a single word always decodes for a 1-register-wide DataType");
+            store.set(register.name.clone(), new_value);
+            MaskWriteRegisterResponse {
+                reference_address: request.reference_address,
+                and_mask: request.and_mask,
+                or_mask: request.or_mask,
+            }
+            .encode()
+        }
+        // Covers the same three cases as handle_write_single: no register
+        // at this address, a register too wide for this FC, and a
+        // read-only register.
+        None => ExceptionResponse {
+            function_code: FUNCTION_CODE_MASK_WRITE_REGISTER,
             exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
         }
         .encode(),
@@ -935,6 +1001,130 @@ mod tests {
             ExceptionResponse::decode(&response).unwrap(),
             ExceptionResponse {
                 function_code: FUNCTION_CODE_WRITE_SINGLE_REGISTER,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
+        assert_eq!(store.lock().unwrap().get("Precise_Value"), None);
+    }
+
+    #[test]
+    fn mask_write_register_applies_mask_to_existing_value_and_echoes_the_request() {
+        // Current=0x0012, And=0x00F2, Or=0x0025 -> Result=0x0017 is the
+        // Modbus spec's own worked example (Application Protocol V1.1b3,
+        // section 6.8) — reused here rather than an arbitrary value so the
+        // expected result is independently verifiable against the spec.
+        let store = Mutex::new(RegisterStore::new());
+        store
+            .lock()
+            .unwrap()
+            .set("Stop_Process", RegisterValue::U16(0x0012));
+        let coil_store = Mutex::new(CoilStore::new());
+        let request = MaskWriteRegisterRequest {
+            reference_address: 40002,
+            and_mask: 0x00F2,
+            or_mask: 0x0025,
+        }
+        .encode();
+
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+        );
+
+        assert_eq!(
+            MaskWriteRegisterResponse::decode(&response).unwrap(),
+            MaskWriteRegisterResponse {
+                reference_address: 40002,
+                and_mask: 0x00F2,
+                or_mask: 0x0025,
+            }
+        );
+        assert_eq!(
+            store.lock().unwrap().get("Stop_Process"),
+            Some(RegisterValue::U16(0x0017))
+        );
+    }
+
+    #[test]
+    fn mask_write_register_to_a_read_only_register_returns_an_exception_and_does_not_apply() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let request = MaskWriteRegisterRequest {
+            reference_address: 40001,
+            and_mask: 0x0000,
+            or_mask: 0xFFFF,
+        }
+        .encode();
+
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_MASK_WRITE_REGISTER,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
+        assert_eq!(store.lock().unwrap().get("Tank_Temperature"), None);
+    }
+
+    #[test]
+    fn mask_write_register_of_a_multi_register_type_returns_an_exception() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        // Precise_Value is F64 (4 registers wide) and read/write — Mask
+        // Write Register, like Write Single Register, can only ever carry
+        // one wire word, so this can never succeed no matter the access
+        // rights.
+        let request = MaskWriteRegisterRequest {
+            reference_address: 40020,
+            and_mask: 0x0000,
+            or_mask: 0xFFFF,
+        }
+        .encode();
+
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_MASK_WRITE_REGISTER,
                 exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
             }
         );
