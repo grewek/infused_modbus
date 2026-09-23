@@ -74,11 +74,13 @@ This lists every public function code defined by the Modbus Application Protocol
 | 0x14 | Read File Record | Not implemented yet |
 | 0x15 | Write File Record | Not implemented yet |
 | 0x16 | Mask Write Register | Supported |
-| 0x17 | Read/Write Multiple Registers | Not implemented yet |
+| 0x17 | Read/Write Multiple Registers | Supported (server only — see note below the table) |
 | 0x18 | Read FIFO Queue | Not implemented yet |
 | 0x2B / MEI 0x0E | Encapsulated Interface Transport — Read Device Identification | Supported (Extended access only — see [Device description discovery](#device-description-discovery-fc-43)) |
 
 **0x07, 0x08, 0x0B, 0x0C are deliberately out of scope.** All four are marked "(Serial Line only)" in the spec itself and exist to diagnose the physical RS-485/RTU link (CRC error counts, character overrun counts, a Listen Only Mode to silence a malfunctioning node on a multidrop bus, a rolling event log of send/receive activity). None of them read or write register/coil data, they have no equivalent over TCP, and implementing them would mean tracking link-level counters/state that serve no purpose for this project while adding attack surface to `server`. Not planned to be revisited.
+
+**0x17 (Read/Write Multiple Registers) is server-only, deliberately.** It combines a write and a read into one request/response round trip (write applied first, then read) — real external Modbus masters can use it against `server` like any other read/write, and the write half applies exactly like Write Multiple Registers (atomically, no partial apply if either half is invalid). `client` never sends it: everything it could express — write via `transactions/`+`TRANSACTION_END`, read via `holding-registers/` — is already covered by the two separate mechanisms this project already has, so a wire-level round-trip optimization here wouldn't unlock anything new through the filesystem.
 
 ## Getting started
 
