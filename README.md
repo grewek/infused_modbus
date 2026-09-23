@@ -70,7 +70,7 @@ This lists every public function code defined by the Modbus Application Protocol
 | 0x0C | Get Comm Event Log | Out of scope |
 | 0x0F | Write Multiple Coils | Supported |
 | 0x10 | Write Multiple Registers | Supported |
-| 0x11 | Report Server ID | Not implemented yet |
+| 0x11 | Report Server ID | Supported |
 | 0x14 | Read File Record | Not implemented yet |
 | 0x15 | Write File Record | Not implemented yet |
 | 0x16 | Mask Write Register | Supported |
@@ -216,6 +216,14 @@ touch transactions/TRANSACTION_END
 
 This is client-only (the server has no local use for it — see the README's function-code table and `CLAUDE.md` for why) and, like every write, can only ever target a single-register-wide value (`u8`/`i8`/`u16`/`i16`).
 
+If the device description's optional `server-id` field is set (see below), the client's mount also has a read-only `server-id` file at its root, mirroring whatever the connected device (or its own local fallback) declared:
+
+```sh
+cat server-id                               # e.g. infused_modbus-demo-plc
+```
+
+`server` never mirrors its own `server-id` into its FUSE tree this way — it only answers a real Modbus master's FC 0x11 (Report Server ID) request with it (the technician already set it in the TOML they own, so there's nothing new to show them locally).
+
 Unmount with Ctrl+C or `SIGTERM` — both `client` and `server` unmount cleanly on shutdown.
 
 ### Device description discovery (FC 43)
@@ -223,6 +231,14 @@ Unmount with Ctrl+C or `SIGTERM` — both `client` and `server` unmount cleanly 
 The client always requires a local `device-description.toml` path on the command line, but at startup it first asks the server for its own description over Modbus function code 43 (Encapsulated Interface Transport, MEI type 0x0E, Read Device Identification). If the server has one, the client uses it instead of the local file — printing progress as it fetches, since this can take a few round trips. If the server has none, doesn't support FC 43, or the fetch fails for any reason, the client transparently falls back to the local file.
 
 ## Device description TOML format
+
+An optional top-level `server-id` string identifies the device to a Modbus master asking via FC 0x11 (Report Server ID) — set once and not meant to be changed at runtime:
+
+```toml
+server-id = "infused_modbus-demo-plc"
+```
+
+`server` answers real FC 0x11 requests with it (and rejects the function code with `ILLEGAL_FUNCTION` if it's absent); `client` mirrors it read-only into its own mount as `server-id` if its effective device description (local file or FC43-fetched) has one — see [Interacting with the filesystem](#interacting-with-the-filesystem).
 
 Registers live in a `[registers]` table with a required `base_address`, a required `mem-layout` (see below), and one `[[registers.entries]]` array entry per register:
 
