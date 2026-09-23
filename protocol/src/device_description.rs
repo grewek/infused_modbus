@@ -135,6 +135,14 @@ pub struct DeviceDescription {
     // convention as its holding registers, so each gets its own field.
     // Meaningless when `input_registers` is empty.
     pub input_register_mem_layout: MemLayout,
+    // Optional, user-set-once identity string served by the server over
+    // FC 0x11 (Report Server ID) and mirrored read-only into the client's
+    // own FUSE mount (see CLAUDE.md's "FC 0x11 (Report Server ID)"
+    // section) — `None` means "not configured", not "empty string": the
+    // server answers FC11 with ILLEGAL_FUNCTION rather than an empty
+    // identity, and the client's `server-id` file doesn't exist at all
+    // rather than existing-but-blank.
+    pub server_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,6 +216,8 @@ struct RawDeviceDescription {
     discrete_inputs: RawDiscreteInputSection,
     #[serde(default, rename = "input-registers")]
     input_registers: RawInputRegisterSection,
+    #[serde(default, rename = "server-id")]
+    server_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -338,6 +348,7 @@ impl DeviceDescription {
             input_registers,
             mem_layout,
             input_register_mem_layout,
+            server_id: raw.server_id,
         })
     }
 }
@@ -429,8 +440,28 @@ mod tests {
                 input_registers: vec![],
                 mem_layout: MemLayout::Abcd,
                 input_register_mem_layout: MemLayout::Abcd,
+                server_id: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_reads_a_configured_server_id() {
+        let toml_source = r#"
+            server-id = "infused_modbus-demo-plc"
+        "#;
+        let description = DeviceDescription::parse(toml_source).unwrap();
+        assert_eq!(
+            description.server_id,
+            Some("infused_modbus-demo-plc".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_treats_an_absent_server_id_as_none() {
+        let toml_source = "";
+        let description = DeviceDescription::parse(toml_source).unwrap();
+        assert_eq!(description.server_id, None);
     }
 
     #[test]

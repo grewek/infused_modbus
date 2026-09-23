@@ -569,6 +569,7 @@ mod tests {
                 MemLayout::Abcd,
                 MemLayout::Abcd,
                 Arc::new(String::new()),
+                Arc::new(None),
                 Duration::from_secs(1),
             )
             .await;

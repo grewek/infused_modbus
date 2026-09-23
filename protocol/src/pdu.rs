@@ -9,6 +9,7 @@ pub const FUNCTION_CODE_READ_INPUT_REGISTERS: u8 = 0x04;
 pub const FUNCTION_CODE_WRITE_SINGLE_REGISTER: u8 = 0x06;
 pub const FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS: u8 = 0x10;
 pub const FUNCTION_CODE_MASK_WRITE_REGISTER: u8 = 0x16;
+pub const FUNCTION_CODE_REPORT_SERVER_ID: u8 = 0x11;
 pub const FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT: u8 = 0x2B;
 
 // Function code 0x2B is itself a container for different "MEI" (Modbus
@@ -53,6 +54,19 @@ const TWO_FIELD_PDU_LEN: usize = 5;
 // carry, hence its own offset/length pair.
 const OR_MASK_FIELD_BYTE: usize = 5;
 const MASK_WRITE_REGISTER_PDU_LEN: usize = 7;
+
+// Report Server ID's response reuses the same function-code(1) +
+// byte-count(1) + payload shape as BYTE_COUNT_BYTE/RESPONSE_DATA_START
+// above, but under its own name: that pair is documented as specific to a
+// register/coil-address response, and Report Server ID's payload isn't
+// address-shaped data at all (a vendor-specific byte string + a trailing
+// run-indicator byte), so reusing the same constants would conflate two
+// structurally different PDUs that just happen to share byte offsets 1/2.
+const REPORT_SERVER_ID_BYTE_COUNT_BYTE: usize = 1;
+const REPORT_SERVER_ID_DATA_START: usize = 2;
+const REPORT_SERVER_ID_RESPONSE_HEADER_LEN: usize = 2;
+const RUN_INDICATOR_ON: u8 = 0xFF;
+const RUN_INDICATOR_OFF: u8 = 0x00;
 
 const BYTE_COUNT_BYTE: usize = 1;
 // Byte 2 is where the payload starts in any response shaped as
@@ -207,6 +221,25 @@ pub struct MaskWriteRegisterResponse {
     pub reference_address: u16,
     pub and_mask: u16,
     pub or_mask: u16,
+}
+
+/// Report Server ID (Modbus Application Protocol V1.1b3, section 6.11) —
+/// the request carries no fields at all, just the function code byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportServerIdRequest;
+
+/// `server_id`'s content is entirely vendor-specific per the spec (no
+/// normative format) — kept as raw bytes rather than a `String` here, since
+/// `protocol` has no business assuming it's valid UTF-8; whatever produced
+/// it (see `server::handler`) is responsible for that. `run_indicator_status`
+/// is `true` for "running" (wire value `0xFF`), `false` for "not running"
+/// (wire value `0x00`) — any other wire value is out of spec but decoded as
+/// `true`/non-zero rather than rejected, since a stray non-`0x00` value is
+/// still unambiguously "not off".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportServerIdResponse {
+    pub server_id: Vec<u8>,
+    pub run_indicator_status: bool,
 }
 
 /// Same packed-bit wire encoding as [`ReadCoilsResponse`]/`WriteSingleCoil`'s
@@ -699,6 +732,72 @@ impl MaskWriteRegisterResponse {
             reference_address,
             and_mask,
             or_mask,
+        })
+    }
+}
+
+impl ReportServerIdRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        vec![FUNCTION_CODE_REPORT_SERVER_ID]
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let Some(&function_code) = bytes.first() else {
+            return Err(DecodeError::TooShort);
+        };
+        if function_code != FUNCTION_CODE_REPORT_SERVER_ID {
+            return Err(DecodeError::UnexpectedFunctionCode {
+                expected: FUNCTION_CODE_REPORT_SERVER_ID,
+                actual: function_code,
+            });
+        }
+        Ok(Self)
+    }
+}
+
+impl ReportServerIdResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        // +1 for the trailing run_indicator_status byte, which byte_count
+        // covers alongside server_id (Modbus Application Protocol V1.1b3,
+        // section 6.11's own worked example).
+        let byte_count = self.server_id.len() + 1;
+        let mut buffer = Vec::with_capacity(REPORT_SERVER_ID_RESPONSE_HEADER_LEN + byte_count);
+        buffer.push(FUNCTION_CODE_REPORT_SERVER_ID);
+        buffer.push(byte_count as u8);
+        buffer.extend_from_slice(&self.server_id);
+        buffer.push(if self.run_indicator_status {
+            RUN_INDICATOR_ON
+        } else {
+            RUN_INDICATOR_OFF
+        });
+        buffer
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < REPORT_SERVER_ID_RESPONSE_HEADER_LEN {
+            return Err(DecodeError::TooShort);
+        }
+        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_REPORT_SERVER_ID {
+            return Err(DecodeError::UnexpectedFunctionCode {
+                expected: FUNCTION_CODE_REPORT_SERVER_ID,
+                actual: bytes[FUNCTION_CODE_BYTE],
+            });
+        }
+        let byte_count = bytes[REPORT_SERVER_ID_BYTE_COUNT_BYTE] as usize;
+        // byte_count must cover at least the trailing run_indicator_status
+        // byte — a claimed 0 has nowhere for it to live.
+        if byte_count == 0 {
+            return Err(DecodeError::TooShort);
+        }
+        if bytes.len() < REPORT_SERVER_ID_DATA_START + byte_count {
+            return Err(DecodeError::TooShort);
+        }
+        let server_id_end = REPORT_SERVER_ID_DATA_START + byte_count - 1;
+        let server_id = bytes[REPORT_SERVER_ID_DATA_START..server_id_end].to_vec();
+        let run_indicator_status = bytes[server_id_end] != RUN_INDICATOR_OFF;
+        Ok(Self {
+            server_id,
+            run_indicator_status,
         })
     }
 }
@@ -1671,6 +1770,122 @@ mod tests {
             MaskWriteRegisterResponse::decode(&bytes),
             Err(DecodeError::UnexpectedFunctionCode {
                 expected: 0x16,
+                actual: 0x06
+            })
+        );
+    }
+
+    #[test]
+    fn report_server_id_request_round_trip() {
+        let request = ReportServerIdRequest;
+        let encoded = request.encode();
+        let decoded = ReportServerIdRequest::decode(&encoded).unwrap();
+        assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn report_server_id_request_encode_produces_expected_bytes() {
+        assert_eq!(ReportServerIdRequest.encode(), vec![0x11]);
+    }
+
+    #[test]
+    fn report_server_id_request_decode_rejects_empty_buffer() {
+        assert_eq!(
+            ReportServerIdRequest::decode(&[]),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn report_server_id_request_decode_rejects_wrong_function_code() {
+        assert_eq!(
+            ReportServerIdRequest::decode(&[0x06]),
+            Err(DecodeError::UnexpectedFunctionCode {
+                expected: 0x11,
+                actual: 0x06
+            })
+        );
+    }
+
+    #[test]
+    fn report_server_id_response_round_trip() {
+        let response = ReportServerIdResponse {
+            server_id: b"infused_modbus".to_vec(),
+            run_indicator_status: true,
+        };
+        let encoded = response.encode();
+        let decoded = ReportServerIdResponse::decode(&encoded).unwrap();
+        assert_eq!(response, decoded);
+    }
+
+    #[test]
+    fn report_server_id_response_encode_produces_expected_bytes() {
+        let response = ReportServerIdResponse {
+            server_id: vec![0x41, 0x42],
+            run_indicator_status: true,
+        };
+        // function code, byte_count (2 id bytes + 1 run indicator = 3), id
+        // bytes, run indicator (0xFF = ON).
+        assert_eq!(response.encode(), vec![0x11, 0x03, 0x41, 0x42, 0xFF]);
+    }
+
+    #[test]
+    fn report_server_id_response_encode_of_an_empty_server_id() {
+        let response = ReportServerIdResponse {
+            server_id: vec![],
+            run_indicator_status: false,
+        };
+        assert_eq!(response.encode(), vec![0x11, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn report_server_id_response_decode_reads_the_run_indicator_status() {
+        let bytes = [0x11, 0x03, 0x41, 0x42, 0x00];
+        assert_eq!(
+            ReportServerIdResponse::decode(&bytes).unwrap(),
+            ReportServerIdResponse {
+                server_id: vec![0x41, 0x42],
+                run_indicator_status: false,
+            }
+        );
+    }
+
+    #[test]
+    fn report_server_id_response_decode_rejects_too_short_buffer() {
+        assert_eq!(
+            ReportServerIdResponse::decode(&[0x11]),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn report_server_id_response_decode_rejects_a_byte_count_claiming_more_than_the_buffer_holds() {
+        // byte_count says 10, but only 2 bytes actually follow — must be
+        // rejected before slicing, not read out-of-bounds or truncated
+        // silently.
+        let bytes = [0x11, 0x0A, 0x41, 0x42];
+        assert_eq!(
+            ReportServerIdResponse::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn report_server_id_response_decode_rejects_a_zero_byte_count() {
+        let bytes = [0x11, 0x00];
+        assert_eq!(
+            ReportServerIdResponse::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn report_server_id_response_decode_rejects_wrong_function_code() {
+        let bytes = [0x06, 0x03, 0x41, 0x42, 0xFF];
+        assert_eq!(
+            ReportServerIdResponse::decode(&bytes),
+            Err(DecodeError::UnexpectedFunctionCode {
+                expected: 0x11,
                 actual: 0x06
             })
         );

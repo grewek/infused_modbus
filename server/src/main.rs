@@ -187,6 +187,7 @@ fn start_serving(
     mem_layout: MemLayout,
     input_register_mem_layout: MemLayout,
     toml_source: Arc<String>,
+    server_id: Arc<Option<String>>,
     client_trust: Arc<Mutex<fuse_fs::client_trust::ClientTrustState>>,
     approved_clients: Arc<Mutex<server::client_trust::ApprovedClients>>,
     live_connections: Arc<Mutex<server::live_connections::LiveConnections>>,
@@ -217,6 +218,7 @@ fn start_serving(
                     let input_registers = Arc::clone(&input_registers);
                     let input_register_store = Arc::clone(&input_register_store);
                     let toml_source = Arc::clone(&toml_source);
+                    let server_id = Arc::clone(&server_id);
                     tokio::spawn(async move {
                         serve_tcp_connection(
                             stream,
@@ -231,6 +233,7 @@ fn start_serving(
                             mem_layout,
                             input_register_mem_layout,
                             toml_source,
+                            server_id,
                             REQUEST_TIMEOUT,
                         )
                         .await;
@@ -291,6 +294,7 @@ fn start_serving(
                     let input_registers = Arc::clone(&input_registers);
                     let input_register_store = Arc::clone(&input_register_store);
                     let toml_source = Arc::clone(&toml_source);
+                    let server_id = Arc::clone(&server_id);
                     let live_connections = Arc::clone(&live_connections);
                     let connection_semaphore = Arc::clone(&connection_semaphore);
                     tokio::spawn(async move {
@@ -350,6 +354,7 @@ fn start_serving(
                                 mem_layout,
                                 input_register_mem_layout,
                                 toml_source,
+                                server_id,
                                 REQUEST_TIMEOUT,
                             )
                             .await;
@@ -380,6 +385,7 @@ fn start_serving(
                                 mem_layout,
                                 input_register_mem_layout,
                                 toml_source,
+                                server_id,
                                 REQUEST_TIMEOUT,
                             ) => {}
                             // Resolves once `server admin revoke` drops this
@@ -424,6 +430,7 @@ fn start_serving(
                     mem_layout,
                     input_register_mem_layout,
                     toml_source,
+                    server_id,
                     frame_silence,
                     REQUEST_TIMEOUT,
                 )
@@ -467,6 +474,7 @@ fn main() {
     let input_registers = description.input_registers;
     let mem_layout = description.mem_layout;
     let input_register_mem_layout = description.input_register_mem_layout;
+    let server_id = description.server_id;
 
     let store = Arc::new(Mutex::new(RegisterStore::new()));
     let coil_store = Arc::new(Mutex::new(CoilStore::new()));
@@ -581,6 +589,7 @@ fn main() {
         mem_layout,
         input_register_mem_layout,
         Arc::new(toml_source.clone()),
+        Arc::new(server_id),
         Arc::clone(&client_trust),
         approved_clients,
         live_connections,
@@ -603,6 +612,11 @@ fn main() {
         Some(client_trust),
         fuse_permissions,
         WriteMode::Direct,
+        // Deliberately not `server_id` (already moved into `start_serving`
+        // above anyway) — the server never mirrors its own configured
+        // server-id into its FUSE tree, only answers real FC11 requests
+        // with it (see CLAUDE.md's "FC 0x11 (Report Server ID)" section).
+        None,
     );
     // default_permissions makes the kernel actually enforce what getattr
     // reports (see fuse_fs::permissions) instead of every request being

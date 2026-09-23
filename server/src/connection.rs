@@ -33,6 +33,7 @@ pub async fn serve_tcp_connection<S>(
     mem_layout: MemLayout,
     input_register_mem_layout: MemLayout,
     toml_source: Arc<String>,
+    server_id: Arc<Option<String>>,
     timeout: Duration,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -54,6 +55,7 @@ pub async fn serve_tcp_connection<S>(
         let handler_input_registers = Arc::clone(&input_registers);
         let handler_input_register_store = Arc::clone(&input_register_store);
         let handler_toml_source = Arc::clone(&toml_source);
+        let handler_server_id = Arc::clone(&server_id);
         let result = protocol::tcp::serve_request(
             &mut stream,
             async move |pdu: &[u8]| {
@@ -70,6 +72,7 @@ pub async fn serve_tcp_connection<S>(
                     mem_layout,
                     input_register_mem_layout,
                     &handler_toml_source,
+                    handler_server_id.as_deref(),
                 )
             },
             timeout,
@@ -103,6 +106,7 @@ pub async fn serve_rtu_connection<S>(
     mem_layout: MemLayout,
     input_register_mem_layout: MemLayout,
     toml_source: Arc<String>,
+    server_id: Arc<Option<String>>,
     frame_silence: Duration,
     timeout: Duration,
 ) where
@@ -118,6 +122,7 @@ pub async fn serve_rtu_connection<S>(
         let handler_input_registers = Arc::clone(&input_registers);
         let handler_input_register_store = Arc::clone(&input_register_store);
         let handler_toml_source = Arc::clone(&toml_source);
+        let handler_server_id = Arc::clone(&server_id);
         let result = protocol::rtu::serve_request(
             &mut stream,
             async move |pdu: &[u8]| {
@@ -134,6 +139,7 @@ pub async fn serve_rtu_connection<S>(
                     mem_layout,
                     input_register_mem_layout,
                     &handler_toml_source,
+                    handler_server_id.as_deref(),
                 )
             },
             frame_silence,
@@ -221,6 +227,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
+            Arc::new(None),
             Duration::from_secs(1),
         ));
 
@@ -267,6 +274,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
+            Arc::new(None),
             Duration::from_secs(1),
         ));
 
@@ -319,6 +327,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
+            Arc::new(None),
             Duration::from_secs(1),
         ));
 
@@ -373,6 +382,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
+            Arc::new(None),
             Duration::from_millis(20),
             Duration::from_secs(1),
         ));
@@ -420,6 +430,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
+            Arc::new(None),
             Duration::from_millis(20),
             Duration::from_secs(1),
         ));

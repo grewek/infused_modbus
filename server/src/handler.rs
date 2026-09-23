@@ -43,12 +43,13 @@ use protocol::pdu::{
     ExceptionResponse, FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
     FUNCTION_CODE_MASK_WRITE_REGISTER, FUNCTION_CODE_READ_COILS,
     FUNCTION_CODE_READ_DISCRETE_INPUTS, FUNCTION_CODE_READ_HOLDING_REGISTERS,
-    FUNCTION_CODE_READ_INPUT_REGISTERS, FUNCTION_CODE_WRITE_MULTIPLE_COILS,
-    FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS, FUNCTION_CODE_WRITE_SINGLE_COIL,
-    FUNCTION_CODE_WRITE_SINGLE_REGISTER, MaskWriteRegisterRequest, MaskWriteRegisterResponse,
-    ReadCoilsRequest, ReadCoilsResponse, ReadDeviceIdentificationRequest,
-    ReadDiscreteInputsRequest, ReadDiscreteInputsResponse, ReadHoldingRegistersRequest,
-    ReadHoldingRegistersResponse, ReadInputRegistersRequest, ReadInputRegistersResponse,
+    FUNCTION_CODE_READ_INPUT_REGISTERS, FUNCTION_CODE_REPORT_SERVER_ID,
+    FUNCTION_CODE_WRITE_MULTIPLE_COILS, FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
+    FUNCTION_CODE_WRITE_SINGLE_COIL, FUNCTION_CODE_WRITE_SINGLE_REGISTER, MaskWriteRegisterRequest,
+    MaskWriteRegisterResponse, ReadCoilsRequest, ReadCoilsResponse,
+    ReadDeviceIdentificationRequest, ReadDiscreteInputsRequest, ReadDiscreteInputsResponse,
+    ReadHoldingRegistersRequest, ReadHoldingRegistersResponse, ReadInputRegistersRequest,
+    ReadInputRegistersResponse, ReportServerIdRequest, ReportServerIdResponse,
     WriteMultipleCoilsRequest, WriteMultipleCoilsResponse, WriteMultipleRegistersRequest,
     WriteMultipleRegistersResponse, WriteSingleCoilRequest, WriteSingleCoilResponse,
     WriteSingleRegisterRequest, WriteSingleRegisterResponse,
@@ -69,6 +70,7 @@ pub fn handle_request(
     mem_layout: MemLayout,
     input_register_mem_layout: MemLayout,
     toml_source: &str,
+    server_id: Option<&str>,
 ) -> Vec<u8> {
     let Some(&function_code) = pdu.first() else {
         return ExceptionResponse {
@@ -89,6 +91,7 @@ pub fn handle_request(
         FUNCTION_CODE_MASK_WRITE_REGISTER => {
             handle_mask_write_register(pdu, registers, store, mem_layout)
         }
+        FUNCTION_CODE_REPORT_SERVER_ID => handle_report_server_id(pdu, server_id),
         FUNCTION_CODE_READ_COILS => handle_read_coils(pdu, coils, coil_store),
         FUNCTION_CODE_WRITE_SINGLE_COIL => handle_write_single_coil(pdu, coils, coil_store),
         FUNCTION_CODE_WRITE_MULTIPLE_COILS => handle_write_multiple_coils(pdu, coils, coil_store),
@@ -318,6 +321,36 @@ fn handle_mask_write_register(
         None => ExceptionResponse {
             function_code: FUNCTION_CODE_MASK_WRITE_REGISTER,
             exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+        }
+        .encode(),
+    }
+}
+
+// Report Server ID (FC 0x11) — `server_id` comes straight from the
+// device-description TOML's optional `server-id` field (see CLAUDE.md's
+// "FC 0x11 (Report Server ID)" section); this handler has no store/register
+// involvement at all, unlike every other dispatch target in this file.
+// Unconfigured (`None`) responds exactly like a function code this crate
+// never implemented at all — the same ILLEGAL_FUNCTION exception, not a
+// response with an empty server_id — since answering with nothing
+// meaningful isn't really "supporting" the function code.
+fn handle_report_server_id(pdu: &[u8], server_id: Option<&str>) -> Vec<u8> {
+    let Ok(_request) = ReportServerIdRequest::decode(pdu) else {
+        return ExceptionResponse {
+            function_code: FUNCTION_CODE_REPORT_SERVER_ID,
+            exception_code: EXCEPTION_ILLEGAL_FUNCTION,
+        }
+        .encode();
+    };
+    match server_id {
+        Some(server_id) => ReportServerIdResponse {
+            server_id: server_id.as_bytes().to_vec(),
+            run_indicator_status: true,
+        }
+        .encode(),
+        None => ExceptionResponse {
+            function_code: FUNCTION_CODE_REPORT_SERVER_ID,
+            exception_code: EXCEPTION_ILLEGAL_FUNCTION,
         }
         .encode(),
     }
@@ -715,6 +748,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -747,6 +781,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
         assert_eq!(
             ReadHoldingRegistersResponse::decode(&response).unwrap(),
@@ -778,6 +813,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
@@ -813,6 +849,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
@@ -848,6 +885,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
@@ -887,6 +925,7 @@ mod tests {
             MemLayout::Cdab,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         let decoded = ReadHoldingRegistersResponse::decode(&response).unwrap();
@@ -919,6 +958,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -957,6 +997,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -995,6 +1036,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1039,6 +1081,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1079,6 +1122,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1119,6 +1163,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1129,6 +1174,68 @@ mod tests {
             }
         );
         assert_eq!(store.lock().unwrap().get("Precise_Value"), None);
+    }
+
+    #[test]
+    fn report_server_id_responds_with_the_configured_id_when_present() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let request = ReportServerIdRequest.encode();
+
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            Some("infused_modbus-demo-plc"),
+        );
+
+        assert_eq!(
+            ReportServerIdResponse::decode(&response).unwrap(),
+            ReportServerIdResponse {
+                server_id: b"infused_modbus-demo-plc".to_vec(),
+                run_indicator_status: true,
+            }
+        );
+    }
+
+    #[test]
+    fn report_server_id_without_a_configured_id_returns_an_exception() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let request = ReportServerIdRequest.encode();
+
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_REPORT_SERVER_ID,
+                exception_code: EXCEPTION_ILLEGAL_FUNCTION,
+            }
+        );
     }
 
     #[test]
@@ -1154,6 +1261,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1199,6 +1307,7 @@ mod tests {
             MemLayout::Dcba,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1241,6 +1350,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1275,6 +1385,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
@@ -1302,6 +1413,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap().exception_code,
@@ -1337,6 +1449,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "name = \"X\"",
+            None,
         );
 
         let decoded = ReadDeviceIdentificationResponse::decode(&response).unwrap();
@@ -1371,6 +1484,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1403,6 +1517,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
         assert_eq!(
             ReadCoilsResponse::decode(&response).unwrap(),
@@ -1434,6 +1549,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
         assert_eq!(
             ExceptionResponse::decode(&response).unwrap(),
@@ -1467,6 +1583,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1505,6 +1622,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1539,6 +1657,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1584,6 +1703,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1626,6 +1746,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1661,6 +1782,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1696,6 +1818,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1736,6 +1859,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1771,6 +1895,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
@@ -1812,6 +1937,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Cdab,
             "",
+            None,
         );
 
         let decoded = ReadInputRegistersResponse::decode(&response).unwrap();
@@ -1846,6 +1972,7 @@ mod tests {
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
+            None,
         );
 
         assert_eq!(
