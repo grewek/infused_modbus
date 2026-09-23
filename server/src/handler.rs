@@ -43,16 +43,17 @@ use protocol::pdu::{
     ExceptionResponse, FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
     FUNCTION_CODE_MASK_WRITE_REGISTER, FUNCTION_CODE_READ_COILS,
     FUNCTION_CODE_READ_DISCRETE_INPUTS, FUNCTION_CODE_READ_HOLDING_REGISTERS,
-    FUNCTION_CODE_READ_INPUT_REGISTERS, FUNCTION_CODE_REPORT_SERVER_ID,
-    FUNCTION_CODE_WRITE_MULTIPLE_COILS, FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
-    FUNCTION_CODE_WRITE_SINGLE_COIL, FUNCTION_CODE_WRITE_SINGLE_REGISTER, MaskWriteRegisterRequest,
-    MaskWriteRegisterResponse, ReadCoilsRequest, ReadCoilsResponse,
-    ReadDeviceIdentificationRequest, ReadDiscreteInputsRequest, ReadDiscreteInputsResponse,
-    ReadHoldingRegistersRequest, ReadHoldingRegistersResponse, ReadInputRegistersRequest,
-    ReadInputRegistersResponse, ReportServerIdRequest, ReportServerIdResponse,
-    WriteMultipleCoilsRequest, WriteMultipleCoilsResponse, WriteMultipleRegistersRequest,
-    WriteMultipleRegistersResponse, WriteSingleCoilRequest, WriteSingleCoilResponse,
-    WriteSingleRegisterRequest, WriteSingleRegisterResponse,
+    FUNCTION_CODE_READ_INPUT_REGISTERS, FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+    FUNCTION_CODE_REPORT_SERVER_ID, FUNCTION_CODE_WRITE_MULTIPLE_COILS,
+    FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS, FUNCTION_CODE_WRITE_SINGLE_COIL,
+    FUNCTION_CODE_WRITE_SINGLE_REGISTER, MaskWriteRegisterRequest, MaskWriteRegisterResponse,
+    ReadCoilsRequest, ReadCoilsResponse, ReadDeviceIdentificationRequest,
+    ReadDiscreteInputsRequest, ReadDiscreteInputsResponse, ReadHoldingRegistersRequest,
+    ReadHoldingRegistersResponse, ReadInputRegistersRequest, ReadInputRegistersResponse,
+    ReadWriteMultipleRegistersRequest, ReadWriteMultipleRegistersResponse, ReportServerIdRequest,
+    ReportServerIdResponse, WriteMultipleCoilsRequest, WriteMultipleCoilsResponse,
+    WriteMultipleRegistersRequest, WriteMultipleRegistersResponse, WriteSingleCoilRequest,
+    WriteSingleCoilResponse, WriteSingleRegisterRequest, WriteSingleRegisterResponse,
 };
 use std::sync::{Mutex, PoisonError};
 
@@ -90,6 +91,9 @@ pub fn handle_request(
         }
         FUNCTION_CODE_MASK_WRITE_REGISTER => {
             handle_mask_write_register(pdu, registers, store, mem_layout)
+        }
+        FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS => {
+            handle_read_write_multiple_registers(pdu, registers, store, mem_layout)
         }
         FUNCTION_CODE_REPORT_SERVER_ID => handle_report_server_id(pdu, server_id),
         FUNCTION_CODE_READ_COILS => handle_read_coils(pdu, coils, coil_store),
@@ -418,6 +422,108 @@ fn handle_write_multiple_registers(
         quantity: request.register_values.len() as u16,
     }
     .encode()
+}
+
+// Read/Write Multiple Registers (FC 0x17): the write half is validated
+// exactly like handle_write_multiple_registers (register-by-register,
+// ReadWrite-only, no register-width overrun) and the read half exactly like
+// handle_read — both fully resolved against the *static* `registers`
+// description before either touches `store`, so a problem with either half
+// rejects the whole request without applying a partial write. Only once
+// both halves are known-valid is the store locked once, the write applied,
+// and the read performed against that same now-updated state — the read
+// always reflects this request's own write, never a concurrent one
+// interleaved in between.
+fn handle_read_write_multiple_registers(
+    pdu: &[u8],
+    registers: &[RegisterDescription],
+    store: &Mutex<RegisterStore>,
+    mem_layout: MemLayout,
+) -> Vec<u8> {
+    let Ok(request) = ReadWriteMultipleRegistersRequest::decode(pdu) else {
+        return ExceptionResponse {
+            function_code: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+        }
+        .encode();
+    };
+
+    let mut resolved_writes: Vec<(&RegisterDescription, RegisterValue)> = Vec::new();
+    let mut address = request.write_starting_address;
+    let write_end_address = request
+        .write_starting_address
+        .wrapping_add(request.write_values.len() as u16);
+    let mut offset = 0usize;
+    while address != write_end_address {
+        let Some(register) = registers.iter().find(|register| {
+            register.address == address && register.access == AccessRight::ReadWrite
+        }) else {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+            .encode();
+        };
+        let register_count = register.data_type.register_count() as usize;
+        if offset + register_count > request.write_values.len() {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+            .encode();
+        }
+        let words = &request.write_values[offset..offset + register_count];
+        // Always Some: `words` is exactly `register_count` long by
+        // construction above.
+        let value = register_value_from_words(register.data_type, words, mem_layout)
+            .expect("word slice length always matches the register's own width");
+        resolved_writes.push((register, value));
+        offset += register_count;
+        address = address.wrapping_add(register.data_type.register_count());
+    }
+
+    let mut read_registers: Vec<&RegisterDescription> = Vec::new();
+    let mut address = request.read_starting_address;
+    let read_end_address = request
+        .read_starting_address
+        .wrapping_add(request.read_quantity);
+    let mut word_count = 0usize;
+    while address != read_end_address {
+        let Some(register) = registers
+            .iter()
+            .find(|register| register.address == address)
+        else {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+            .encode();
+        };
+        word_count += register.data_type.register_count() as usize;
+        if word_count > request.read_quantity as usize {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+            .encode();
+        }
+        read_registers.push(register);
+        address = address.wrapping_add(register.data_type.register_count());
+    }
+
+    let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
+    for (register, value) in resolved_writes {
+        store.set(register.name.clone(), value);
+    }
+    let mut register_values = Vec::with_capacity(request.read_quantity as usize);
+    for register in read_registers {
+        let value = match store.get(&register.name) {
+            Some(value) if value.data_type() == register.data_type => value,
+            _ => default_register_value(register.data_type),
+        };
+        register_values.extend(register_value_to_words(value, mem_layout));
+    }
+    ReadWriteMultipleRegistersResponse { register_values }.encode()
 }
 
 fn handle_read_coils(
@@ -1363,6 +1469,185 @@ mod tests {
         // Stop_Process (40002, the second address in this batch) is
         // writable, but nothing should have been applied since the first
         // address (40001, Tank_Temperature) is read-only.
+        assert_eq!(store.lock().unwrap().get("Stop_Process"), None);
+    }
+
+    #[test]
+    fn read_write_multiple_registers_read_reflects_this_requests_own_write() {
+        // Writes and reads the *same* register in one request — the read
+        // half must see the value this same request just wrote, not
+        // whatever was there before.
+        let store = Mutex::new(RegisterStore::new());
+        store
+            .lock()
+            .unwrap()
+            .set("Stop_Process", RegisterValue::U16(1));
+        let coil_store = Mutex::new(CoilStore::new());
+        let request = ReadWriteMultipleRegistersRequest {
+            read_starting_address: 40002,
+            read_quantity: 1,
+            write_starting_address: 40002,
+            write_values: vec![42],
+        }
+        .encode();
+
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ReadWriteMultipleRegistersResponse::decode(&response).unwrap(),
+            ReadWriteMultipleRegistersResponse {
+                register_values: vec![42],
+            }
+        );
+        assert_eq!(
+            store.lock().unwrap().get("Stop_Process"),
+            Some(RegisterValue::U16(42))
+        );
+    }
+
+    #[test]
+    fn read_write_multiple_registers_write_and_read_ranges_can_differ() {
+        let store = Mutex::new(RegisterStore::new());
+        store
+            .lock()
+            .unwrap()
+            .set("Tank_Temperature", RegisterValue::U16(72));
+        let coil_store = Mutex::new(CoilStore::new());
+        let request = ReadWriteMultipleRegistersRequest {
+            read_starting_address: 40001,
+            read_quantity: 1,
+            write_starting_address: 40010,
+            write_values: vec![11, 22],
+        }
+        .encode();
+
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ReadWriteMultipleRegistersResponse::decode(&response).unwrap(),
+            ReadWriteMultipleRegistersResponse {
+                register_values: vec![72],
+            }
+        );
+        assert_eq!(
+            store.lock().unwrap().get("Valve_1"),
+            Some(RegisterValue::U16(11))
+        );
+        assert_eq!(
+            store.lock().unwrap().get("Valve_2"),
+            Some(RegisterValue::U16(22))
+        );
+    }
+
+    #[test]
+    fn read_write_multiple_registers_rejects_without_applying_when_the_write_half_is_invalid() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        // Tank_Temperature (40001) is read-only, so the write half must be
+        // rejected — the (otherwise valid) read half must not run either,
+        // and nothing should be applied.
+        let request = ReadWriteMultipleRegistersRequest {
+            read_starting_address: 40002,
+            read_quantity: 1,
+            write_starting_address: 40001,
+            write_values: vec![99],
+        }
+        .encode();
+
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
+        assert_eq!(store.lock().unwrap().get("Tank_Temperature"), None);
+    }
+
+    #[test]
+    fn read_write_multiple_registers_rejects_without_applying_when_the_read_half_is_invalid() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        // The write half (Stop_Process, 40002) is perfectly valid on its
+        // own; the read half targets an address with no register at all.
+        // The whole request must still be rejected, and the write must
+        // not have been applied either — a bad read half must not leave a
+        // partially-applied write.
+        let request = ReadWriteMultipleRegistersRequest {
+            read_starting_address: 49999,
+            read_quantity: 1,
+            write_starting_address: 40002,
+            write_values: vec![5],
+        }
+        .encode();
+
+        let response = handle_request(
+            &request,
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &Vec::new(),
+            &Mutex::new(DiscreteInputStore::new()),
+            &Vec::new(),
+            &Mutex::new(InputRegisterStore::new()),
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
         assert_eq!(store.lock().unwrap().get("Stop_Process"), None);
     }
 

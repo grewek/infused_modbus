@@ -10,6 +10,7 @@ pub const FUNCTION_CODE_WRITE_SINGLE_REGISTER: u8 = 0x06;
 pub const FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS: u8 = 0x10;
 pub const FUNCTION_CODE_MASK_WRITE_REGISTER: u8 = 0x16;
 pub const FUNCTION_CODE_REPORT_SERVER_ID: u8 = 0x11;
+pub const FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS: u8 = 0x17;
 pub const FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT: u8 = 0x2B;
 
 // Function code 0x2B is itself a container for different "MEI" (Modbus
@@ -67,6 +68,17 @@ const REPORT_SERVER_ID_DATA_START: usize = 2;
 const REPORT_SERVER_ID_RESPONSE_HEADER_LEN: usize = 2;
 const RUN_INDICATOR_ON: u8 = 0xFF;
 const RUN_INDICATOR_OFF: u8 = 0x00;
+
+// Read/Write Multiple Registers' request reuses ADDRESS_FIELD_BYTE (read
+// starting address) and QUANTITY_OR_VALUE_FIELD_BYTE (read quantity) above
+// — same structural reasoning as everywhere else those two are shared —
+// but has two more fields beyond what any other request in this file
+// carries (a second address + the write payload's own byte count), hence
+// these three additional offsets.
+const READ_WRITE_WRITE_STARTING_ADDRESS_BYTE: usize = 5;
+const READ_WRITE_BYTE_COUNT_BYTE: usize = 9;
+const READ_WRITE_VALUES_START: usize = 10;
+const READ_WRITE_REQUEST_HEADER_LEN: usize = 10;
 
 const BYTE_COUNT_BYTE: usize = 1;
 // Byte 2 is where the payload starts in any response shaped as
@@ -240,6 +252,31 @@ pub struct ReportServerIdRequest;
 pub struct ReportServerIdResponse {
     pub server_id: Vec<u8>,
     pub run_indicator_status: bool,
+}
+
+/// Read/Write Multiple Registers (FC 0x17): writes `write_values` starting
+/// at `write_starting_address`, then reads `read_quantity` registers
+/// starting at `read_starting_address` and returns them — both halves in
+/// one request/response round trip, write applied before the read. Unlike
+/// [`WriteMultipleRegistersRequest`], `write_quantity` isn't a separate
+/// field here either — same reasoning: it's always exactly
+/// `write_values.len()`, redundant with the wire's own byte-count field,
+/// so decoding derives it rather than trusting a second copy that could
+/// disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadWriteMultipleRegistersRequest {
+    pub read_starting_address: u16,
+    pub read_quantity: u16,
+    pub write_starting_address: u16,
+    pub write_values: Vec<u16>,
+}
+
+/// Same wire shape as [`ReadHoldingRegistersResponse`]/
+/// [`ReadInputRegistersResponse`] — just the registers `read_quantity`
+/// asked for, in order; nothing echoes the write half at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadWriteMultipleRegistersResponse {
+    pub register_values: Vec<u16>,
 }
 
 /// Same packed-bit wire encoding as [`ReadCoilsResponse`]/`WriteSingleCoil`'s
@@ -799,6 +836,94 @@ impl ReportServerIdResponse {
             server_id,
             run_indicator_status,
         })
+    }
+}
+
+impl ReadWriteMultipleRegistersRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buffer =
+            Vec::with_capacity(READ_WRITE_REQUEST_HEADER_LEN + self.write_values.len() * 2);
+        buffer.push(FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS);
+        buffer.extend_from_slice(&self.read_starting_address.to_be_bytes());
+        buffer.extend_from_slice(&self.read_quantity.to_be_bytes());
+        buffer.extend_from_slice(&self.write_starting_address.to_be_bytes());
+        let write_quantity = self.write_values.len() as u16;
+        buffer.extend_from_slice(&write_quantity.to_be_bytes());
+        buffer.push((self.write_values.len() * 2) as u8);
+        for value in &self.write_values {
+            buffer.extend_from_slice(&value.to_be_bytes());
+        }
+        buffer
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < READ_WRITE_REQUEST_HEADER_LEN {
+            return Err(DecodeError::TooShort);
+        }
+        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS {
+            return Err(DecodeError::UnexpectedFunctionCode {
+                expected: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+                actual: bytes[FUNCTION_CODE_BYTE],
+            });
+        }
+        let read_starting_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
+        let read_quantity = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
+        let write_starting_address = read_u16_be(bytes, READ_WRITE_WRITE_STARTING_ADDRESS_BYTE);
+        let byte_count = bytes[READ_WRITE_BYTE_COUNT_BYTE];
+        if !byte_count.is_multiple_of(2) {
+            return Err(DecodeError::OddByteCount { byte_count });
+        }
+        if bytes.len() < READ_WRITE_VALUES_START + byte_count as usize {
+            return Err(DecodeError::TooShort);
+        }
+        let write_values = bytes
+            [READ_WRITE_VALUES_START..(READ_WRITE_VALUES_START + byte_count as usize)]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect();
+        Ok(Self {
+            read_starting_address,
+            read_quantity,
+            write_starting_address,
+            write_values,
+        })
+    }
+}
+
+impl ReadWriteMultipleRegistersResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(RESPONSE_HEADER_LEN + self.register_values.len() * 2);
+        buffer.push(FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS);
+        buffer.push((self.register_values.len() * 2) as u8);
+        for value in &self.register_values {
+            buffer.extend_from_slice(&value.to_be_bytes());
+        }
+        buffer
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < RESPONSE_HEADER_LEN {
+            return Err(DecodeError::TooShort);
+        }
+        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS {
+            return Err(DecodeError::UnexpectedFunctionCode {
+                expected: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+                actual: bytes[FUNCTION_CODE_BYTE],
+            });
+        }
+        let byte_count = bytes[BYTE_COUNT_BYTE];
+        if !byte_count.is_multiple_of(2) {
+            return Err(DecodeError::OddByteCount { byte_count });
+        }
+        if bytes.len() < RESPONSE_DATA_START + byte_count as usize {
+            return Err(DecodeError::TooShort);
+        }
+        let register_values = bytes
+            [RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count as usize)]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect();
+        Ok(Self { register_values })
     }
 }
 
@@ -1888,6 +2013,140 @@ mod tests {
                 expected: 0x11,
                 actual: 0x06
             })
+        );
+    }
+
+    #[test]
+    fn read_write_multiple_registers_request_round_trip() {
+        let request = ReadWriteMultipleRegistersRequest {
+            read_starting_address: 0x0003,
+            read_quantity: 0x0002,
+            write_starting_address: 0x000E,
+            write_values: vec![0x00FF, 0x00FF],
+        };
+        let encoded = request.encode();
+        let decoded = ReadWriteMultipleRegistersRequest::decode(&encoded).unwrap();
+        assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn read_write_multiple_registers_request_encode_produces_expected_bytes() {
+        let request = ReadWriteMultipleRegistersRequest {
+            read_starting_address: 0x0003,
+            read_quantity: 0x0002,
+            write_starting_address: 0x000E,
+            write_values: vec![0x00FF, 0x00FF],
+        };
+        assert_eq!(
+            request.encode(),
+            vec![
+                0x17, 0x00, 0x03, 0x00, 0x02, 0x00, 0x0E, 0x00, 0x02, 0x04, 0x00, 0xFF, 0x00, 0xFF
+            ]
+        );
+    }
+
+    #[test]
+    fn read_write_multiple_registers_request_decode_rejects_too_short_buffer() {
+        let bytes = [0x17, 0x00, 0x03, 0x00, 0x02, 0x00, 0x0E, 0x00, 0x02];
+        assert_eq!(
+            ReadWriteMultipleRegistersRequest::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn read_write_multiple_registers_request_decode_rejects_wrong_function_code() {
+        let bytes = [
+            0x10, 0x00, 0x03, 0x00, 0x02, 0x00, 0x0E, 0x00, 0x02, 0x04, 0x00, 0xFF, 0x00, 0xFF,
+        ];
+        assert_eq!(
+            ReadWriteMultipleRegistersRequest::decode(&bytes),
+            Err(DecodeError::UnexpectedFunctionCode {
+                expected: 0x17,
+                actual: 0x10
+            })
+        );
+    }
+
+    #[test]
+    fn read_write_multiple_registers_request_decode_rejects_odd_byte_count() {
+        let bytes = [
+            0x17, 0x00, 0x03, 0x00, 0x02, 0x00, 0x0E, 0x00, 0x02, 0x03, 0x00, 0xFF, 0x00,
+        ];
+        assert_eq!(
+            ReadWriteMultipleRegistersRequest::decode(&bytes),
+            Err(DecodeError::OddByteCount { byte_count: 3 })
+        );
+    }
+
+    #[test]
+    fn read_write_multiple_registers_request_decode_rejects_a_byte_count_claiming_more_than_the_buffer_holds()
+     {
+        // byte_count says 10 (5 registers), but only 2 registers' worth of
+        // bytes actually follow — must be rejected before slicing.
+        let bytes = [
+            0x17, 0x00, 0x03, 0x00, 0x02, 0x00, 0x0E, 0x00, 0x02, 0x0A, 0x00, 0xFF, 0x00, 0xFF,
+        ];
+        assert_eq!(
+            ReadWriteMultipleRegistersRequest::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn read_write_multiple_registers_response_round_trip() {
+        let response = ReadWriteMultipleRegistersResponse {
+            register_values: vec![0x00AB, 0x00CD],
+        };
+        let encoded = response.encode();
+        let decoded = ReadWriteMultipleRegistersResponse::decode(&encoded).unwrap();
+        assert_eq!(response, decoded);
+    }
+
+    #[test]
+    fn read_write_multiple_registers_response_encode_produces_expected_bytes() {
+        let response = ReadWriteMultipleRegistersResponse {
+            register_values: vec![0x00AB, 0x00CD],
+        };
+        assert_eq!(response.encode(), vec![0x17, 0x04, 0x00, 0xAB, 0x00, 0xCD]);
+    }
+
+    #[test]
+    fn read_write_multiple_registers_response_decode_rejects_too_short_buffer() {
+        assert_eq!(
+            ReadWriteMultipleRegistersResponse::decode(&[0x17]),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn read_write_multiple_registers_response_decode_rejects_wrong_function_code() {
+        let bytes = [0x03, 0x04, 0x00, 0xAB, 0x00, 0xCD];
+        assert_eq!(
+            ReadWriteMultipleRegistersResponse::decode(&bytes),
+            Err(DecodeError::UnexpectedFunctionCode {
+                expected: 0x17,
+                actual: 0x03
+            })
+        );
+    }
+
+    #[test]
+    fn read_write_multiple_registers_response_decode_rejects_odd_byte_count() {
+        let bytes = [0x17, 0x03, 0x00, 0xAB, 0x00];
+        assert_eq!(
+            ReadWriteMultipleRegistersResponse::decode(&bytes),
+            Err(DecodeError::OddByteCount { byte_count: 3 })
+        );
+    }
+
+    #[test]
+    fn read_write_multiple_registers_response_decode_rejects_a_byte_count_claiming_more_than_the_buffer_holds()
+     {
+        let bytes = [0x17, 0x0A, 0x00, 0xAB, 0x00, 0xCD];
+        assert_eq!(
+            ReadWriteMultipleRegistersResponse::decode(&bytes),
+            Err(DecodeError::TooShort)
         );
     }
 
