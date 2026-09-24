@@ -57,29 +57,29 @@ A given `client`/`server` instance uses exactly one of these at a time — they 
 
 ## Supported Modbus function codes
 
-This lists every public function code defined by the Modbus Application Protocol specification, not just the ones this project implements — so the gaps are visible rather than silently omitted. "Not implemented yet" will be added later. "Out of scope" means this project has decided not to implement it at all — see the notes below the table.
+This lists every public function code defined by the Modbus Application Protocol specification, not just the ones this project implements — so the gaps are visible rather than silently omitted. "Not implemented yet" will be added later. "Out of scope" means this project has decided not to implement it at all — see the notes below the table. "Supported" here means `server` is *capable* of answering it — whether it actually does on a given deployment additionally depends on `--server-options` (see [Run the server](#run-the-server) above): every function code defaults to disabled until a technician explicitly enables it, so a "Supported" code still gets `ILLEGAL_FUNCTION` if its key isn't set to `true`.
 
-| Code | Name | Status |
-| ---- | ---- | ------ |
-| 0x01 | Read Coils | Supported |
-| 0x02 | Read Discrete Inputs | Supported |
-| 0x03 | Read Holding Registers | Supported |
-| 0x04 | Read Input Registers | Supported |
-| 0x05 | Write Single Coil | Supported |
-| 0x06 | Write Single Register | Supported |
-| 0x07 | Read Exception Status | Out of scope |
-| 0x08 | Diagnostics | Out of scope |
-| 0x0B | Get Comm Event Counter | Out of scope |
-| 0x0C | Get Comm Event Log | Out of scope |
-| 0x0F | Write Multiple Coils | Supported |
-| 0x10 | Write Multiple Registers | Supported |
-| 0x11 | Report Server ID | Supported |
-| 0x14 | Read File Record | Not implemented yet |
-| 0x15 | Write File Record | Not implemented yet |
-| 0x16 | Mask Write Register | Supported |
-| 0x17 | Read/Write Multiple Registers | Supported (server only — see note below the table) |
-| 0x18 | Read FIFO Queue | Not implemented yet |
-| 0x2B / MEI 0x0E | Encapsulated Interface Transport — Read Device Identification | Supported (Extended access only — see [Device description discovery](#device-description-discovery-fc-43)) |
+| Code | Name | `server-options.toml` key | Status |
+| ---- | ---- | -------------------------- | ------ |
+| 0x01 | Read Coils | `read_coils` | Supported |
+| 0x02 | Read Discrete Inputs | `read_discrete_inputs` | Supported |
+| 0x03 | Read Holding Registers | `read_holding_registers` | Supported |
+| 0x04 | Read Input Registers | `read_input_registers` | Supported |
+| 0x05 | Write Single Coil | `write_single_coil` | Supported |
+| 0x06 | Write Single Register | `write_single_register` | Supported |
+| 0x07 | Read Exception Status | — | Out of scope |
+| 0x08 | Diagnostics | — | Out of scope |
+| 0x0B | Get Comm Event Counter | — | Out of scope |
+| 0x0C | Get Comm Event Log | — | Out of scope |
+| 0x0F | Write Multiple Coils | `write_multiple_coils` | Supported |
+| 0x10 | Write Multiple Registers | `write_multiple_registers` | Supported |
+| 0x11 | Report Server ID | `report_server_id` | Supported |
+| 0x14 | Read File Record | `read_file_record` | Not implemented yet |
+| 0x15 | Write File Record | `write_file_record` | Not implemented yet |
+| 0x16 | Mask Write Register | `mask_write_register` | Supported |
+| 0x17 | Read/Write Multiple Registers | `read_write_multiple_registers` | Supported (server only — see note below the table) |
+| 0x18 | Read FIFO Queue | `read_fifo_queue` | Not implemented yet |
+| 0x2B / MEI 0x0E | Encapsulated Interface Transport — Read Device Identification | `read_device_identification` | Supported (Extended access only — see [Device description discovery](#device-description-discovery-fc-43)) |
 
 **0x07, 0x08, 0x0B, 0x0C are deliberately out of scope.** All four are marked "(Serial Line only)" in the spec itself and exist to diagnose the physical RS-485/RTU link (CRC error counts, character overrun counts, a Listen Only Mode to silence a malfunctioning node on a multidrop bus, a rolling event log of send/receive activity). None of them read or write register/coil data, they have no equivalent over TCP, and implementing them would mean tracking link-level counters/state that serve no purpose for this project while adding attack surface to `server`. Not planned to be revisited.
 
@@ -98,7 +98,7 @@ Requires Linux (FUSE is a Linux-specific dependency) and a FUSE-capable kernel/u
 ### Run the server
 
 ```sh
-cargo run -p server -- <mountpoint> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>]
+cargo run -p server -- <mountpoint> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>] [--server-options <server-options.toml>]
 ```
 
 `<connection>` is one of:
@@ -109,11 +109,21 @@ cargo run -p server -- <mountpoint> <device-description.toml> <connection> [--fu
 
 `--fuse-permissions` is optional — see [FUSE directory permissions](#fuse-directory-permissions). `--max-clients` is also optional (`tls+tcp://` only) and bounds how many client certificates can be approved at once — without it, there is no limit.
 
+**`--server-options` controls which function codes this server will actually answer on the wire — and it's strict default-deny.** Without it (or with a present-but-empty file), *every* function code is disabled and every incoming request gets an `ILLEGAL_FUNCTION` exception, no matter how many function codes this project implements — `server` prints a loud startup warning if this ends up being the case, since "starts fine but answers nothing" is an easy flag to forget. Every function code this server can serve — including already-implemented ones like Read/Write Holding Registers — is attack surface exposed to any reachable Modbus master, so enabling one is an explicit technician choice, not an on-by-default assumption. Point it at a TOML file with a `[function-codes]` table, one boolean per function code, named after the operation:
+
+```toml
+[function-codes]
+read_holding_registers = true
+write_single_register = true
+```
+
+See the [function code table](#supported-modbus-function-codes) above for every available key name.
+
 Example:
 
 ```sh
 mkdir -p /tmp/modbus-server
-cargo run -p server -- /tmp/modbus-server device.toml tcp://0.0.0.0:502
+cargo run -p server -- /tmp/modbus-server device.toml tcp://0.0.0.0:502 --server-options server-options.toml
 ```
 
 `server` also has a second, unrelated invocation form for managing TLS client approvals — see [Connecting over TLS](#connecting-over-tls):
@@ -394,7 +404,6 @@ Both binaries mount with the kernel's `default_permissions` option, so these val
 This project is under active development. As of now:
 
 - `u8`/`i8` registers each occupy a whole 16-bit register (in the low byte) rather than two of them being packed into one — no real device was found that packs independent named values that way, so the simpler representation was kept.
-- The server's direct-write FUSE path (`holding-registers/<name>` and friends) doesn't check a register's TOML-declared `access = "read_only"` — every wire-facing write handler does enforce it, but a local write via the server's own mount currently doesn't. Not yet fixed.
 - FC 43 (device identification) only supports "Extended" access serving custom private objects (the mechanism used for description discovery above) — the standard VendorName/ProductCode/etc. objects and Basic/Regular/Individual access aren't implemented yet.
 - RTU serial parameters beyond baud rate (data bits, parity, stop bits) aren't configurable yet; fixed defaults (8 data bits, no parity, 1 stop bit) are used.
 - `tls+tcp://`'s admin socket path, TLS identity directories, `approved-clients.toml`'s own path, and DoS-hardening limits (handshake timeout, connection caps — see [Connecting over TLS](#connecting-over-tls)) are all fixed constants, not yet configurable via a CLI flag. Protection against a flood from many different source addresses is explicitly out of scope for the application layer itself. RTU's serial link remains a separate, unauthenticated threat model that TLS does nothing to address.
