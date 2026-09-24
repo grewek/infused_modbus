@@ -74,7 +74,7 @@ This lists every public function code defined by the Modbus Application Protocol
 | 0x0F | Write Multiple Coils | `write_multiple_coils` | Supported |
 | 0x10 | Write Multiple Registers | `write_multiple_registers` | Supported |
 | 0x11 | Report Server ID | `report_server_id` | Supported |
-| 0x14 | Read File Record | `read_file_record` | Not implemented yet |
+| 0x14 | Read File Record | `read_file_record` | Supported — see note below the table |
 | 0x15 | Write File Record | `write_file_record` | Not implemented yet |
 | 0x16 | Mask Write Register | `mask_write_register` | Supported |
 | 0x17 | Read/Write Multiple Registers | `read_write_multiple_registers` | Supported (server only — see note below the table) |
@@ -84,6 +84,8 @@ This lists every public function code defined by the Modbus Application Protocol
 **0x07, 0x08, 0x0B, 0x0C are deliberately out of scope.** All four are marked "(Serial Line only)" in the spec itself and exist to diagnose the physical RS-485/RTU link (CRC error counts, character overrun counts, a Listen Only Mode to silence a malfunctioning node on a multidrop bus, a rolling event log of send/receive activity). None of them read or write register/coil data, they have no equivalent over TCP, and implementing them would mean tracking link-level counters/state that serve no purpose for this project while adding attack surface to `server`. Not planned to be revisited.
 
 **0x17 (Read/Write Multiple Registers) is server-only, deliberately.** It combines a write and a read into one request/response round trip (write applied first, then read) — real external Modbus masters can use it against `server` like any other read/write, and the write half applies exactly like Write Multiple Registers (atomically, no partial apply if either half is invalid). `client` never sends it: everything it could express — write via `transactions/`+`TRANSACTION_END`, read via `holding-registers/` — is already covered by the two separate mechanisms this project already has, so a wire-level round-trip optimization here wouldn't unlock anything new through the filesystem.
+
+**0x14 (Read File Record) is deliberately minimal: raw bytes only, no field-level interpretation.** What a "file"/"record" means is entirely vendor-specific — real devices use it for things like event logs or historical trend data, and this project has no way to know a given device's own field layout without being told. `[[file-records]]` entries in the device description TOML (see below) declare which `(file_number, record_number)` combinations exist and how many words each holds; `server` answers real requests for them straight from `file-records/<file_number>/<record_number>`, directly writable there like every other server-side data type (a technician can stage test data by hand). `client` shows the same path read-only, as a plain hex dump, refreshed by polling — nothing decodes the bytes into named fields (yet; that's planned as part of a future custom-function-codes feature, not built alongside this one).
 
 ## Getting started
 
@@ -239,6 +241,17 @@ touch transactions/TRANSACTION_END
 
 This is client-only (the server has no local use for it — see the README's function-code table and `CLAUDE.md` for why) and, like every write, can only ever target a single-register-wide value (`u8`/`i8`/`u16`/`i16`).
 
+Declared `[[file-records]]` (FC 0x14) show up under `file-records/<file_number>/<record_number>` — nested one level deeper than everything else, since file/record numbers are two-axis and there's no human-readable name for them. Content is a plain hex dump; nothing decodes it into fields:
+
+```sh
+ls file-records/20/                         # e.g. "5"
+cat file-records/20/5                       # e.g. "0D FE 00 20"
+
+echo "0D FE 00 20" > file-records/20/5      # server only — applies immediately, like holding-registers/
+```
+
+Read-only on the client, populated by polling one `Read File Record` request per configured entry at a time.
+
 If the device description's optional `server-id` field is set (see below), the client's mount also has a read-only `server-id` file at its root, mirroring whatever the connected device (or its own local fallback) declared:
 
 ```sh
@@ -380,6 +393,17 @@ data_type = "f32"
 ```
 
 All four sections (`[registers]`, `[coils]`, `[discrete-inputs]`, `[input-registers]`) are independently optional — a device only declares the ones it actually has.
+
+File records (FC 0x14) are a different shape from every other section: no `base_address`/`offset` and no `name` — `file_number`/`record_number` *are* the address, and the FUSE path itself (`file-records/<file_number>/<record_number>`) is the identifier. `record_length` is in 16-bit words, matching the wire field's own unit:
+
+```toml
+[[file-records]]
+file_number = 20
+record_number = 5
+record_length = 9
+```
+
+`[[file-records]]` is a flat, independently-optional array — no wrapping section. See the function code table above for how content is exposed (raw hex, no field decoding).
 
 ## FUSE directory permissions
 
