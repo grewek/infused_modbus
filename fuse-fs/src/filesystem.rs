@@ -257,9 +257,16 @@ impl InfusedFilesystem {
         let report_ino = INodeNo(transactions_ino.0 + 1);
         let first_report_ino = report_ino.0 + 1;
         // report/'s coil files sit right after its register files — see
-        // `first_coil_report_ino`.
+        // `first_coil_report_ino`. Its file-record files sit right after
+        // that — see `first_file_record_report_ino`. Both included here so
+        // `transactions/`'s own dynamic inode range starts strictly after
+        // the whole of `report/`, not just its register+coil portion.
+        let after_report_ino = first_report_ino
+            + registers.len() as u64
+            + coils.len() as u64
+            + file_records.len() as u64;
         let transactions = Mutex::new(TransactionFsState {
-            next_ino: first_report_ino + registers.len() as u64 + coils.len() as u64,
+            next_ino: after_report_ino,
             ..Default::default()
         });
         // client-trust/'s two fixed directory inodes sit right after every
@@ -267,8 +274,7 @@ impl InfusedFilesystem {
         // way regardless of whether `client_trust` is `Some` (client-side
         // `None` just never exposes them), so the numbering stays
         // deterministic and independent of which fields happen to be used.
-        let client_trust_ino =
-            INodeNo(first_report_ino + registers.len() as u64 + coils.len() as u64);
+        let client_trust_ino = INodeNo(after_report_ino);
         let client_trust_approved_ino = INodeNo(client_trust_ino.0 + 1);
         // connection_attempts/'s directory + its three fixed log files sit
         // right after approved/ — fixed like report_ino/coils_ino (always
@@ -548,6 +554,32 @@ impl InfusedFilesystem {
         self.coils.get(index as usize)
     }
 
+    // report/'s file-record files sit right after its coil files — see
+    // `new`. Unlike discrete-inputs/input-registers (never covered by
+    // report/ at all, per H3's original scope), file records get report/
+    // coverage because — unlike those two — a client-initiated write to
+    // them (FC 0x15) has a real device round trip that can genuinely fail,
+    // the exact thing report/ exists to surface.
+    fn first_file_record_report_ino(&self) -> u64 {
+        self.first_coil_report_ino() + self.coils.len() as u64
+    }
+
+    fn report_file_record_by_ino(&self, ino: INodeNo) -> Option<&FileRecordDescription> {
+        let index = ino.0.checked_sub(self.first_file_record_report_ino())?;
+        self.file_records.get(index as usize)
+    }
+
+    // The synthetic name a file record is staged/reported under — reused
+    // consistently everywhere a single string key has to stand in for the
+    // (file_number, record_number) pair: `transactions/<name>` staging,
+    // the `StagedValue::FileRecord` hand-off channel's map key, and
+    // `report/<name>`. Never parsed back — each of those sites already has
+    // (or resolves) the two numbers directly, this is purely a
+    // human-readable, collision-unlikely identifier.
+    fn file_record_report_name(file_number: u16, record_number: u16) -> String {
+        format!("{file_number}:{record_number}")
+    }
+
     // The `fuse-permissions.toml` permissions that apply to `ino`, if it
     // belongs to one of the 4 configurable subtrees (their own directory
     // inode, or any file inside it) — `None` for `root`/`client-trust/*`,
@@ -567,6 +599,7 @@ impl InfusedFilesystem {
         } else if ino == self.report_ino
             || self.report_register_by_ino(ino).is_some()
             || self.report_coil_by_ino(ino).is_some()
+            || self.report_file_record_by_ino(ino).is_some()
         {
             Some(self.permissions.report)
         } else {
@@ -840,6 +873,17 @@ impl InfusedFilesystem {
     // not the FUSE write boundary, so what a technician wrote is always
     // visible exactly as typed via a subsequent read, even if it doesn't
     // match.
+    // The `transactions/<file_number>:<record_number>` naming a client
+    // stages a Write File Record (FC 0x15) through — same colon-separated
+    // synthetic identifier as `file_record_report_name`, but parsed back
+    // here rather than just constructed, since this is the one place a
+    // human actually types it in. Not itself a membership check — callers
+    // still verify the parsed numbers name a real configured file record.
+    fn parse_file_record_name(name: &str) -> Option<(u16, u16)> {
+        let (file_number, record_number) = name.split_once(':')?;
+        Some((file_number.parse().ok()?, record_number.parse().ok()?))
+    }
+
     fn parse_file_record_value(text: &str) -> Option<Vec<u8>> {
         let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         if cleaned.is_empty() || !cleaned.len().is_multiple_of(2) {
@@ -1267,11 +1311,18 @@ impl Filesystem for InfusedFilesystem {
                 .position(|register| register.name == name)
             {
                 Some(INodeNo(self.first_report_ino() + index as u64))
+            } else if let Some(index) = self.coils.iter().position(|coil| coil.name == name) {
+                Some(INodeNo(self.first_coil_report_ino() + index as u64))
             } else {
-                self.coils
+                self.file_records
                     .iter()
-                    .position(|coil| coil.name == name)
-                    .map(|index| INodeNo(self.first_coil_report_ino() + index as u64))
+                    .position(|description| {
+                        Self::file_record_report_name(
+                            description.file_number,
+                            description.record_number,
+                        ) == name
+                    })
+                    .map(|index| INodeNo(self.first_file_record_report_ino() + index as u64))
             };
             match ino {
                 Some(ino) => {
@@ -1430,6 +1481,17 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
+        if let Some(description) = self.report_file_record_by_ino(ino) {
+            let name =
+                Self::file_record_report_name(description.file_number, description.record_number);
+            let content = self.report_content(&name);
+            reply.attr(
+                &ATTR_TTL,
+                &self.file_attr(ino, content.len() as u64, 0o444, req),
+            );
+            return;
+        }
+
         match self.transaction_name_by_ino(ino) {
             Some(name) => {
                 let content = self.transaction_content(&name);
@@ -1543,6 +1605,10 @@ impl Filesystem for InfusedFilesystem {
             self.report_content(&register.name)
         } else if let Some(coil) = self.report_coil_by_ino(ino) {
             self.report_content(&coil.name)
+        } else if let Some(description) = self.report_file_record_by_ino(ino) {
+            let name =
+                Self::file_record_report_name(description.file_number, description.record_number);
+            self.report_content(&name)
         } else if let Some(name) = self.transaction_name_by_ino(ino) {
             // The lock must be released before `transaction_content` tries
             // to take it again — std::sync::Mutex isn't reentrant, so
@@ -1795,6 +1861,18 @@ impl Filesystem for InfusedFilesystem {
                 let coil_ino = INodeNo(self.first_coil_report_ino() + index as u64);
                 entries.push((coil_ino, FileType::RegularFile, coil.name.clone()));
             }
+            for (index, description) in self.file_records.iter().enumerate() {
+                let file_record_report_ino =
+                    INodeNo(self.first_file_record_report_ino() + index as u64);
+                entries.push((
+                    file_record_report_ino,
+                    FileType::RegularFile,
+                    Self::file_record_report_name(
+                        description.file_number,
+                        description.record_number,
+                    ),
+                ));
+            }
             entries
         } else {
             reply.error(Errno::ENOTDIR);
@@ -1852,8 +1930,16 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
-        if self.register_by_name(name).is_none() && self.coil_by_name(name).is_none() {
-            // Staging a value only makes sense for a real register or coil.
+        let is_known_target = self.register_by_name(name).is_some()
+            || self.coil_by_name(name).is_some()
+            || Self::parse_file_record_name(name).is_some_and(|(file_number, record_number)| {
+                self.file_record_by_numbers(file_number, record_number)
+                    .is_some()
+            });
+        if !is_known_target {
+            // Staging a value only makes sense for a real register, coil,
+            // or (via the `<file_number>:<record_number>` naming) file
+            // record.
             reply.error(Errno::ENOENT);
             return;
         }
@@ -1941,6 +2027,17 @@ impl Filesystem for InfusedFilesystem {
                 }
             } else if self.coil_by_name(&name).is_some() {
                 Self::parse_coil_value(&text).map(StagedValue::Coil)
+            } else if let Some((file_number, record_number)) = Self::parse_file_record_name(&name)
+                .filter(|&(file_number, record_number)| {
+                    self.file_record_by_numbers(file_number, record_number)
+                        .is_some()
+                })
+            {
+                Self::parse_file_record_value(&text).map(|value| StagedValue::FileRecord {
+                    file_number,
+                    record_number,
+                    value,
+                })
             } else {
                 None
             };
@@ -1990,7 +2087,7 @@ impl Filesystem for InfusedFilesystem {
                 let record_number = description.record_number;
                 Self::parse_file_record_value(&text).map(|value| {
                     (
-                        format!("{file_number}:{record_number}"),
+                        Self::file_record_report_name(file_number, record_number),
                         StagedValue::FileRecord {
                             file_number,
                             record_number,
@@ -2993,6 +3090,67 @@ mod tests {
     fn parse_file_record_value_rejects_empty_input() {
         assert_eq!(InfusedFilesystem::parse_file_record_value(""), None);
         assert_eq!(InfusedFilesystem::parse_file_record_value("   "), None);
+    }
+
+    #[test]
+    fn parse_file_record_name_accepts_a_colon_separated_pair() {
+        assert_eq!(
+            InfusedFilesystem::parse_file_record_name("4:1"),
+            Some((4, 1))
+        );
+    }
+
+    #[test]
+    fn parse_file_record_name_rejects_a_missing_colon() {
+        assert_eq!(InfusedFilesystem::parse_file_record_name("41"), None);
+    }
+
+    #[test]
+    fn parse_file_record_name_rejects_non_numeric_parts() {
+        assert_eq!(InfusedFilesystem::parse_file_record_name("a:1"), None);
+        assert_eq!(InfusedFilesystem::parse_file_record_name("4:b"), None);
+    }
+
+    #[test]
+    fn file_record_report_name_is_colon_separated() {
+        assert_eq!(
+            InfusedFilesystem::file_record_report_name(4, 1),
+            "4:1".to_string()
+        );
+    }
+
+    #[test]
+    fn first_file_record_report_ino_sits_right_after_the_coil_report_range() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Direct);
+        assert_eq!(
+            filesystem.first_file_record_report_ino(),
+            filesystem.first_coil_report_ino() + filesystem.coils.len() as u64
+        );
+    }
+
+    #[test]
+    fn report_file_record_by_ino_resolves_each_entry_in_declaration_order() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Direct);
+        let first = INodeNo(filesystem.first_file_record_report_ino());
+        let second = INodeNo(filesystem.first_file_record_report_ino() + 1);
+        assert_eq!(
+            filesystem
+                .report_file_record_by_ino(first)
+                .map(|d| d.record_number),
+            Some(5)
+        );
+        assert_eq!(
+            filesystem
+                .report_file_record_by_ino(second)
+                .map(|d| d.record_number),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn report_file_record_by_ino_returns_none_for_an_unrelated_inode() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Direct);
+        assert_eq!(filesystem.report_file_record_by_ino(ROOT_INO), None);
     }
 
     #[test]

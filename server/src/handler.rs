@@ -47,16 +47,18 @@ use protocol::pdu::{
     FUNCTION_CODE_READ_DISCRETE_INPUTS, FUNCTION_CODE_READ_FILE_RECORD,
     FUNCTION_CODE_READ_HOLDING_REGISTERS, FUNCTION_CODE_READ_INPUT_REGISTERS,
     FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS, FUNCTION_CODE_REPORT_SERVER_ID,
-    FUNCTION_CODE_WRITE_MULTIPLE_COILS, FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
-    FUNCTION_CODE_WRITE_SINGLE_COIL, FUNCTION_CODE_WRITE_SINGLE_REGISTER, MaskWriteRegisterRequest,
-    MaskWriteRegisterResponse, ReadCoilsRequest, ReadCoilsResponse,
-    ReadDeviceIdentificationRequest, ReadDiscreteInputsRequest, ReadDiscreteInputsResponse,
-    ReadFileRecordRequest, ReadFileRecordResponse, ReadHoldingRegistersRequest,
-    ReadHoldingRegistersResponse, ReadInputRegistersRequest, ReadInputRegistersResponse,
-    ReadWriteMultipleRegistersRequest, ReadWriteMultipleRegistersResponse, ReportServerIdRequest,
-    ReportServerIdResponse, WriteMultipleCoilsRequest, WriteMultipleCoilsResponse,
-    WriteMultipleRegistersRequest, WriteMultipleRegistersResponse, WriteSingleCoilRequest,
-    WriteSingleCoilResponse, WriteSingleRegisterRequest, WriteSingleRegisterResponse,
+    FUNCTION_CODE_WRITE_FILE_RECORD, FUNCTION_CODE_WRITE_MULTIPLE_COILS,
+    FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS, FUNCTION_CODE_WRITE_SINGLE_COIL,
+    FUNCTION_CODE_WRITE_SINGLE_REGISTER, MaskWriteRegisterRequest, MaskWriteRegisterResponse,
+    ReadCoilsRequest, ReadCoilsResponse, ReadDeviceIdentificationRequest,
+    ReadDiscreteInputsRequest, ReadDiscreteInputsResponse, ReadFileRecordRequest,
+    ReadFileRecordResponse, ReadHoldingRegistersRequest, ReadHoldingRegistersResponse,
+    ReadInputRegistersRequest, ReadInputRegistersResponse, ReadWriteMultipleRegistersRequest,
+    ReadWriteMultipleRegistersResponse, ReportServerIdRequest, ReportServerIdResponse,
+    WriteFileRecordRequest, WriteFileRecordResponse, WriteMultipleCoilsRequest,
+    WriteMultipleCoilsResponse, WriteMultipleRegistersRequest, WriteMultipleRegistersResponse,
+    WriteSingleCoilRequest, WriteSingleCoilResponse, WriteSingleRegisterRequest,
+    WriteSingleRegisterResponse,
 };
 use std::sync::{Mutex, PoisonError};
 
@@ -139,6 +141,9 @@ pub fn handle_request(
         }
         FUNCTION_CODE_READ_FILE_RECORD => {
             handle_read_file_record(pdu, file_records, file_record_store)
+        }
+        FUNCTION_CODE_WRITE_FILE_RECORD => {
+            handle_write_file_record(pdu, file_records, file_record_store)
         }
         _ => ExceptionResponse {
             function_code,
@@ -243,6 +248,68 @@ fn handle_read_file_record(
         .encode();
     }
     encoded
+}
+
+// Resolves every sub-request fully against the static `file_records`
+// descriptions — unknown (file_number, record_number) or a `record_data`
+// length that doesn't match the declared `record_length` — *before*
+// touching `file_record_store` at all, same "validate before applying"
+// invariant as every other multi-item write handler in this module (no
+// partial writes on a request that's partly invalid). Per spec the
+// response echoes the request's sub-requests back exactly, so a
+// successful reply is always the same size as the request — no separate
+// PDU-length check needed here (unlike the read half), since an echo can
+// never grow past what already arrived as one valid PDU.
+fn handle_write_file_record(
+    pdu: &[u8],
+    file_records: &[FileRecordDescription],
+    file_record_store: &Mutex<FileRecordStore>,
+) -> Vec<u8> {
+    let Ok(request) = WriteFileRecordRequest::decode(pdu) else {
+        return ExceptionResponse {
+            function_code: FUNCTION_CODE_WRITE_FILE_RECORD,
+            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+        }
+        .encode();
+    };
+
+    for sub_request in &request.sub_requests {
+        let Some(description) = file_records.iter().find(|description| {
+            description.file_number == sub_request.file_number
+                && description.record_number == sub_request.record_number
+        }) else {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_WRITE_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+            .encode();
+        };
+        if sub_request.record_data.len() != description.record_length as usize * 2 {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_WRITE_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+            }
+            .encode();
+        }
+    }
+
+    {
+        let mut store = file_record_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for sub_request in &request.sub_requests {
+            store.set(
+                sub_request.file_number,
+                sub_request.record_number,
+                sub_request.record_data.clone(),
+            );
+        }
+    }
+
+    WriteFileRecordResponse {
+        sub_requests: request.sub_requests,
+    }
+    .encode()
 }
 
 // Zero (or 0.0) for every DataType — what an unset register reads back as,
@@ -850,7 +917,7 @@ fn handle_write_multiple_coils(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::pdu::FileRecordSubRequest;
+    use protocol::pdu::{FileRecordSubRequest, WriteFileRecordSubRequest};
 
     fn registers() -> Vec<RegisterDescription> {
         vec![
@@ -2785,6 +2852,253 @@ mod tests {
             ExceptionResponse::decode(&response).unwrap(),
             ExceptionResponse {
                 function_code: FUNCTION_CODE_READ_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_FUNCTION,
+            }
+        );
+    }
+
+    #[test]
+    fn write_file_record_applies_every_sub_request_and_echoes_the_request() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let file_record_store = Mutex::new(FileRecordStore::new());
+
+        let sub_requests = vec![
+            WriteFileRecordSubRequest {
+                file_number: 4,
+                record_number: 1,
+                record_data: vec![0x0D, 0xFE, 0x00, 0x20],
+            },
+            WriteFileRecordSubRequest {
+                file_number: 3,
+                record_number: 9,
+                record_data: vec![0x33, 0xCD, 0x00, 0x40],
+            },
+        ];
+        let request = WriteFileRecordRequest {
+            sub_requests: sub_requests.clone(),
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &ServerOptions::allow_all(),
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            &file_records(),
+            &file_record_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            WriteFileRecordResponse::decode(&response).unwrap(),
+            WriteFileRecordResponse { sub_requests }
+        );
+        assert_eq!(
+            file_record_store.lock().unwrap().get(4, 1),
+            Some(&vec![0x0D, 0xFE, 0x00, 0x20])
+        );
+        assert_eq!(
+            file_record_store.lock().unwrap().get(3, 9),
+            Some(&vec![0x33, 0xCD, 0x00, 0x40])
+        );
+    }
+
+    #[test]
+    fn write_file_record_of_unknown_file_number_returns_an_exception_and_writes_nothing() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let file_record_store = Mutex::new(FileRecordStore::new());
+
+        let request = WriteFileRecordRequest {
+            sub_requests: vec![WriteFileRecordSubRequest {
+                file_number: 999,
+                record_number: 1,
+                record_data: vec![0x00, 0x00, 0x00, 0x00],
+            }],
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &ServerOptions::allow_all(),
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            &file_records(),
+            &file_record_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_WRITE_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
+        assert_eq!(file_record_store.lock().unwrap().get(999, 1), None);
+    }
+
+    #[test]
+    fn write_file_record_with_wrong_record_length_returns_an_exception() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let file_record_store = Mutex::new(FileRecordStore::new());
+
+        // file_records() declares (4, 1) with record_length 2 (4 bytes),
+        // not 1 (2 bytes).
+        let request = WriteFileRecordRequest {
+            sub_requests: vec![WriteFileRecordSubRequest {
+                file_number: 4,
+                record_number: 1,
+                record_data: vec![0x00, 0x00],
+            }],
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &ServerOptions::allow_all(),
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            &file_records(),
+            &file_record_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_WRITE_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+            }
+        );
+    }
+
+    #[test]
+    fn write_file_record_rejects_the_whole_batch_when_one_sub_request_is_invalid() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let file_record_store = Mutex::new(FileRecordStore::new());
+
+        // First sub-request is valid, second references an unknown record —
+        // the whole request must be rejected, and the valid one must not
+        // have been applied either (no partial writes).
+        let request = WriteFileRecordRequest {
+            sub_requests: vec![
+                WriteFileRecordSubRequest {
+                    file_number: 4,
+                    record_number: 1,
+                    record_data: vec![0x00, 0x00, 0x00, 0x00],
+                },
+                WriteFileRecordSubRequest {
+                    file_number: 999,
+                    record_number: 1,
+                    record_data: vec![0x00, 0x00, 0x00, 0x00],
+                },
+            ],
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &ServerOptions::allow_all(),
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            &file_records(),
+            &file_record_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_WRITE_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
+        assert_eq!(file_record_store.lock().unwrap().get(4, 1), None);
+    }
+
+    #[test]
+    fn write_file_record_is_rejected_when_disabled_via_server_options() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let file_record_store = Mutex::new(FileRecordStore::new());
+
+        let request = WriteFileRecordRequest {
+            sub_requests: vec![WriteFileRecordSubRequest {
+                file_number: 4,
+                record_number: 1,
+                record_data: vec![0x00, 0x00, 0x00, 0x00],
+            }],
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &ServerOptions::default(),
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            &file_records(),
+            &file_record_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_WRITE_FILE_RECORD,
                 exception_code: EXCEPTION_ILLEGAL_FUNCTION,
             }
         );

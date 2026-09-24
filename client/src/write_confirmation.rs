@@ -7,8 +7,9 @@ use fuse_fs::{CoilValue, RegisterValue, WriteStatus};
 use protocol::DecodeError;
 use protocol::device_description::{CoilDescription, MemLayout, RegisterDescription};
 use protocol::pdu::{
-    ExceptionResponse, MaskWriteRegisterRequest, WriteMultipleCoilsRequest,
-    WriteMultipleRegistersRequest, WriteSingleCoilRequest, WriteSingleRegisterRequest,
+    ExceptionResponse, MaskWriteRegisterRequest, WriteFileRecordRequest, WriteFileRecordResponse,
+    WriteFileRecordSubRequest, WriteMultipleCoilsRequest, WriteMultipleRegistersRequest,
+    WriteSingleCoilRequest, WriteSingleRegisterRequest,
 };
 use std::time::Duration;
 
@@ -172,6 +173,67 @@ pub async fn confirm_mask_write(
     .encode();
     match connection.request(unit_id, pdu, timeout).await {
         Ok(response_pdu) => interpret_write_response(&response_pdu),
+        Err(error) => WriteStatus::Failed(format!("write failed: {error}")),
+    }
+}
+
+/// File-record counterpart of `interpret_write_response` — but unlike a
+/// plain register/coil write, a Write File Record (FC 0x15) response
+/// echoes the *entire* request back (file/record numbers and data
+/// included, not just a fixed address+value/quantity pair), so "not an
+/// exception" alone isn't a strong enough confirmation: it's also checked
+/// against `sent` to catch a response that decodes fine but doesn't
+/// actually match what was written (a device bug, or a confused relay).
+pub fn interpret_write_file_record_response(
+    response_pdu: &[u8],
+    sent: &[WriteFileRecordSubRequest],
+) -> WriteStatus {
+    match ExceptionResponse::decode(response_pdu) {
+        Ok(exception) => WriteStatus::Failed(format!(
+            "device returned Modbus exception code {}",
+            exception.exception_code
+        )),
+        Err(DecodeError::NotAnExceptionResponse { .. }) => {
+            match WriteFileRecordResponse::decode(response_pdu) {
+                Ok(response) if response.sub_requests == sent => WriteStatus::Ok,
+                Ok(_) => WriteStatus::Failed(
+                    "device echoed a different file record than what was written".to_string(),
+                ),
+                Err(error) => WriteStatus::Failed(format!("malformed write response: {error:?}")),
+            }
+        }
+        Err(error) => WriteStatus::Failed(format!("malformed write response: {error:?}")),
+    }
+}
+
+/// Sends a Write File Record (FC 0x15) request for a single
+/// `(file_number, record_number)` and confirms it via
+/// `interpret_write_file_record_response`. Always exactly one sub-request
+/// per call, mirroring `confirm_mask_write`'s "never batched" reasoning —
+/// `client::transaction_consumer` stages/sends each staged file record
+/// independently, same as it already does for mask writes, and for the
+/// same underlying reason `client::polling::poll_file_records_once`
+/// doesn't batch reads either (no concrete need yet, extraction-based
+/// programming).
+pub async fn confirm_file_record_write(
+    connection: &mut Connection,
+    file_number: u16,
+    record_number: u16,
+    value: Vec<u8>,
+    unit_id: u8,
+    timeout: Duration,
+) -> WriteStatus {
+    let sub_requests = vec![WriteFileRecordSubRequest {
+        file_number,
+        record_number,
+        record_data: value,
+    }];
+    let pdu = WriteFileRecordRequest {
+        sub_requests: sub_requests.clone(),
+    }
+    .encode();
+    match connection.request(unit_id, pdu, timeout).await {
+        Ok(response_pdu) => interpret_write_file_record_response(&response_pdu, &sub_requests),
         Err(error) => WriteStatus::Failed(format!("write failed: {error}")),
     }
 }
@@ -740,6 +802,150 @@ mod tests {
             &mut connection,
             1,
             &[true, false],
+            0x01,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(matches!(status, WriteStatus::Failed(_)));
+    }
+
+    fn a_file_record_sub_request() -> WriteFileRecordSubRequest {
+        WriteFileRecordSubRequest {
+            file_number: 4,
+            record_number: 1,
+            record_data: vec![0x0D, 0xFE, 0x00, 0x20],
+        }
+    }
+
+    #[test]
+    fn interpret_write_file_record_response_treats_a_matching_echo_as_ok() {
+        let sent = vec![a_file_record_sub_request()];
+        let response = WriteFileRecordResponse {
+            sub_requests: sent.clone(),
+        }
+        .encode();
+        assert_eq!(
+            interpret_write_file_record_response(&response, &sent),
+            WriteStatus::Ok
+        );
+    }
+
+    #[test]
+    fn interpret_write_file_record_response_treats_a_different_echo_as_failed() {
+        let sent = vec![a_file_record_sub_request()];
+        let response = WriteFileRecordResponse {
+            sub_requests: vec![WriteFileRecordSubRequest {
+                file_number: 4,
+                record_number: 1,
+                record_data: vec![0x00, 0x00, 0x00, 0x00],
+            }],
+        }
+        .encode();
+        assert!(matches!(
+            interpret_write_file_record_response(&response, &sent),
+            WriteStatus::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn interpret_write_file_record_response_treats_exception_as_failed() {
+        let sent = vec![a_file_record_sub_request()];
+        let response = ExceptionResponse {
+            function_code: 0x15,
+            exception_code: 0x02,
+        }
+        .encode();
+        assert_eq!(
+            interpret_write_file_record_response(&response, &sent),
+            WriteStatus::Failed("device returned Modbus exception code 2".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_file_record_write_returns_ok_when_device_echoes_the_write() {
+        let (mut connection, mut device) = connected_pair().await;
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut header)
+                .await
+                .unwrap();
+            let mut pdu = vec![0u8; 13];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut pdu)
+                .await
+                .unwrap();
+            let mut response = header;
+            response.extend_from_slice(&pdu);
+            tokio::io::AsyncWriteExt::write_all(&mut device, &response)
+                .await
+                .unwrap();
+        });
+
+        let status = confirm_file_record_write(
+            &mut connection,
+            4,
+            1,
+            vec![0x0D, 0xFE, 0x00, 0x20],
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(status, WriteStatus::Ok);
+        device_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirm_file_record_write_returns_failed_when_device_returns_an_exception() {
+        let (mut connection, mut device) = connected_pair().await;
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut header)
+                .await
+                .unwrap();
+            let mut pdu = vec![0u8; 13];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut pdu)
+                .await
+                .unwrap();
+            let exception = ExceptionResponse {
+                function_code: 0x15,
+                exception_code: 0x02,
+            }
+            .encode();
+            let mut response = header;
+            let length = (exception.len() + 1) as u16;
+            response[4..6].copy_from_slice(&length.to_be_bytes());
+            response.extend_from_slice(&exception);
+            tokio::io::AsyncWriteExt::write_all(&mut device, &response)
+                .await
+                .unwrap();
+        });
+
+        let status = confirm_file_record_write(
+            &mut connection,
+            4,
+            1,
+            vec![0x0D, 0xFE, 0x00, 0x20],
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(status, WriteStatus::Failed(_)));
+        device_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirm_file_record_write_returns_failed_when_the_device_never_responds() {
+        let (mut connection, _device) = connected_pair().await;
+
+        let status = confirm_file_record_write(
+            &mut connection,
+            4,
+            1,
+            vec![0x0D, 0xFE, 0x00, 0x20],
             0x01,
             Duration::from_millis(50),
         )

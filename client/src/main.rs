@@ -251,6 +251,7 @@ fn main() {
     let consumer_connection = Arc::clone(&connection);
     let consumer_registers = registers.clone();
     let consumer_coils = coils.clone();
+    let consumer_file_records = file_records.clone();
     let consumer_report = Arc::clone(&report);
     std::thread::spawn(move || {
         run_transaction_consumer(
@@ -258,6 +259,7 @@ fn main() {
             &consumer_connection,
             &consumer_registers,
             &consumer_coils,
+            &consumer_file_records,
             &consumer_report,
             mem_layout,
             transaction_receiver,

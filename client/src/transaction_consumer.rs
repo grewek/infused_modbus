@@ -54,12 +54,14 @@
 use crate::batching::{Batch, build_batches};
 use crate::connection::Connection;
 use crate::write_confirmation::{
-    confirm_coil_write, confirm_coil_write_multiple, confirm_mask_write, confirm_write,
-    confirm_write_multiple,
+    confirm_coil_write, confirm_coil_write_multiple, confirm_file_record_write, confirm_mask_write,
+    confirm_write, confirm_write_multiple,
 };
 use fuse_fs::register_encoding::register_value_to_words;
 use fuse_fs::{CoilValue, RegisterValue, StagedValue, WriteReport, WriteStatus};
-use protocol::device_description::{CoilDescription, MemLayout, RegisterDescription};
+use protocol::device_description::{
+    CoilDescription, FileRecordDescription, MemLayout, RegisterDescription,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -110,6 +112,7 @@ pub fn run_transaction_consumer(
     connection: &Arc<AsyncMutex<Connection>>,
     registers: &[RegisterDescription],
     coils: &[CoilDescription],
+    file_records: &[FileRecordDescription],
     report: &Arc<Mutex<WriteReport>>,
     mem_layout: MemLayout,
     transaction_receiver: mpsc::Receiver<HashMap<String, StagedValue>>,
@@ -120,6 +123,7 @@ pub fn run_transaction_consumer(
         let mut register_entries: Vec<(RegisterDescription, RegisterValue)> = Vec::new();
         let mut coil_entries: Vec<(CoilDescription, bool)> = Vec::new();
         let mut masked_register_entries: Vec<(RegisterDescription, u16, u16)> = Vec::new();
+        let mut file_record_entries: Vec<(String, u16, u16, Vec<u8>)> = Vec::new();
 
         // Resolve every staged name against the known registers/coils
         // first, reporting anything unknown or mismatched immediately —
@@ -185,18 +189,47 @@ pub fn run_transaction_consumer(
                         .unwrap()
                         .set(name, WriteStatus::Failed(reason));
                 }
-                // Never actually produced on the client — same reasoning as
-                // DiscreteInput/InputRegister above: fuse-fs only
-                // constructs this from the server's direct-write path, and
-                // no Modbus function code lets a master write a file record
-                // either (FC 0x15/Write File Record isn't implemented).
-                StagedValue::FileRecord { .. } => {
-                    let reason = format!("file record {name}: never writable via Modbus");
-                    report
-                        .lock()
-                        .unwrap()
-                        .set(name, WriteStatus::Failed(reason));
-                }
+                // Unlike DiscreteInput/InputRegister above, this one *is*
+                // real on the client — FC 0x15 (Write File Record) is the
+                // whole point of exposing file records here at all (a
+                // technician pushing data into a real device's file/record
+                // slot), unlike FC17 where the client already had every
+                // equivalent tool. Resolved against the known
+                // `file_records` the same way registers/coils are above;
+                // sent individually below (`file_record_entries`), never
+                // batched — same reasoning as `masked_register_entries`,
+                // Modbus has no "write multiple file records" function
+                // code.
+                StagedValue::FileRecord {
+                    file_number,
+                    record_number,
+                    value,
+                } => match file_records.iter().find(|description| {
+                    description.file_number == file_number
+                        && description.record_number == record_number
+                }) {
+                    Some(description) if value.len() == description.record_length as usize * 2 => {
+                        file_record_entries.push((name, file_number, record_number, value));
+                    }
+                    Some(description) => {
+                        let reason = format!(
+                            "file record {file_number}:{record_number}: expected {} bytes but got {}",
+                            description.record_length as usize * 2,
+                            value.len()
+                        );
+                        report
+                            .lock()
+                            .unwrap()
+                            .set(name, WriteStatus::Failed(reason));
+                    }
+                    None => {
+                        let reason = format!("unknown file record: {file_number}:{record_number}");
+                        report
+                            .lock()
+                            .unwrap()
+                            .set(name, WriteStatus::Failed(reason));
+                    }
+                },
                 // Collected separately from register_entries, not batched:
                 // Mask Write Register (FC 0x16) has no "multiple" variant,
                 // so each masked write always goes out as its own request
@@ -321,6 +354,31 @@ pub fn run_transaction_consumer(
             });
             report.lock().unwrap().set(register.name.clone(), status);
         }
+
+        // Deliberately does not touch a local FileRecordStore on success,
+        // same "single writer" discipline already established for
+        // registers/coils (see this module's own doc comment): only
+        // `client::polling::poll_file_records_once` ever writes the
+        // client's mirror, so `file-records/<file>/<record>` can lag up to
+        // one poll interval behind `report/<name>` showing `OK` — a
+        // confirmed write landing here and a poll response already in
+        // flight would otherwise be able to race the same way H2 already
+        // ruled out for registers/coils.
+        for (name, file_number, record_number, value) in file_record_entries {
+            let status = handle.block_on(async {
+                let mut connection = connection.lock().await;
+                confirm_file_record_write(
+                    &mut connection,
+                    file_number,
+                    record_number,
+                    value,
+                    unit_id,
+                    timeout,
+                )
+                .await
+            });
+            report.lock().unwrap().set(name, status);
+        }
     }
 }
 
@@ -412,6 +470,7 @@ mod tests {
                 &connection,
                 &registers,
                 &coils,
+                &[],
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -479,6 +538,7 @@ mod tests {
                 &connection,
                 &registers,
                 &coils,
+                &[],
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -521,6 +581,7 @@ mod tests {
                 &connection,
                 &registers,
                 &coils,
+                &[],
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -582,6 +643,7 @@ mod tests {
                 &connection,
                 &registers,
                 &coils,
+                &[],
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -652,6 +714,7 @@ mod tests {
                 &connection,
                 &registers,
                 &coils,
+                &[],
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -725,6 +788,7 @@ mod tests {
                 &connection,
                 &registers,
                 &coils,
+                &[],
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -800,6 +864,7 @@ mod tests {
                 &connection,
                 &registers,
                 &coils,
+                &[],
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -873,6 +938,7 @@ mod tests {
                 &connection,
                 &registers,
                 &coils,
+                &[],
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -952,6 +1018,7 @@ mod tests {
                 &connection,
                 &registers,
                 &coils,
+                &[],
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -998,6 +1065,7 @@ mod tests {
                 &connection,
                 &registers,
                 &coils,
+                &[],
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -1062,6 +1130,7 @@ mod tests {
                 &connection,
                 &registers,
                 &coils,
+                &[],
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -1111,6 +1180,7 @@ mod tests {
                 &connection,
                 &registers,
                 &coils,
+                &[],
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -1159,6 +1229,7 @@ mod tests {
                 &connection,
                 &registers,
                 &coils,
+                &[],
                 &consumer_report,
                 MemLayout::Abcd,
                 transaction_receiver,
@@ -1182,6 +1253,181 @@ mod tests {
 
         assert!(matches!(
             report.lock().unwrap().get("Ghost_Register"),
+            Some(WriteStatus::Failed(_))
+        ));
+
+        drop(device);
+    }
+
+    fn a_file_record() -> FileRecordDescription {
+        FileRecordDescription {
+            file_number: 4,
+            record_number: 1,
+            record_length: 2,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn confirms_a_file_record_write_and_updates_report() {
+        let (connection, mut device) = connected_pair().await;
+        let (transaction_sender, transaction_receiver) = mpsc::channel();
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let registers: Vec<RegisterDescription> = vec![];
+        let coils: Vec<CoilDescription> = vec![];
+        let file_records = vec![a_file_record()];
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut header)
+                .await
+                .unwrap();
+            let mut pdu = vec![0u8; 13];
+            tokio::io::AsyncReadExt::read_exact(&mut device, &mut pdu)
+                .await
+                .unwrap();
+            assert_eq!(
+                pdu,
+                vec![
+                    0x15, 0x0B, 0x06, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x0D, 0xFE, 0x00, 0x20,
+                ]
+            );
+            let mut response = header;
+            response.extend_from_slice(&pdu);
+            tokio::io::AsyncWriteExt::write_all(&mut device, &response)
+                .await
+                .unwrap();
+        });
+
+        let handle = Handle::current();
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let consumer_report = Arc::clone(&report);
+        let consumer_thread = std::thread::spawn(move || {
+            run_transaction_consumer(
+                &handle,
+                &connection,
+                &registers,
+                &coils,
+                &file_records,
+                &consumer_report,
+                MemLayout::Abcd,
+                transaction_receiver,
+                0x01,
+                Duration::from_secs(1),
+            );
+        });
+
+        let mut transaction = HashMap::new();
+        transaction.insert(
+            "4:1".to_string(),
+            StagedValue::FileRecord {
+                file_number: 4,
+                record_number: 1,
+                value: vec![0x0D, 0xFE, 0x00, 0x20],
+            },
+        );
+        transaction_sender.send(transaction).unwrap();
+        drop(transaction_sender);
+
+        device_task.await.unwrap();
+        consumer_thread.join().unwrap();
+
+        assert_eq!(report.lock().unwrap().get("4:1"), Some(&WriteStatus::Ok));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_file_record_is_reported_as_failed_without_sending_anything() {
+        let (connection, device) = connected_pair().await;
+        let (transaction_sender, transaction_receiver) = mpsc::channel();
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let registers: Vec<RegisterDescription> = vec![];
+        let coils: Vec<CoilDescription> = vec![];
+        let file_records = vec![a_file_record()];
+
+        let handle = Handle::current();
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let consumer_report = Arc::clone(&report);
+        let consumer_thread = std::thread::spawn(move || {
+            run_transaction_consumer(
+                &handle,
+                &connection,
+                &registers,
+                &coils,
+                &file_records,
+                &consumer_report,
+                MemLayout::Abcd,
+                transaction_receiver,
+                0x01,
+                Duration::from_secs(1),
+            );
+        });
+
+        let mut transaction = HashMap::new();
+        transaction.insert(
+            "999:1".to_string(),
+            StagedValue::FileRecord {
+                file_number: 999,
+                record_number: 1,
+                value: vec![0x00, 0x00, 0x00, 0x00],
+            },
+        );
+        transaction_sender.send(transaction).unwrap();
+        drop(transaction_sender);
+
+        consumer_thread.join().unwrap();
+
+        assert!(matches!(
+            report.lock().unwrap().get("999:1"),
+            Some(WriteStatus::Failed(_))
+        ));
+
+        drop(device);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wrong_length_file_record_is_reported_as_failed_without_sending_anything() {
+        let (connection, device) = connected_pair().await;
+        let (transaction_sender, transaction_receiver) = mpsc::channel();
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let registers: Vec<RegisterDescription> = vec![];
+        let coils: Vec<CoilDescription> = vec![];
+        // a_file_record() declares record_length 2 (4 bytes), not 1 (2
+        // bytes).
+        let file_records = vec![a_file_record()];
+
+        let handle = Handle::current();
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let consumer_report = Arc::clone(&report);
+        let consumer_thread = std::thread::spawn(move || {
+            run_transaction_consumer(
+                &handle,
+                &connection,
+                &registers,
+                &coils,
+                &file_records,
+                &consumer_report,
+                MemLayout::Abcd,
+                transaction_receiver,
+                0x01,
+                Duration::from_secs(1),
+            );
+        });
+
+        let mut transaction = HashMap::new();
+        transaction.insert(
+            "4:1".to_string(),
+            StagedValue::FileRecord {
+                file_number: 4,
+                record_number: 1,
+                value: vec![0x00, 0x00],
+            },
+        );
+        transaction_sender.send(transaction).unwrap();
+        drop(transaction_sender);
+
+        consumer_thread.join().unwrap();
+
+        assert!(matches!(
+            report.lock().unwrap().get("4:1"),
             Some(WriteStatus::Failed(_))
         ));
 
