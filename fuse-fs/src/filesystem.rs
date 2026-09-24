@@ -491,10 +491,30 @@ impl InfusedFilesystem {
     // direct-write model"). Reported via `getattr`/`lookup` so the kernel's
     // own `default_permissions` check (which runs before `write` is ever
     // called) doesn't reject a write the FUSE layer would otherwise accept.
+    // Used for coils/discrete-inputs/input-registers, none of which have a
+    // TOML-declared `AccessRight` (coils are always read/write; the other
+    // two have no wire write path at all, so "direct write" is the only way
+    // to ever set them) — see `register_file_mode` for the register case,
+    // which additionally depends on the register's own `access`.
     fn writable_data_file_mode(&self) -> u16 {
         match self.write_mode {
             WriteMode::Direct => 0o644,
             WriteMode::Staged => 0o444,
+        }
+    }
+
+    // Like `writable_data_file_mode`, but for `holding-registers/<name>`
+    // specifically: a register additionally carries its own TOML-declared
+    // `AccessRight`, and `WriteMode::Direct` must not make a
+    // `read_only`-declared register writable just because the server
+    // otherwise writes directly — the wire handlers (`handle_write_single`/
+    // `handle_write_multiple_registers`/FC17's write half) already enforce
+    // this `access` check, so the server's own local FUSE write path has to
+    // match rather than being a backdoor around it.
+    fn register_file_mode(&self, register: &RegisterDescription) -> u16 {
+        match (self.write_mode, register.access) {
+            (WriteMode::Direct, protocol::device_description::AccessRight::ReadWrite) => 0o644,
+            _ => 0o444,
         }
     }
 
@@ -504,13 +524,20 @@ impl InfusedFilesystem {
     // <name>`/`coils/<name>`/`discrete-inputs/<name>`/`input-registers/
     // <name>` alongside the existing `transactions/` staging path. `false`
     // on the client (WriteMode::Staged) regardless of whether `ino` names a
-    // real register/coil/discrete-input/input-register.
+    // real register/coil/discrete-input/input-register. For a register,
+    // additionally requires `access == ReadWrite` — a `read_only`-declared
+    // register must stay non-writable locally too, matching the wire
+    // handlers' own enforcement of the same TOML field.
     fn direct_writable_by_ino(&self, ino: INodeNo) -> bool {
-        self.write_mode == WriteMode::Direct
-            && (self.register_by_ino(ino).is_some()
-                || self.coil_by_ino(ino).is_some()
-                || self.discrete_input_by_ino(ino).is_some()
-                || self.input_register_by_ino(ino).is_some())
+        if self.write_mode != WriteMode::Direct {
+            return false;
+        }
+        if let Some(register) = self.register_by_ino(ino) {
+            return register.access == protocol::device_description::AccessRight::ReadWrite;
+        }
+        self.coil_by_ino(ino).is_some()
+            || self.discrete_input_by_ino(ino).is_some()
+            || self.input_register_by_ino(ino).is_some()
     }
 
     // `transactions/`+`TRANSACTION_END` only exist in WriteMode::Staged
@@ -916,7 +943,7 @@ impl Filesystem for InfusedFilesystem {
                         &self.file_attr(
                             ino,
                             content.len() as u64,
-                            self.writable_data_file_mode(),
+                            self.register_file_mode(register),
                             req,
                         ),
                         Generation(0),
@@ -1116,7 +1143,7 @@ impl Filesystem for InfusedFilesystem {
                 &self.file_attr(
                     ino,
                     content.len() as u64,
-                    self.writable_data_file_mode(),
+                    self.register_file_mode(register),
                     req,
                 ),
             );
@@ -1825,6 +1852,49 @@ mod tests {
         )
     }
 
+    // Mirrors `test_filesystem_with_permissions_write_mode_and_server_id`,
+    // but with `Stop_Process` declared `read_only` — dedicated fixture
+    // rather than adding a second register to the shared one, since other
+    // tests may assume exactly one register exists.
+    fn test_filesystem_with_read_only_register(
+        write_mode: WriteMode,
+    ) -> (
+        InfusedFilesystem,
+        mpsc::Receiver<HashMap<String, StagedValue>>,
+    ) {
+        let registers = vec![RegisterDescription {
+            name: "Stop_Process".to_string(),
+            address: 40001,
+            data_type: DataType::U16,
+            access: AccessRight::ReadOnly,
+        }];
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let (sender, receiver) = mpsc::channel();
+        (
+            InfusedFilesystem::new(
+                registers,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                store,
+                coil_store,
+                discrete_input_store,
+                input_register_store,
+                sender,
+                report,
+                None,
+                FusePermissions::default(),
+                write_mode,
+                None,
+            ),
+            receiver,
+        )
+    }
+
     fn test_filesystem_with_client_trust() -> InfusedFilesystem {
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         let coil_store = Arc::new(Mutex::new(CoilStore::new()));
@@ -2008,6 +2078,56 @@ mod tests {
         );
         assert!(!filesystem.direct_writable_by_ino(ROOT_INO));
         assert!(!filesystem.direct_writable_by_ino(filesystem.transactions_ino));
+    }
+
+    // Regression test for a bug found during FC17 manual verification (see
+    // CLAUDE.md/memory): `direct_writable_by_ino` used to ignore a
+    // register's own TOML-declared `AccessRight` entirely, so a
+    // `read_only`-declared register was still locally writable on the
+    // server via `holding-registers/<name>` — unlike every wire-facing
+    // write handler, which does enforce `access`.
+    #[test]
+    fn direct_writable_by_ino_is_false_for_a_read_only_register_in_direct_mode() {
+        let (filesystem, _receiver) = test_filesystem_with_read_only_register(WriteMode::Direct);
+        let register_ino = *filesystem.name_to_ino.get("Stop_Process").unwrap();
+        assert!(!filesystem.direct_writable_by_ino(register_ino));
+    }
+
+    #[test]
+    fn direct_writable_by_ino_is_true_for_a_read_write_register_in_direct_mode() {
+        let (filesystem, _receiver) = test_filesystem_with_permissions_and_write_mode(
+            FusePermissions::default(),
+            WriteMode::Direct,
+        );
+        let register_ino = *filesystem.name_to_ino.get("Stop_Process").unwrap();
+        assert!(filesystem.direct_writable_by_ino(register_ino));
+    }
+
+    #[test]
+    fn register_file_mode_is_read_only_for_a_read_only_register_even_in_direct_mode() {
+        let (filesystem, _receiver) = test_filesystem_with_read_only_register(WriteMode::Direct);
+        let register = filesystem.register_by_name("Stop_Process").unwrap();
+        assert_eq!(filesystem.register_file_mode(register), 0o444);
+    }
+
+    #[test]
+    fn register_file_mode_is_writable_for_a_read_write_register_in_direct_mode() {
+        let (filesystem, _receiver) = test_filesystem_with_permissions_and_write_mode(
+            FusePermissions::default(),
+            WriteMode::Direct,
+        );
+        let register = filesystem.register_by_name("Stop_Process").unwrap();
+        assert_eq!(filesystem.register_file_mode(register), 0o644);
+    }
+
+    #[test]
+    fn register_file_mode_is_read_only_for_a_read_write_register_when_staged() {
+        let (filesystem, _receiver) = test_filesystem_with_permissions_and_write_mode(
+            FusePermissions::default(),
+            WriteMode::Staged,
+        );
+        let register = filesystem.register_by_name("Stop_Process").unwrap();
+        assert_eq!(filesystem.register_file_mode(register), 0o444);
     }
 
     #[test]
