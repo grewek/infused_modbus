@@ -187,13 +187,38 @@ impl DiscreteInputStore {
     }
 }
 
+// Keyed by (file_number, record_number) rather than a name — file records
+// (FC 0x14/0x15) have no `name` field at all, see
+// protocol::device_description::FileRecordDescription's own doc comment.
+// Values are raw, uninterpreted bytes (see CLAUDE.md's "FC 0x14 (Read File
+// Record)" section) — unlike RegisterValue/CoilValue there's no typed
+// shape to store, just whatever bytes were last written.
+#[derive(Debug, Default)]
+pub struct FileRecordStore {
+    values: HashMap<(u16, u16), Vec<u8>>,
+}
+
+impl FileRecordStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, file_number: u16, record_number: u16) -> Option<&Vec<u8>> {
+        self.values.get(&(file_number, record_number))
+    }
+
+    pub fn set(&mut self, file_number: u16, record_number: u16, value: Vec<u8>) {
+        self.values.insert((file_number, record_number), value);
+    }
+}
+
 // A value staged in `transactions/`, before TRANSACTION_END hands it off to
 // be confirmed against the real device. Wraps whichever of RegisterValue or
 // CoilValue matches the name being staged — CLAUDE.md's transactions design
 // describes one directory shared across Modbus data types, not one per
 // type, so PendingTransaction (and the TRANSACTION_END hand-off channel)
 // need one value type that can hold either.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StagedValue {
     Register(RegisterValue),
     Coil(CoilValue),
@@ -210,7 +235,23 @@ pub enum StagedValue {
     // its direct-write path (WriteMode::Direct) has no `transactions/` to
     // stage one from, and doesn't try MASK-parsing on a plain
     // `holding-registers/<name>` write either.
-    MaskedRegister { and_mask: u16, or_mask: u16 },
+    MaskedRegister {
+        and_mask: u16,
+        or_mask: u16,
+    },
+    // Only ever produced by the server's direct-write path
+    // (`file-records/<file_number>/<record_number>`), same "server-only,
+    // client has no write path at all" story as `DiscreteInput`/
+    // `InputRegister` above — no Modbus function code lets a master write
+    // one either (FC 0x15/Write File Record isn't implemented). Carries
+    // `file_number`/`record_number` directly rather than relying on the
+    // channel's own String key to identify which record this is, since
+    // `FileRecordStore::set` needs both numbers, not a name.
+    FileRecord {
+        file_number: u16,
+        record_number: u16,
+        value: Vec<u8>,
+    },
 }
 
 impl fmt::Display for StagedValue {
@@ -222,6 +263,12 @@ impl fmt::Display for StagedValue {
             StagedValue::InputRegister(value) => write!(formatter, "{value}"),
             StagedValue::MaskedRegister { and_mask, or_mask } => {
                 write!(formatter, "MASK 0x{and_mask:04X} 0x{or_mask:04X}")
+            }
+            StagedValue::FileRecord { value, .. } => {
+                for byte in value {
+                    write!(formatter, "{byte:02X} ")?;
+                }
+                Ok(())
             }
         }
     }
@@ -248,7 +295,7 @@ impl PendingTransaction {
     }
 
     pub fn get(&self, name: &str) -> Option<StagedValue> {
-        self.staged.get(name).copied()
+        self.staged.get(name).cloned()
     }
 
     pub fn unstage(&mut self, name: &str) -> Option<StagedValue> {
@@ -626,5 +673,37 @@ mod tests {
             WriteStatus::Failed("device timed out".to_string()).to_string(),
             "FAILED: device timed out"
         );
+    }
+
+    #[test]
+    fn file_record_store_get_returns_none_for_an_unset_combination() {
+        let store = FileRecordStore::new();
+        assert_eq!(store.get(20, 5), None);
+    }
+
+    #[test]
+    fn file_record_store_set_then_get_returns_the_value() {
+        let mut store = FileRecordStore::new();
+        store.set(20, 5, vec![0xDE, 0xAD]);
+        assert_eq!(store.get(20, 5), Some(&vec![0xDE, 0xAD]));
+    }
+
+    #[test]
+    fn file_record_store_keys_are_independent_per_file_and_record_number() {
+        let mut store = FileRecordStore::new();
+        store.set(20, 5, vec![0x01]);
+        store.set(20, 6, vec![0x02]);
+        store.set(30, 5, vec![0x03]);
+        assert_eq!(store.get(20, 5), Some(&vec![0x01]));
+        assert_eq!(store.get(20, 6), Some(&vec![0x02]));
+        assert_eq!(store.get(30, 5), Some(&vec![0x03]));
+    }
+
+    #[test]
+    fn file_record_store_set_overwrites_previous_value() {
+        let mut store = FileRecordStore::new();
+        store.set(20, 5, vec![0x01]);
+        store.set(20, 5, vec![0x02]);
+        assert_eq!(store.get(20, 5), Some(&vec![0x02]));
     }
 }

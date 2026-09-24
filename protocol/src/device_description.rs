@@ -120,12 +120,32 @@ pub struct DiscreteInputDescription {
     pub address: u16,
 }
 
+// A single named "file record" for FC 0x14/0x15 (Read/Write File Record) —
+// see CLAUDE.md's "FC 0x14 (Read File Record)" section. Unlike every other
+// entry in this file, `file_number`/`record_number` ARE the address — no
+// base_address+offset resolution, since the wire's own two-axis addressing
+// scheme has no natural "base" to offset from — and there is no `name`
+// field: the FUSE path itself (`file-records/<file_number>/<record_number>`)
+// is the identifier, matching how a real device's own documentation
+// already names these things (e.g. "File 20 = event log"). `record_length`
+// is in 16-bit words (matches the wire field's own unit) and is fixed per
+// entry: an incoming request that doesn't ask for exactly this many words
+// is rejected, the same "must land on an exact boundary" discipline
+// `handle_read` already applies to multi-register values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileRecordDescription {
+    pub file_number: u16,
+    pub record_number: u16,
+    pub record_length: u16,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceDescription {
     pub registers: Vec<RegisterDescription>,
     pub coils: Vec<CoilDescription>,
     pub discrete_inputs: Vec<DiscreteInputDescription>,
     pub input_registers: Vec<InputRegisterDescription>,
+    pub file_records: Vec<FileRecordDescription>,
     // Global for the whole device, not per-register: real devices bake
     // their word/byte order into firmware once, not per data point — see
     // MemLayout's own doc comment. Meaningless when `registers` is empty.
@@ -200,6 +220,16 @@ struct RawDiscreteInputSection {
     entries: Vec<RawDiscreteInputEntry>,
 }
 
+// No wrapping section/`base_address` here, unlike every other entry kind —
+// see `FileRecordDescription`'s own doc comment for why. A flat top-level
+// `[[file-records]]` array of tables instead.
+#[derive(Debug, Deserialize)]
+struct RawFileRecordEntry {
+    file_number: u16,
+    record_number: u16,
+    record_length: u16,
+}
+
 // `registers`/`coils`/`discrete-inputs`/`input-registers` are each optional
 // at the top level (default: no entries) so a device that only has some of
 // the four doesn't need to spell out empty sections for the rest. Once a
@@ -216,6 +246,8 @@ struct RawDeviceDescription {
     discrete_inputs: RawDiscreteInputSection,
     #[serde(default, rename = "input-registers")]
     input_registers: RawInputRegisterSection,
+    #[serde(default, rename = "file-records")]
+    file_records: Vec<RawFileRecordEntry>,
     #[serde(default, rename = "server-id")]
     server_id: Option<String>,
 }
@@ -341,11 +373,22 @@ impl DeviceDescription {
         })
         .collect();
 
+        let file_records = raw
+            .file_records
+            .into_iter()
+            .map(|entry| FileRecordDescription {
+                file_number: entry.file_number,
+                record_number: entry.record_number,
+                record_length: entry.record_length,
+            })
+            .collect();
+
         Ok(DeviceDescription {
             registers,
             coils,
             discrete_inputs,
             input_registers,
+            file_records,
             mem_layout,
             input_register_mem_layout,
             server_id: raw.server_id,
@@ -438,11 +481,51 @@ mod tests {
                 ],
                 discrete_inputs: vec![],
                 input_registers: vec![],
+                file_records: vec![],
                 mem_layout: MemLayout::Abcd,
                 input_register_mem_layout: MemLayout::Abcd,
                 server_id: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_reads_file_record_entries() {
+        let toml_source = r#"
+            [[file-records]]
+            file_number = 20
+            record_number = 5
+            record_length = 9
+
+            [[file-records]]
+            file_number = 20
+            record_number = 6
+            record_length = 9
+        "#;
+
+        let description = DeviceDescription::parse(toml_source).unwrap();
+
+        assert_eq!(
+            description.file_records,
+            vec![
+                FileRecordDescription {
+                    file_number: 20,
+                    record_number: 5,
+                    record_length: 9,
+                },
+                FileRecordDescription {
+                    file_number: 20,
+                    record_number: 6,
+                    record_length: 9,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_of_empty_source_has_no_file_records() {
+        let description = DeviceDescription::parse("").unwrap();
+        assert_eq!(description.file_records, vec![]);
     }
 
     #[test]

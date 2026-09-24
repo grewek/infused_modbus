@@ -552,6 +552,8 @@ mod tests {
         let discrete_input_store = Arc::new(Mutex::new(fuse_fs::DiscreteInputStore::new()));
         let input_registers = Arc::new(Vec::new());
         let input_register_store = Arc::new(Mutex::new(fuse_fs::InputRegisterStore::new()));
+        let file_records = Arc::new(Vec::new());
+        let file_record_store = Arc::new(Mutex::new(fuse_fs::FileRecordStore::new()));
 
         tokio::spawn(async move {
             let (tcp_stream, _peer) = listener.accept().await.unwrap();
@@ -567,6 +569,8 @@ mod tests {
                 discrete_input_store,
                 input_registers,
                 input_register_store,
+                file_records,
+                file_record_store,
                 MemLayout::Abcd,
                 MemLayout::Abcd,
                 Arc::new(String::new()),

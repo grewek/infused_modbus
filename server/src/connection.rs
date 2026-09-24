@@ -5,10 +5,10 @@
 
 use crate::handler::handle_request;
 use crate::server_options::ServerOptions;
-use fuse_fs::{CoilStore, DiscreteInputStore, InputRegisterStore, RegisterStore};
+use fuse_fs::{CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore};
 use protocol::device_description::{
-    CoilDescription, DiscreteInputDescription, InputRegisterDescription, MemLayout,
-    RegisterDescription,
+    CoilDescription, DiscreteInputDescription, FileRecordDescription, InputRegisterDescription,
+    MemLayout, RegisterDescription,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,6 +32,8 @@ pub async fn serve_tcp_connection<S>(
     discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
     input_registers: Arc<Vec<InputRegisterDescription>>,
     input_register_store: Arc<Mutex<InputRegisterStore>>,
+    file_records: Arc<Vec<FileRecordDescription>>,
+    file_record_store: Arc<Mutex<FileRecordStore>>,
     mem_layout: MemLayout,
     input_register_mem_layout: MemLayout,
     toml_source: Arc<String>,
@@ -56,6 +58,8 @@ pub async fn serve_tcp_connection<S>(
         let handler_discrete_input_store = Arc::clone(&discrete_input_store);
         let handler_input_registers = Arc::clone(&input_registers);
         let handler_input_register_store = Arc::clone(&input_register_store);
+        let handler_file_records = Arc::clone(&file_records);
+        let handler_file_record_store = Arc::clone(&file_record_store);
         let handler_toml_source = Arc::clone(&toml_source);
         let handler_server_id = Arc::clone(&server_id);
         let result = protocol::tcp::serve_request(
@@ -72,6 +76,8 @@ pub async fn serve_tcp_connection<S>(
                     &handler_discrete_input_store,
                     &handler_input_registers,
                     &handler_input_register_store,
+                    &handler_file_records,
+                    &handler_file_record_store,
                     mem_layout,
                     input_register_mem_layout,
                     &handler_toml_source,
@@ -107,6 +113,8 @@ pub async fn serve_rtu_connection<S>(
     discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
     input_registers: Arc<Vec<InputRegisterDescription>>,
     input_register_store: Arc<Mutex<InputRegisterStore>>,
+    file_records: Arc<Vec<FileRecordDescription>>,
+    file_record_store: Arc<Mutex<FileRecordStore>>,
     mem_layout: MemLayout,
     input_register_mem_layout: MemLayout,
     toml_source: Arc<String>,
@@ -125,6 +133,8 @@ pub async fn serve_rtu_connection<S>(
         let handler_discrete_input_store = Arc::clone(&discrete_input_store);
         let handler_input_registers = Arc::clone(&input_registers);
         let handler_input_register_store = Arc::clone(&input_register_store);
+        let handler_file_records = Arc::clone(&file_records);
+        let handler_file_record_store = Arc::clone(&file_record_store);
         let handler_toml_source = Arc::clone(&toml_source);
         let handler_server_id = Arc::clone(&server_id);
         let result = protocol::rtu::serve_request(
@@ -141,6 +151,8 @@ pub async fn serve_rtu_connection<S>(
                     &handler_discrete_input_store,
                     &handler_input_registers,
                     &handler_input_register_store,
+                    &handler_file_records,
+                    &handler_file_record_store,
                     mem_layout,
                     input_register_mem_layout,
                     &handler_toml_source,
@@ -210,6 +222,14 @@ mod tests {
         Arc::new(Mutex::new(InputRegisterStore::new()))
     }
 
+    fn file_records() -> Arc<Vec<FileRecordDescription>> {
+        Arc::new(Vec::new())
+    }
+
+    fn file_record_store() -> Arc<Mutex<FileRecordStore>> {
+        Arc::new(Mutex::new(FileRecordStore::new()))
+    }
+
     #[tokio::test]
     async fn serves_a_read_request_from_the_current_store_value() {
         let (mut master, server_stream) = tokio::io::duplex(1024);
@@ -230,6 +250,8 @@ mod tests {
             discrete_input_store(),
             input_registers(),
             input_register_store(),
+            file_records(),
+            file_record_store(),
             MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
@@ -278,6 +300,8 @@ mod tests {
             discrete_input_store(),
             input_registers(),
             input_register_store(),
+            file_records(),
+            file_record_store(),
             MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
@@ -332,6 +356,8 @@ mod tests {
             discrete_input_store(),
             input_registers(),
             input_register_store(),
+            file_records(),
+            file_record_store(),
             MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
@@ -388,6 +414,8 @@ mod tests {
             discrete_input_store(),
             input_registers(),
             input_register_store(),
+            file_records(),
+            file_record_store(),
             MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),
@@ -437,6 +465,8 @@ mod tests {
             discrete_input_store(),
             input_registers(),
             input_register_store(),
+            file_records(),
+            file_record_store(),
             MemLayout::Abcd,
             MemLayout::Abcd,
             Arc::new(String::new()),

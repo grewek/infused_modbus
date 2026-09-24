@@ -185,6 +185,18 @@ pub fn run_transaction_consumer(
                         .unwrap()
                         .set(name, WriteStatus::Failed(reason));
                 }
+                // Never actually produced on the client — same reasoning as
+                // DiscreteInput/InputRegister above: fuse-fs only
+                // constructs this from the server's direct-write path, and
+                // no Modbus function code lets a master write a file record
+                // either (FC 0x15/Write File Record isn't implemented).
+                StagedValue::FileRecord { .. } => {
+                    let reason = format!("file record {name}: never writable via Modbus");
+                    report
+                        .lock()
+                        .unwrap()
+                        .set(name, WriteStatus::Failed(reason));
+                }
                 // Collected separately from register_entries, not batched:
                 // Mask Write Register (FC 0x16) has no "multiple" variant,
                 // so each masked write always goes out as its own request

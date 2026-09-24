@@ -54,7 +54,9 @@ use client::device_identification::fetch_device_description;
 use client::polling::run_polling_loop;
 use client::transaction_consumer::run_transaction_consumer;
 use fuse_fs::filesystem::{InfusedFilesystem, WriteMode};
-use fuse_fs::{CoilStore, DiscreteInputStore, InputRegisterStore, RegisterStore, WriteReport};
+use fuse_fs::{
+    CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore, WriteReport,
+};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::DeviceDescription;
 use std::sync::{Arc, Mutex, mpsc};
@@ -225,6 +227,7 @@ fn main() {
     // that wiring lands.
     let discrete_inputs = description.discrete_inputs;
     let input_registers = description.input_registers;
+    let file_records = description.file_records;
     let mem_layout = description.mem_layout;
     let input_register_mem_layout = description.input_register_mem_layout;
     let server_id = description.server_id;
@@ -240,6 +243,7 @@ fn main() {
     let coil_store = Arc::new(Mutex::new(CoilStore::new()));
     let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
     let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+    let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
     let report = Arc::new(Mutex::new(WriteReport::new()));
     let (transaction_sender, transaction_receiver) = mpsc::channel();
 
@@ -271,6 +275,8 @@ fn main() {
     let polling_discrete_input_store = Arc::clone(&discrete_input_store);
     let polling_input_registers = input_registers.clone();
     let polling_input_register_store = Arc::clone(&input_register_store);
+    let polling_file_records = file_records.clone();
+    let polling_file_record_store = Arc::clone(&file_record_store);
     runtime.spawn(async move {
         run_polling_loop(
             polling_connection,
@@ -282,6 +288,8 @@ fn main() {
             polling_discrete_input_store,
             &polling_input_registers,
             polling_input_register_store,
+            &polling_file_records,
+            polling_file_record_store,
             mem_layout,
             input_register_mem_layout,
             unit_id,
@@ -301,10 +309,12 @@ fn main() {
         coils,
         discrete_inputs,
         input_registers,
+        file_records,
         store,
         coil_store,
         discrete_input_store,
         input_register_store,
+        file_record_store,
         transaction_sender,
         report,
         // client-trust/ only exists on the server — see CLAUDE.md's TLS

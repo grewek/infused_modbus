@@ -24,13 +24,16 @@
 use crate::batching::{Batch, build_batches};
 use crate::connection::Connection;
 use fuse_fs::register_encoding::register_value_from_words;
-use fuse_fs::{CoilStore, CoilValue, DiscreteInputStore, InputRegisterStore, RegisterStore};
+use fuse_fs::{
+    CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore,
+};
 use protocol::device_description::{
-    CoilDescription, DiscreteInputDescription, InputRegisterDescription, MemLayout,
-    RegisterDescription,
+    CoilDescription, DiscreteInputDescription, FileRecordDescription, InputRegisterDescription,
+    MemLayout, RegisterDescription,
 };
 use protocol::pdu::{
-    ReadCoilsRequest, ReadCoilsResponse, ReadDiscreteInputsRequest, ReadDiscreteInputsResponse,
+    FileRecordSubRequest, ReadCoilsRequest, ReadCoilsResponse, ReadDiscreteInputsRequest,
+    ReadDiscreteInputsResponse, ReadFileRecordRequest, ReadFileRecordResponse,
     ReadHoldingRegistersRequest, ReadHoldingRegistersResponse, ReadInputRegistersRequest,
     ReadInputRegistersResponse,
 };
@@ -353,6 +356,73 @@ pub async fn poll_input_registers_once(
     }
 }
 
+/// File-record counterpart of the other `poll_*_once` functions — but
+/// unlike registers/coils/discrete-inputs/input-registers, file records
+/// are never batched into one request: each configured entry gets its own
+/// Read File Record request, one sub-request each. Deliberately kept this
+/// simple for now (see CLAUDE.md's "FC 0x14 (Read File Record)" section) —
+/// batching several sub-requests into one PDU is possible per the spec,
+/// but there's no concrete need for it yet with a rarely-used FC like this
+/// one (per this project's extraction-based-programming convention).
+/// Values are stored raw/uninterpreted, shown as a hex dump in
+/// `file-records/<file_number>/<record_number>` — nothing decodes them.
+/// No write path exists on the client for these (server direct-write
+/// only, no Write File Record function code implemented), same reasoning
+/// as `poll_discrete_inputs_once`/`poll_input_registers_once`.
+pub async fn poll_file_records_once(
+    connection: &Arc<AsyncMutex<Connection>>,
+    file_records: &[FileRecordDescription],
+    file_record_store: &Arc<Mutex<FileRecordStore>>,
+    unit_id: u8,
+    timeout: Duration,
+) {
+    for description in file_records {
+        let request_pdu = ReadFileRecordRequest {
+            sub_requests: vec![FileRecordSubRequest {
+                file_number: description.file_number,
+                record_number: description.record_number,
+                record_length: description.record_length,
+            }],
+        }
+        .encode();
+
+        let result = {
+            let mut connection = connection.lock().await;
+            connection.request(unit_id, request_pdu, timeout).await
+        };
+
+        let response_pdu = match result {
+            Ok(response_pdu) => response_pdu,
+            Err(error) => {
+                eprintln!(
+                    "poll: read of file record {}:{} failed: {error}",
+                    description.file_number, description.record_number
+                );
+                continue;
+            }
+        };
+
+        match ReadFileRecordResponse::decode(&response_pdu) {
+            Ok(mut decoded) if decoded.records.len() == 1 => {
+                let mut file_record_store = file_record_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                file_record_store.set(
+                    description.file_number,
+                    description.record_number,
+                    decoded.records.remove(0),
+                );
+            }
+            Ok(_) | Err(_) => {
+                eprintln!(
+                    "poll: unexpected response reading file record {}:{}: {:02X?}",
+                    description.file_number, description.record_number, response_pdu
+                );
+            }
+        }
+    }
+}
+
 /// Polls every register and coil batch on a fixed interval, forever —
 /// meant to run as its own tokio task alongside the transaction consumer,
 /// sharing the same connection (`stream`).
@@ -367,6 +437,8 @@ pub async fn run_polling_loop(
     discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
     input_registers: &[InputRegisterDescription],
     input_register_store: Arc<Mutex<InputRegisterStore>>,
+    file_records: &[FileRecordDescription],
+    file_record_store: Arc<Mutex<FileRecordStore>>,
     mem_layout: MemLayout,
     input_register_mem_layout: MemLayout,
     unit_id: u8,
@@ -403,6 +475,14 @@ pub async fn run_polling_loop(
             &input_register_batches,
             &input_register_store,
             input_register_mem_layout,
+            unit_id,
+            timeout,
+        )
+        .await;
+        poll_file_records_once(
+            &connection,
+            file_records,
+            &file_record_store,
             unit_id,
             timeout,
         )
@@ -445,6 +525,18 @@ mod tests {
             name: name.to_string(),
             address,
             data_type,
+        }
+    }
+
+    fn file_record(
+        file_number: u16,
+        record_number: u16,
+        record_length: u16,
+    ) -> FileRecordDescription {
+        FileRecordDescription {
+            file_number,
+            record_number,
+            record_length,
         }
     }
 
@@ -930,5 +1022,110 @@ mod tests {
         .await;
 
         assert_eq!(input_register_store.lock().unwrap().get("A"), None);
+    }
+
+    #[tokio::test]
+    async fn poll_file_records_once_applies_a_successful_read_to_the_store() {
+        let (connection, mut device) = connected_pair().await;
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
+        let file_records = vec![file_record(4, 1, 2)];
+
+        let device_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 7];
+            device.read_exact(&mut header).await.unwrap();
+            let mut pdu = vec![0u8; 9];
+            device.read_exact(&mut pdu).await.unwrap();
+
+            let response_pdu = ReadFileRecordResponse {
+                records: vec![vec![0x0D, 0xFE, 0x00, 0x20]],
+            }
+            .encode();
+            let mut response = header;
+            let length = (response_pdu.len() + 1) as u16;
+            response[4..6].copy_from_slice(&length.to_be_bytes());
+            response.extend_from_slice(&response_pdu);
+            device.write_all(&response).await.unwrap();
+        });
+
+        poll_file_records_once(
+            &connection,
+            &file_records,
+            &file_record_store,
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        device_task.await.unwrap();
+        assert_eq!(
+            file_record_store.lock().unwrap().get(4, 1),
+            Some(&vec![0x0D, 0xFE, 0x00, 0x20])
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_file_records_once_sends_one_request_per_configured_record() {
+        let (connection, mut device) = connected_pair().await;
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
+        let file_records = vec![file_record(4, 1, 1), file_record(3, 9, 1)];
+
+        let device_task = tokio::spawn(async move {
+            for value in [0x11u8, 0x22u8] {
+                let mut header = vec![0u8; 7];
+                device.read_exact(&mut header).await.unwrap();
+                let mut pdu = vec![0u8; 9];
+                device.read_exact(&mut pdu).await.unwrap();
+
+                let response_pdu = ReadFileRecordResponse {
+                    records: vec![vec![0x00, value]],
+                }
+                .encode();
+                let mut response = header;
+                let length = (response_pdu.len() + 1) as u16;
+                response[4..6].copy_from_slice(&length.to_be_bytes());
+                response.extend_from_slice(&response_pdu);
+                device.write_all(&response).await.unwrap();
+            }
+        });
+
+        poll_file_records_once(
+            &connection,
+            &file_records,
+            &file_record_store,
+            0x01,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        device_task.await.unwrap();
+        assert_eq!(
+            file_record_store.lock().unwrap().get(4, 1),
+            Some(&vec![0x00, 0x11])
+        );
+        assert_eq!(
+            file_record_store.lock().unwrap().get(3, 9),
+            Some(&vec![0x00, 0x22])
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_file_records_once_leaves_the_store_untouched_when_the_device_times_out() {
+        let (connection, _device) = connected_pair().await;
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
+        let file_records = vec![file_record(4, 1, 2)];
+
+        poll_file_records_once(
+            &connection,
+            &file_records,
+            &file_record_store,
+            0x01,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert_eq!(file_record_store.lock().unwrap().get(4, 1), None);
     }
 }

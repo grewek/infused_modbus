@@ -22,6 +22,9 @@ pub enum DecodeError {
     UnexpectedProtocolId { actual: u16 },
     InvalidAduLength { length: u16 },
     CrcMismatch { expected: u16, actual: u16 },
+    InvalidFileRecordByteCount { byte_count: u8 },
+    InvalidFileRecordReferenceType { actual: u8 },
+    InvalidFileRecordSubResponseLength { length: u8 },
 }
 
 pub(crate) fn read_u16_be(bytes: &[u8], offset: usize) -> u16 {

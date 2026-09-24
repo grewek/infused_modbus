@@ -41,11 +41,13 @@
 // device_identification.rs for the object layout.
 
 use fuse_fs::filesystem::{InfusedFilesystem, WriteMode};
-use fuse_fs::{CoilStore, DiscreteInputStore, InputRegisterStore, RegisterStore, WriteReport};
+use fuse_fs::{
+    CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore, WriteReport,
+};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::{
-    CoilDescription, DeviceDescription, DiscreteInputDescription, InputRegisterDescription,
-    MemLayout, RegisterDescription,
+    CoilDescription, DeviceDescription, DiscreteInputDescription, FileRecordDescription,
+    InputRegisterDescription, MemLayout, RegisterDescription,
 };
 use server::connection::{serve_rtu_connection, serve_tcp_connection};
 use server::transaction_consumer::run_transaction_consumer;
@@ -208,6 +210,8 @@ fn start_serving(
     discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
     input_registers: Arc<Vec<InputRegisterDescription>>,
     input_register_store: Arc<Mutex<InputRegisterStore>>,
+    file_records: Arc<Vec<FileRecordDescription>>,
+    file_record_store: Arc<Mutex<FileRecordStore>>,
     mem_layout: MemLayout,
     input_register_mem_layout: MemLayout,
     toml_source: Arc<String>,
@@ -241,6 +245,8 @@ fn start_serving(
                     let discrete_input_store = Arc::clone(&discrete_input_store);
                     let input_registers = Arc::clone(&input_registers);
                     let input_register_store = Arc::clone(&input_register_store);
+                    let file_records = Arc::clone(&file_records);
+                    let file_record_store = Arc::clone(&file_record_store);
                     let toml_source = Arc::clone(&toml_source);
                     let server_id = Arc::clone(&server_id);
                     tokio::spawn(async move {
@@ -255,6 +261,8 @@ fn start_serving(
                             discrete_input_store,
                             input_registers,
                             input_register_store,
+                            file_records,
+                            file_record_store,
                             mem_layout,
                             input_register_mem_layout,
                             toml_source,
@@ -318,6 +326,8 @@ fn start_serving(
                     let discrete_input_store = Arc::clone(&discrete_input_store);
                     let input_registers = Arc::clone(&input_registers);
                     let input_register_store = Arc::clone(&input_register_store);
+                    let file_records = Arc::clone(&file_records);
+                    let file_record_store = Arc::clone(&file_record_store);
                     let toml_source = Arc::clone(&toml_source);
                     let server_id = Arc::clone(&server_id);
                     let live_connections = Arc::clone(&live_connections);
@@ -377,6 +387,8 @@ fn start_serving(
                                 discrete_input_store,
                                 input_registers,
                                 input_register_store,
+                                file_records,
+                                file_record_store,
                                 mem_layout,
                                 input_register_mem_layout,
                                 toml_source,
@@ -409,6 +421,8 @@ fn start_serving(
                                 discrete_input_store,
                                 input_registers,
                                 input_register_store,
+                                file_records,
+                                file_record_store,
                                 mem_layout,
                                 input_register_mem_layout,
                                 toml_source,
@@ -455,6 +469,8 @@ fn start_serving(
                     discrete_input_store,
                     input_registers,
                     input_register_store,
+                    file_records,
+                    file_record_store,
                     mem_layout,
                     input_register_mem_layout,
                     toml_source,
@@ -515,6 +531,7 @@ fn main() {
     // names, just with empty content until that lands.
     let discrete_inputs = description.discrete_inputs;
     let input_registers = description.input_registers;
+    let file_records = description.file_records;
     let mem_layout = description.mem_layout;
     let input_register_mem_layout = description.input_register_mem_layout;
     let server_id = description.server_id;
@@ -523,6 +540,7 @@ fn main() {
     let coil_store = Arc::new(Mutex::new(CoilStore::new()));
     let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
     let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+    let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
     let report = Arc::new(Mutex::new(WriteReport::new()));
     let (transaction_sender, transaction_receiver) = mpsc::channel();
 
@@ -530,6 +548,7 @@ fn main() {
     let consumer_coil_store = Arc::clone(&coil_store);
     let consumer_discrete_input_store = Arc::clone(&discrete_input_store);
     let consumer_input_register_store = Arc::clone(&input_register_store);
+    let consumer_file_record_store = Arc::clone(&file_record_store);
     let consumer_report = Arc::clone(&report);
     std::thread::spawn(move || {
         run_transaction_consumer(
@@ -537,6 +556,7 @@ fn main() {
             &consumer_coil_store,
             &consumer_discrete_input_store,
             &consumer_input_register_store,
+            &consumer_file_record_store,
             &consumer_report,
             transaction_receiver,
         );
@@ -630,6 +650,8 @@ fn main() {
         Arc::clone(&discrete_input_store),
         Arc::new(input_registers.clone()),
         Arc::clone(&input_register_store),
+        Arc::new(file_records.clone()),
+        Arc::clone(&file_record_store),
         mem_layout,
         input_register_mem_layout,
         Arc::new(toml_source.clone()),
@@ -647,10 +669,12 @@ fn main() {
         coils,
         discrete_inputs,
         input_registers,
+        file_records,
         store,
         coil_store,
         discrete_input_store,
         input_register_store,
+        file_record_store,
         transaction_sender,
         report,
         Some(client_trust),

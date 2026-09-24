@@ -11,6 +11,7 @@ pub const FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS: u8 = 0x10;
 pub const FUNCTION_CODE_MASK_WRITE_REGISTER: u8 = 0x16;
 pub const FUNCTION_CODE_REPORT_SERVER_ID: u8 = 0x11;
 pub const FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS: u8 = 0x17;
+pub const FUNCTION_CODE_READ_FILE_RECORD: u8 = 0x14;
 pub const FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT: u8 = 0x2B;
 
 // Function code 0x2B is itself a container for different "MEI" (Modbus
@@ -93,6 +94,20 @@ const RESPONSE_HEADER_LEN: usize = 2;
 // is a malformed request/response, not just an unusual one.
 const COIL_VALUE_ON: u16 = 0xFF00;
 const COIL_VALUE_OFF: u16 = 0x0000;
+
+// Read File Record (FC 0x14) reuses BYTE_COUNT_BYTE/RESPONSE_DATA_START
+// above for both its request and response — both are shaped as function
+// code (1) + byte count (1) + payload, the same structural shape those two
+// constants already cover, not a coincidental same value.
+//
+// The reference type byte every sub-request/sub-response carries is fixed
+// by the spec at 6 ("extended memory file record" — the only reference
+// type Modbus defines) — anything else is a malformed request/response,
+// not a different valid kind of reference.
+const FILE_RECORD_REFERENCE_TYPE: u8 = 6;
+// reference type (1) + file number (2) + record number (2) + record
+// length (2), the fixed width of one Read File Record request sub-request.
+const FILE_RECORD_SUB_REQUEST_LEN: usize = 7;
 
 // Header shape (function code + address + quantity + byte count) shared by
 // both "write multiple" request PDUs (Write Multiple Registers, Write
@@ -306,6 +321,40 @@ pub struct WriteMultipleRegistersRequest {
 pub struct WriteMultipleRegistersResponse {
     pub starting_address: u16,
     pub quantity: u16,
+}
+
+/// One sub-request within a [`ReadFileRecordRequest`] — a Read File Record
+/// PDU can bundle several of these into one request (as many as fit in the
+/// 253-byte PDU limit), each independently addressing a record by
+/// `file_number`/`record_number` and asking for `record_length` words
+/// starting there. The wire's own `reference_type` field (always `6`, the
+/// only value the spec defines) isn't modeled here — it carries no
+/// information, so [`ReadFileRecordRequest::encode`]/`::decode` handle it
+/// as a fixed protocol constant rather than a field a caller could get
+/// wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileRecordSubRequest {
+    pub file_number: u16,
+    pub record_number: u16,
+    pub record_length: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadFileRecordRequest {
+    pub sub_requests: Vec<FileRecordSubRequest>,
+}
+
+/// The response carries only raw record bytes, in the same order as the
+/// request's `sub_requests` — no file/record number or reference type is
+/// echoed back per record (the wire genuinely doesn't include it; the
+/// requester already knows what it asked for, in order). Each entry is
+/// always `2 * record_length` bytes for its matching sub-request.
+/// Deliberately untyped/uninterpreted: what a record's bytes actually mean
+/// is entirely vendor-specific (CLAUDE.md's "FC 0x14 (Read File Record)"
+/// section) — this project doesn't attempt to decode it, only carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadFileRecordResponse {
+    pub records: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1207,6 +1256,131 @@ impl ReadDeviceIdentificationResponse {
             next_object_id,
             objects,
         })
+    }
+}
+
+impl ReadFileRecordRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(
+            RESPONSE_DATA_START + self.sub_requests.len() * FILE_RECORD_SUB_REQUEST_LEN,
+        );
+        buffer.push(FUNCTION_CODE_READ_FILE_RECORD);
+        buffer.push((self.sub_requests.len() * FILE_RECORD_SUB_REQUEST_LEN) as u8);
+        for sub_request in &self.sub_requests {
+            buffer.push(FILE_RECORD_REFERENCE_TYPE);
+            buffer.extend_from_slice(&sub_request.file_number.to_be_bytes());
+            buffer.extend_from_slice(&sub_request.record_number.to_be_bytes());
+            buffer.extend_from_slice(&sub_request.record_length.to_be_bytes());
+        }
+        buffer
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < RESPONSE_DATA_START {
+            return Err(DecodeError::TooShort);
+        }
+        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_FILE_RECORD {
+            return Err(DecodeError::UnexpectedFunctionCode {
+                expected: FUNCTION_CODE_READ_FILE_RECORD,
+                actual: bytes[FUNCTION_CODE_BYTE],
+            });
+        }
+        let byte_count = bytes[BYTE_COUNT_BYTE];
+        if byte_count == 0 || !(byte_count as usize).is_multiple_of(FILE_RECORD_SUB_REQUEST_LEN) {
+            return Err(DecodeError::InvalidFileRecordByteCount { byte_count });
+        }
+        if bytes.len() < RESPONSE_DATA_START + byte_count as usize {
+            return Err(DecodeError::TooShort);
+        }
+
+        let sub_request_count = byte_count as usize / FILE_RECORD_SUB_REQUEST_LEN;
+        let mut sub_requests = Vec::with_capacity(sub_request_count);
+        let mut offset = RESPONSE_DATA_START;
+        for _ in 0..sub_request_count {
+            let reference_type = bytes[offset];
+            if reference_type != FILE_RECORD_REFERENCE_TYPE {
+                return Err(DecodeError::InvalidFileRecordReferenceType {
+                    actual: reference_type,
+                });
+            }
+            sub_requests.push(FileRecordSubRequest {
+                file_number: read_u16_be(bytes, offset + 1),
+                record_number: read_u16_be(bytes, offset + 3),
+                record_length: read_u16_be(bytes, offset + 5),
+            });
+            offset += FILE_RECORD_SUB_REQUEST_LEN;
+        }
+        Ok(Self { sub_requests })
+    }
+}
+
+impl ReadFileRecordResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        let data_len: usize = self.records.iter().map(|record| 2 + record.len()).sum();
+        let mut buffer = Vec::with_capacity(RESPONSE_DATA_START + data_len);
+        buffer.push(FUNCTION_CODE_READ_FILE_RECORD);
+        buffer.push(data_len as u8);
+        for record in &self.records {
+            // File response length: reference type byte + this record's
+            // own data bytes — does NOT include this length byte itself.
+            buffer.push((1 + record.len()) as u8);
+            buffer.push(FILE_RECORD_REFERENCE_TYPE);
+            buffer.extend_from_slice(record);
+        }
+        buffer
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < RESPONSE_DATA_START {
+            return Err(DecodeError::TooShort);
+        }
+        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_FILE_RECORD {
+            return Err(DecodeError::UnexpectedFunctionCode {
+                expected: FUNCTION_CODE_READ_FILE_RECORD,
+                actual: bytes[FUNCTION_CODE_BYTE],
+            });
+        }
+        let byte_count = bytes[BYTE_COUNT_BYTE] as usize;
+        if bytes.len() < RESPONSE_DATA_START + byte_count {
+            return Err(DecodeError::TooShort);
+        }
+
+        // Each sub-response's own length byte is untrusted peer input —
+        // checked against the actual remaining buffer before every read,
+        // the same discipline ReadDeviceIdentificationResponse::decode
+        // already applies to its own variable-length objects.
+        let end = RESPONSE_DATA_START + byte_count;
+        let mut records = Vec::new();
+        let mut offset = RESPONSE_DATA_START;
+        while offset < end {
+            if bytes.len() < offset + 1 {
+                return Err(DecodeError::TooShort);
+            }
+            let sub_response_length = bytes[offset];
+            if sub_response_length == 0 {
+                return Err(DecodeError::InvalidFileRecordSubResponseLength {
+                    length: sub_response_length,
+                });
+            }
+            let reference_type_offset = offset + 1;
+            if bytes.len() < reference_type_offset + 1 {
+                return Err(DecodeError::TooShort);
+            }
+            let reference_type = bytes[reference_type_offset];
+            if reference_type != FILE_RECORD_REFERENCE_TYPE {
+                return Err(DecodeError::InvalidFileRecordReferenceType {
+                    actual: reference_type,
+                });
+            }
+            let data_start = reference_type_offset + 1;
+            let data_len = sub_response_length as usize - 1;
+            if bytes.len() < data_start + data_len {
+                return Err(DecodeError::TooShort);
+            }
+            records.push(bytes[data_start..data_start + data_len].to_vec());
+            offset = data_start + data_len;
+        }
+        Ok(Self { records })
     }
 }
 
@@ -2522,6 +2696,180 @@ mod tests {
                 expected: 0x2B,
                 actual: 0x03
             })
+        );
+    }
+
+    #[test]
+    fn read_file_record_request_round_trip() {
+        let request = ReadFileRecordRequest {
+            sub_requests: vec![FileRecordSubRequest {
+                file_number: 0x0004,
+                record_number: 0x0001,
+                record_length: 0x0002,
+            }],
+        };
+        let encoded = request.encode();
+        let decoded = ReadFileRecordRequest::decode(&encoded).unwrap();
+        assert_eq!(request, decoded);
+    }
+
+    // Bytes taken from the Modbus Application Protocol spec's own worked
+    // example for FC 0x14 (two sub-requests), as a cross-check against the
+    // spec rather than just against our own encoder.
+    #[test]
+    fn read_file_record_request_encode_produces_expected_bytes() {
+        let request = ReadFileRecordRequest {
+            sub_requests: vec![
+                FileRecordSubRequest {
+                    file_number: 0x0004,
+                    record_number: 0x0001,
+                    record_length: 0x0002,
+                },
+                FileRecordSubRequest {
+                    file_number: 0x0003,
+                    record_number: 0x0009,
+                    record_length: 0x0002,
+                },
+            ],
+        };
+        assert_eq!(
+            request.encode(),
+            vec![
+                0x14, 0x0E, 0x06, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x06, 0x00, 0x03, 0x00, 0x09,
+                0x00, 0x02,
+            ]
+        );
+    }
+
+    #[test]
+    fn read_file_record_request_decode_rejects_too_short_buffer() {
+        let bytes = [0x14, 0x07];
+        assert_eq!(
+            ReadFileRecordRequest::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn read_file_record_request_decode_rejects_wrong_function_code() {
+        let bytes = [0x03, 0x07, 0x06, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02];
+        assert_eq!(
+            ReadFileRecordRequest::decode(&bytes),
+            Err(DecodeError::UnexpectedFunctionCode {
+                expected: 0x14,
+                actual: 0x03
+            })
+        );
+    }
+
+    #[test]
+    fn read_file_record_request_decode_rejects_a_byte_count_that_is_not_a_multiple_of_seven() {
+        let bytes = [0x14, 0x06, 0x06, 0x00, 0x04, 0x00, 0x01, 0x00];
+        assert_eq!(
+            ReadFileRecordRequest::decode(&bytes),
+            Err(DecodeError::InvalidFileRecordByteCount { byte_count: 6 })
+        );
+    }
+
+    #[test]
+    fn read_file_record_request_decode_rejects_a_zero_byte_count() {
+        let bytes = [0x14, 0x00];
+        assert_eq!(
+            ReadFileRecordRequest::decode(&bytes),
+            Err(DecodeError::InvalidFileRecordByteCount { byte_count: 0 })
+        );
+    }
+
+    #[test]
+    fn read_file_record_request_decode_rejects_a_byte_count_claiming_more_than_the_buffer_holds() {
+        let bytes = [0x14, 0x07, 0x06, 0x00, 0x04, 0x00, 0x01];
+        assert_eq!(
+            ReadFileRecordRequest::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn read_file_record_request_decode_rejects_a_wrong_reference_type() {
+        let bytes = [0x14, 0x07, 0x05, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02];
+        assert_eq!(
+            ReadFileRecordRequest::decode(&bytes),
+            Err(DecodeError::InvalidFileRecordReferenceType { actual: 0x05 })
+        );
+    }
+
+    #[test]
+    fn read_file_record_response_round_trip() {
+        let response = ReadFileRecordResponse {
+            records: vec![vec![0x0D, 0xFE, 0x00, 0x20], vec![0x33, 0xCD, 0x00, 0x40]],
+        };
+        let encoded = response.encode();
+        let decoded = ReadFileRecordResponse::decode(&encoded).unwrap();
+        assert_eq!(response, decoded);
+    }
+
+    // Bytes taken from the Modbus Application Protocol spec's own worked
+    // example for FC 0x14's response, matching the request example above.
+    #[test]
+    fn read_file_record_response_encode_produces_expected_bytes() {
+        let response = ReadFileRecordResponse {
+            records: vec![vec![0x0D, 0xFE, 0x00, 0x20], vec![0x33, 0xCD, 0x00, 0x40]],
+        };
+        assert_eq!(
+            response.encode(),
+            vec![
+                0x14, 0x0C, 0x05, 0x06, 0x0D, 0xFE, 0x00, 0x20, 0x05, 0x06, 0x33, 0xCD, 0x00, 0x40,
+            ]
+        );
+    }
+
+    #[test]
+    fn read_file_record_response_decode_rejects_too_short_buffer() {
+        let bytes = [0x14];
+        assert_eq!(
+            ReadFileRecordResponse::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn read_file_record_response_decode_rejects_wrong_function_code() {
+        let bytes = [0x03, 0x05, 0x06, 0x0D, 0xFE, 0x00, 0x20];
+        assert_eq!(
+            ReadFileRecordResponse::decode(&bytes),
+            Err(DecodeError::UnexpectedFunctionCode {
+                expected: 0x14,
+                actual: 0x03
+            })
+        );
+    }
+
+    #[test]
+    fn read_file_record_response_decode_rejects_a_byte_count_claiming_more_than_the_buffer_holds() {
+        let bytes = [0x14, 0x05, 0x06, 0x0D, 0xFE];
+        assert_eq!(
+            ReadFileRecordResponse::decode(&bytes),
+            Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn read_file_record_response_decode_rejects_a_wrong_reference_type() {
+        // byte_count=6, sub_response_length=5 (reference type + 4 data
+        // bytes), reference type=0x05 (wrong, must be 6).
+        let bytes = [0x14, 0x06, 0x05, 0x05, 0xAA, 0xBB, 0xCC, 0xDD];
+        assert_eq!(
+            ReadFileRecordResponse::decode(&bytes),
+            Err(DecodeError::InvalidFileRecordReferenceType { actual: 0x05 })
+        );
+    }
+
+    #[test]
+    fn read_file_record_response_decode_rejects_a_zero_sub_response_length() {
+        let bytes = [0x14, 0x01, 0x00];
+        assert_eq!(
+            ReadFileRecordResponse::decode(&bytes),
+            Err(DecodeError::InvalidFileRecordSubResponseLength { length: 0 })
         );
     }
 }

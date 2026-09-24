@@ -1,8 +1,8 @@
 use crate::client_trust::ClientTrustState;
 use crate::permissions::{DirectoryPermissions, FusePermissions};
 use crate::{
-    CoilStore, CoilValue, DiscreteInputStore, InputRegisterStore, PendingTransaction,
-    RegisterStore, RegisterValue, StagedValue, WriteReport,
+    CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore,
+    PendingTransaction, RegisterStore, RegisterValue, StagedValue, WriteReport,
 };
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner, OpenFlags,
@@ -10,8 +10,8 @@ use fuser::{
     TimeOrNow,
 };
 use protocol::device_description::{
-    CoilDescription, DataType, DiscreteInputDescription, InputRegisterDescription,
-    RegisterDescription,
+    CoilDescription, DataType, DiscreteInputDescription, FileRecordDescription,
+    InputRegisterDescription, RegisterDescription,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -162,6 +162,26 @@ pub struct InfusedFilesystem {
     // struct, never touched again after construction.
     server_id: Option<String>,
     server_id_ino: INodeNo,
+    // `file-records/<file_number>/<record_number>` — see CLAUDE.md's "FC
+    // 0x14 (Read File Record)" section. Unlike every other data type in
+    // this filesystem, this one needs a second nesting level: a
+    // `file_number` can hold several `record_number`s, so
+    // `file-records/`'s own children are dynamically-named-but-statically-
+    // known subdirectories (one per unique `file_number` in `file_records`,
+    // in first-seen order — `unique_file_numbers`/`file_number_to_ino`
+    // resolve a directory name to its inode), each containing the record
+    // files for that file number. Read-only on the client, directly
+    // writable on the server (WriteMode::Direct) exactly like
+    // holding-registers/coils/discrete-inputs/input-registers — but with
+    // no `report/` coverage, same precedent as discrete-inputs/
+    // input-registers (H3 stayed scoped to registers/coils; a direct
+    // write's own write()/release() return code is the only failure
+    // signal needed here too).
+    file_records: Vec<FileRecordDescription>,
+    file_record_store: Arc<Mutex<FileRecordStore>>,
+    file_records_ino: INodeNo,
+    unique_file_numbers: Vec<u16>,
+    file_number_to_ino: HashMap<u16, INodeNo>,
     // Per-top-level-directory mode/uid/gid from `fuse-permissions.toml`
     // (see `permissions_for`) — deliberately does not cover `client-trust/`
     // at all (T3 hardcodes that subtree's attrs regardless of this field).
@@ -179,10 +199,12 @@ impl InfusedFilesystem {
         coils: Vec<CoilDescription>,
         discrete_inputs: Vec<DiscreteInputDescription>,
         input_registers: Vec<InputRegisterDescription>,
+        file_records: Vec<FileRecordDescription>,
         store: Arc<Mutex<RegisterStore>>,
         coil_store: Arc<Mutex<CoilStore>>,
         discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
         input_register_store: Arc<Mutex<InputRegisterStore>>,
+        file_record_store: Arc<Mutex<FileRecordStore>>,
         transaction_sender: mpsc::Sender<HashMap<String, StagedValue>>,
         report: Arc<Mutex<WriteReport>>,
         client_trust: Option<Arc<Mutex<ClientTrustState>>>,
@@ -256,17 +278,46 @@ impl InfusedFilesystem {
         let approved_log_ino = INodeNo(connection_attempts_ino.0 + 1);
         let pending_log_ino = INodeNo(approved_log_ino.0 + 1);
         let rejected_log_ino = INodeNo(pending_log_ino.0 + 1);
-        if let Some(client_trust) = &client_trust {
-            client_trust
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .set_next_ino(rejected_log_ino.0 + 1);
-        }
         // Always computed, same "always allocate the inode, only
         // conditionally expose the name" precedent as client_trust_ino —
         // keeps every fixed inode's number independent of which optional
         // features happen to be in use.
         let server_id_ino = INodeNo(rejected_log_ino.0 + 1);
+        // file-records/ needs two nesting levels: one inode for the
+        // file-records/ root, then one per *unique* file_number (in
+        // first-seen order — `unique_file_numbers`), then one per
+        // FileRecordDescription entry itself (in `file_records` order,
+        // mirroring how every other data type's file inodes sit
+        // contiguously after their own directory inode).
+        let file_records_ino = INodeNo(server_id_ino.0 + 1);
+        let mut unique_file_numbers: Vec<u16> = Vec::new();
+        for entry in &file_records {
+            if !unique_file_numbers.contains(&entry.file_number) {
+                unique_file_numbers.push(entry.file_number);
+            }
+        }
+        let first_file_number_ino = file_records_ino.0 + 1;
+        let file_number_to_ino: HashMap<u16, INodeNo> = unique_file_numbers
+            .iter()
+            .enumerate()
+            .map(|(index, &file_number)| {
+                (file_number, INodeNo(first_file_number_ino + index as u64))
+            })
+            .collect();
+        let first_file_record_ino = first_file_number_ino + unique_file_numbers.len() as u64;
+        // Unlike server_id_ino (mutually exclusive with client_trust in
+        // practice — server_id is client-only, client_trust is
+        // server-only), file-records/ genuinely coexists with client_trust
+        // on the server, so client_trust's own dynamic `approved/`
+        // allocator must start strictly after every fixed inode this
+        // filesystem hands out, file-records included — not just after
+        // rejected_log_ino/server_id_ino like before file-records existed.
+        if let Some(client_trust) = &client_trust {
+            client_trust
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .set_next_ino(first_file_record_ino + file_records.len() as u64);
+        }
         Self {
             registers,
             name_to_ino,
@@ -299,6 +350,11 @@ impl InfusedFilesystem {
             write_mode,
             server_id,
             server_id_ino,
+            file_records,
+            file_record_store,
+            file_records_ino,
+            unique_file_numbers,
+            file_number_to_ino,
         }
     }
 
@@ -330,6 +386,12 @@ impl InfusedFilesystem {
 
     fn input_register_store_lock(&self) -> MutexGuard<'_, InputRegisterStore> {
         self.input_register_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn file_record_store_lock(&self) -> MutexGuard<'_, FileRecordStore> {
+        self.file_record_store
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -423,6 +485,52 @@ impl InfusedFilesystem {
     fn input_register_by_ino(&self, ino: INodeNo) -> Option<&InputRegisterDescription> {
         let index = ino.0.checked_sub(self.first_input_register_ino())?;
         self.input_registers.get(index as usize)
+    }
+
+    // file-records/<file_number>/'s own directory inodes sit right after
+    // the fixed file-records/ directory inode itself — same pattern as
+    // `first_coil_ino`, just one more level up the tree.
+    fn first_file_number_ino(&self) -> u64 {
+        self.file_records_ino.0 + 1
+    }
+
+    // Resolves a `file-records/<file_number>` directory inode back to the
+    // file_number it represents — the reverse of `file_number_to_ino`,
+    // same arithmetic-index pattern as every other `*_by_ino` helper here.
+    fn file_number_by_ino(&self, ino: INodeNo) -> Option<u16> {
+        let index = ino.0.checked_sub(self.first_file_number_ino())?;
+        self.unique_file_numbers.get(index as usize).copied()
+    }
+
+    // file-records/<file_number>/<record_number>'s own file inodes sit
+    // right after every file_number subdirectory inode.
+    fn first_file_record_ino(&self) -> u64 {
+        self.first_file_number_ino() + self.unique_file_numbers.len() as u64
+    }
+
+    fn file_record_by_ino(&self, ino: INodeNo) -> Option<&FileRecordDescription> {
+        let index = ino.0.checked_sub(self.first_file_record_ino())?;
+        self.file_records.get(index as usize)
+    }
+
+    // Forward lookup for `file-records/<file_number>/<record_number>`'s
+    // `lookup()`: given the file_number already resolved from the parent
+    // directory's own inode, find the matching entry (linear scan — no
+    // dedicated HashMap, since the compound (file_number, record_number)
+    // key needs the file_number as context anyway, and entry counts here
+    // are small).
+    fn file_record_by_numbers(
+        &self,
+        file_number: u16,
+        record_number: u16,
+    ) -> Option<(INodeNo, &FileRecordDescription)> {
+        let index = self.file_records.iter().position(|description| {
+            description.file_number == file_number && description.record_number == record_number
+        })?;
+        Some((
+            INodeNo(self.first_file_record_ino() + index as u64),
+            &self.file_records[index],
+        ))
     }
 
     fn report_register_by_ino(&self, ino: INodeNo) -> Option<&RegisterDescription> {
@@ -538,6 +646,7 @@ impl InfusedFilesystem {
         self.coil_by_ino(ino).is_some()
             || self.discrete_input_by_ino(ino).is_some()
             || self.input_register_by_ino(ino).is_some()
+            || self.file_record_by_ino(ino).is_some()
     }
 
     // `transactions/`+`TRANSACTION_END` only exist in WriteMode::Staged
@@ -719,6 +828,52 @@ impl InfusedFilesystem {
         }
     }
 
+    // A file record's content is a plain hex dump — see CLAUDE.md's "FC
+    // 0x14 (Read File Record)" section: what the bytes mean is entirely
+    // vendor-specific, so this project only ever carries them, never
+    // decodes them. Accepts whitespace-separated byte pairs
+    // ("0D FE 00 20") or one contiguous run ("0DFE0020") equally — all
+    // whitespace is stripped before parsing, so both forms (and anything
+    // in between) parse identically. No length check against the
+    // register's own declared `record_length` here — that's enforced at
+    // the wire-response boundary (`server::handler::handle_read_file_record`),
+    // not the FUSE write boundary, so what a technician wrote is always
+    // visible exactly as typed via a subsequent read, even if it doesn't
+    // match.
+    fn parse_file_record_value(text: &str) -> Option<Vec<u8>> {
+        let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if cleaned.is_empty() || !cleaned.len().is_multiple_of(2) {
+            return None;
+        }
+        (0..cleaned.len())
+            .step_by(2)
+            .map(|start| u8::from_str_radix(&cleaned[start..start + 2], 16).ok())
+            .collect()
+    }
+
+    fn format_file_record_hex(bytes: &[u8]) -> String {
+        let hex = bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{hex}\n")
+    }
+
+    // Defaults to `2 * record_length` zero bytes until directly written —
+    // same "declared but unset = zero" precedent as
+    // `default_register_value` in server::handler, just rendered here
+    // rather than there since a file record's default depends on its own
+    // declared width, not a fixed per-DataType shape.
+    fn file_record_content(&self, description: &FileRecordDescription) -> String {
+        let bytes = self
+            .file_record_store_lock()
+            .get(description.file_number, description.record_number)
+            .cloned()
+            .unwrap_or_else(|| vec![0u8; description.record_length as usize * 2]);
+        Self::format_file_record_hex(&bytes)
+    }
+
     // `ino`'s owner/group: the configured `fuse-permissions.toml` value if
     // `ino` belongs to one of the 4 configurable subtrees, otherwise the
     // pre-T2 fallback (whichever uid/gid is making this particular
@@ -816,6 +971,13 @@ impl Filesystem for InfusedFilesystem {
                     reply.entry(
                         &ATTR_TTL,
                         &self.directory_attr(self.input_registers_ino, req),
+                        Generation(0),
+                    );
+                }
+                Some("file-records") => {
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.directory_attr(self.file_records_ino, req),
                         Generation(0),
                     );
                 }
@@ -1032,6 +1194,48 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
+        if parent == self.file_records_ino {
+            let file_number_dir = name
+                .to_str()
+                .and_then(|name| name.parse::<u16>().ok())
+                .and_then(|file_number| {
+                    self.file_number_to_ino
+                        .get(&file_number)
+                        .map(|&ino| (ino, file_number))
+                });
+            match file_number_dir {
+                Some((ino, _file_number)) => {
+                    reply.entry(&ATTR_TTL, &self.directory_attr(ino, req), Generation(0));
+                }
+                None => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
+        if let Some(file_number) = self.file_number_by_ino(parent) {
+            let record = name
+                .to_str()
+                .and_then(|name| name.parse::<u16>().ok())
+                .and_then(|record_number| self.file_record_by_numbers(file_number, record_number));
+            match record {
+                Some((ino, description)) => {
+                    let content = self.file_record_content(description);
+                    reply.entry(
+                        &ATTR_TTL,
+                        &self.file_attr(
+                            ino,
+                            content.len() as u64,
+                            self.writable_data_file_mode(),
+                            req,
+                        ),
+                        Generation(0),
+                    );
+                }
+                None => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
         if parent == self.transactions_ino && self.transactions_enabled() {
             let Some(name) = name.to_str() else {
                 reply.error(Errno::ENOENT);
@@ -1092,6 +1296,8 @@ impl Filesystem for InfusedFilesystem {
             || ino == self.coils_ino
             || ino == self.discrete_inputs_ino
             || ino == self.input_registers_ino
+            || ino == self.file_records_ino
+            || self.file_number_by_ino(ino).is_some()
             || (ino == self.transactions_ino && self.transactions_enabled())
             || ino == self.report_ino
             || (ino == self.client_trust_ino && self.client_trust.is_some())
@@ -1192,6 +1398,20 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
+        if let Some(description) = self.file_record_by_ino(ino) {
+            let content = self.file_record_content(description);
+            reply.attr(
+                &ATTR_TTL,
+                &self.file_attr(
+                    ino,
+                    content.len() as u64,
+                    self.writable_data_file_mode(),
+                    req,
+                ),
+            );
+            return;
+        }
+
         if let Some(register) = self.report_register_by_ino(ino) {
             let content = self.report_content(&register.name);
             reply.attr(
@@ -1266,6 +1486,8 @@ impl Filesystem for InfusedFilesystem {
                 self.discrete_input_content(discrete_input).len() as u64
             } else if let Some(input_register) = self.input_register_by_ino(ino) {
                 self.input_register_content(input_register).len() as u64
+            } else if let Some(description) = self.file_record_by_ino(ino) {
+                self.file_record_content(description).len() as u64
             } else {
                 0
             };
@@ -1315,6 +1537,8 @@ impl Filesystem for InfusedFilesystem {
             self.discrete_input_content(discrete_input)
         } else if let Some(input_register) = self.input_register_by_ino(ino) {
             self.input_register_content(input_register)
+        } else if let Some(description) = self.file_record_by_ino(ino) {
+            self.file_record_content(description)
         } else if let Some(register) = self.report_register_by_ino(ino) {
             self.report_content(&register.name)
         } else if let Some(coil) = self.report_coil_by_ino(ino) {
@@ -1382,6 +1606,11 @@ impl Filesystem for InfusedFilesystem {
                     self.input_registers_ino,
                     FileType::Directory,
                     "input-registers".to_string(),
+                ),
+                (
+                    self.file_records_ino,
+                    FileType::Directory,
+                    "file-records".to_string(),
                 ),
                 (self.report_ino, FileType::Directory, "report".to_string()),
             ]
@@ -1509,6 +1738,37 @@ impl Filesystem for InfusedFilesystem {
                     input_register_ino,
                     FileType::RegularFile,
                     input_register.name.clone(),
+                ));
+            }
+            entries
+        } else if ino == self.file_records_ino {
+            let mut entries = vec![
+                (self.file_records_ino, FileType::Directory, ".".to_string()),
+                (ROOT_INO, FileType::Directory, "..".to_string()),
+            ];
+            for (index, &file_number) in self.unique_file_numbers.iter().enumerate() {
+                let file_number_ino = INodeNo(self.first_file_number_ino() + index as u64);
+                entries.push((
+                    file_number_ino,
+                    FileType::Directory,
+                    file_number.to_string(),
+                ));
+            }
+            entries
+        } else if let Some(file_number) = self.file_number_by_ino(ino) {
+            let mut entries = vec![
+                (ino, FileType::Directory, ".".to_string()),
+                (self.file_records_ino, FileType::Directory, "..".to_string()),
+            ];
+            for (index, description) in self.file_records.iter().enumerate() {
+                if description.file_number != file_number {
+                    continue;
+                }
+                let record_ino = INodeNo(self.first_file_record_ino() + index as u64);
+                entries.push((
+                    record_ino,
+                    FileType::RegularFile,
+                    description.record_number.to_string(),
                 ));
             }
             entries
@@ -1725,6 +1985,19 @@ impl Filesystem for InfusedFilesystem {
                         StagedValue::InputRegister(value),
                     )
                 })
+            } else if let Some(description) = self.file_record_by_ino(ino) {
+                let file_number = description.file_number;
+                let record_number = description.record_number;
+                Self::parse_file_record_value(&text).map(|value| {
+                    (
+                        format!("{file_number}:{record_number}"),
+                        StagedValue::FileRecord {
+                            file_number,
+                            record_number,
+                            value,
+                        },
+                    )
+                })
             } else {
                 None
             };
@@ -1837,10 +2110,12 @@ mod tests {
                 coils,
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
                 store,
                 coil_store,
                 discrete_input_store,
                 input_register_store,
+                Arc::new(Mutex::new(FileRecordStore::new())),
                 sender,
                 report,
                 None,
@@ -1880,10 +2155,68 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
                 store,
                 coil_store,
                 discrete_input_store,
                 input_register_store,
+                Arc::new(Mutex::new(FileRecordStore::new())),
+                sender,
+                report,
+                None,
+                FusePermissions::default(),
+                write_mode,
+                None,
+            ),
+            receiver,
+        )
+    }
+
+    // Two file numbers (20 has two records, 30 has one) so tests can check
+    // both the file_number-grouping level and the record level of
+    // file-records/'s two-level nesting.
+    fn test_filesystem_with_file_records(
+        write_mode: WriteMode,
+    ) -> (
+        InfusedFilesystem,
+        mpsc::Receiver<HashMap<String, StagedValue>>,
+    ) {
+        let file_records = vec![
+            FileRecordDescription {
+                file_number: 20,
+                record_number: 5,
+                record_length: 2,
+            },
+            FileRecordDescription {
+                file_number: 20,
+                record_number: 6,
+                record_length: 2,
+            },
+            FileRecordDescription {
+                file_number: 30,
+                record_number: 1,
+                record_length: 1,
+            },
+        ];
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let (sender, receiver) = mpsc::channel();
+        (
+            InfusedFilesystem::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                file_records,
+                store,
+                coil_store,
+                discrete_input_store,
+                input_register_store,
+                file_record_store,
                 sender,
                 report,
                 None,
@@ -1908,10 +2241,12 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             store,
             coil_store,
             discrete_input_store,
             input_register_store,
+            Arc::new(Mutex::new(FileRecordStore::new())),
             sender,
             report,
             Some(client_trust),
@@ -2618,6 +2953,154 @@ mod tests {
         assert_eq!(InfusedFilesystem::parse_coil_value("true"), None);
         assert_eq!(InfusedFilesystem::parse_coil_value("2"), None);
         assert_eq!(InfusedFilesystem::parse_coil_value(""), None);
+    }
+
+    #[test]
+    fn parse_file_record_value_accepts_space_separated_hex() {
+        assert_eq!(
+            InfusedFilesystem::parse_file_record_value("0D FE 00 20"),
+            Some(vec![0x0D, 0xFE, 0x00, 0x20])
+        );
+    }
+
+    #[test]
+    fn parse_file_record_value_accepts_contiguous_hex() {
+        assert_eq!(
+            InfusedFilesystem::parse_file_record_value("0dfe0020"),
+            Some(vec![0x0D, 0xFE, 0x00, 0x20])
+        );
+    }
+
+    #[test]
+    fn parse_file_record_value_trims_surrounding_whitespace() {
+        assert_eq!(
+            InfusedFilesystem::parse_file_record_value("\n  AB CD  \n"),
+            Some(vec![0xAB, 0xCD])
+        );
+    }
+
+    #[test]
+    fn parse_file_record_value_rejects_odd_length() {
+        assert_eq!(InfusedFilesystem::parse_file_record_value("ABC"), None);
+    }
+
+    #[test]
+    fn parse_file_record_value_rejects_non_hex_characters() {
+        assert_eq!(InfusedFilesystem::parse_file_record_value("ZZ"), None);
+    }
+
+    #[test]
+    fn parse_file_record_value_rejects_empty_input() {
+        assert_eq!(InfusedFilesystem::parse_file_record_value(""), None);
+        assert_eq!(InfusedFilesystem::parse_file_record_value("   "), None);
+    }
+
+    #[test]
+    fn file_record_content_defaults_to_zero_filled_bytes_when_unset() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Direct);
+        let description = filesystem
+            .file_record_by_numbers(20, 5)
+            .map(|(_, description)| description)
+            .unwrap();
+        assert_eq!(filesystem.file_record_content(description), "00 00 00 00\n");
+    }
+
+    #[test]
+    fn file_record_content_reflects_a_stored_value() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Direct);
+        filesystem
+            .file_record_store_lock()
+            .set(20, 5, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let description = filesystem
+            .file_record_by_numbers(20, 5)
+            .map(|(_, description)| description)
+            .unwrap();
+        assert_eq!(filesystem.file_record_content(description), "DE AD BE EF\n");
+    }
+
+    #[test]
+    fn first_file_number_ino_sits_right_after_file_records_ino() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Direct);
+        assert_eq!(
+            filesystem.first_file_number_ino(),
+            filesystem.file_records_ino.0 + 1
+        );
+    }
+
+    #[test]
+    fn file_number_by_ino_resolves_each_unique_file_number_directory() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Direct);
+        let first = INodeNo(filesystem.first_file_number_ino());
+        let second = INodeNo(filesystem.first_file_number_ino() + 1);
+        assert_eq!(filesystem.file_number_by_ino(first), Some(20));
+        assert_eq!(filesystem.file_number_by_ino(second), Some(30));
+    }
+
+    #[test]
+    fn file_number_by_ino_returns_none_for_an_unrelated_inode() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Direct);
+        assert_eq!(filesystem.file_number_by_ino(ROOT_INO), None);
+    }
+
+    #[test]
+    fn file_record_by_ino_resolves_each_record_file_in_declaration_order() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Direct);
+        let first = INodeNo(filesystem.first_file_record_ino());
+        let second = INodeNo(filesystem.first_file_record_ino() + 1);
+        let third = INodeNo(filesystem.first_file_record_ino() + 2);
+        assert_eq!(
+            filesystem
+                .file_record_by_ino(first)
+                .map(|d| d.record_number),
+            Some(5)
+        );
+        assert_eq!(
+            filesystem
+                .file_record_by_ino(second)
+                .map(|d| d.record_number),
+            Some(6)
+        );
+        assert_eq!(
+            filesystem
+                .file_record_by_ino(third)
+                .map(|d| d.record_number),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn file_record_by_ino_returns_none_for_an_unrelated_inode() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Direct);
+        assert_eq!(filesystem.file_record_by_ino(ROOT_INO), None);
+    }
+
+    #[test]
+    fn file_record_by_numbers_resolves_the_matching_entry_and_its_inode() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Direct);
+        let (ino, description) = filesystem.file_record_by_numbers(20, 6).unwrap();
+        assert_eq!(ino, INodeNo(filesystem.first_file_record_ino() + 1));
+        assert_eq!(description.record_length, 2);
+    }
+
+    #[test]
+    fn file_record_by_numbers_returns_none_for_an_unknown_combination() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Direct);
+        assert_eq!(filesystem.file_record_by_numbers(20, 999), None);
+        assert_eq!(filesystem.file_record_by_numbers(999, 5), None);
+    }
+
+    #[test]
+    fn direct_writable_by_ino_is_true_for_a_file_record_in_direct_mode() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Direct);
+        let (ino, _) = filesystem.file_record_by_numbers(20, 5).unwrap();
+        assert!(filesystem.direct_writable_by_ino(ino));
+    }
+
+    #[test]
+    fn direct_writable_by_ino_is_false_for_a_file_record_in_staged_mode() {
+        let (filesystem, _receiver) = test_filesystem_with_file_records(WriteMode::Staged);
+        let (ino, _) = filesystem.file_record_by_numbers(20, 5).unwrap();
+        assert!(!filesystem.direct_writable_by_ino(ino));
     }
 
     #[test]

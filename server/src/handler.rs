@@ -33,23 +33,25 @@ use crate::device_identification::{build_objects, handle_read_device_identificat
 use crate::server_options::ServerOptions;
 use fuse_fs::register_encoding::{register_value_from_words, register_value_to_words};
 use fuse_fs::{
-    CoilStore, CoilValue, DiscreteInputStore, InputRegisterStore, RegisterStore, RegisterValue,
+    CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore,
+    RegisterValue,
 };
 use protocol::device_description::{
-    AccessRight, CoilDescription, DataType, DiscreteInputDescription, InputRegisterDescription,
-    MemLayout, RegisterDescription,
+    AccessRight, CoilDescription, DataType, DiscreteInputDescription, FileRecordDescription,
+    InputRegisterDescription, MemLayout, RegisterDescription,
 };
 use protocol::pdu::{
     EXCEPTION_ILLEGAL_DATA_ADDRESS, EXCEPTION_ILLEGAL_DATA_VALUE, EXCEPTION_ILLEGAL_FUNCTION,
     ExceptionResponse, FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
     FUNCTION_CODE_MASK_WRITE_REGISTER, FUNCTION_CODE_READ_COILS,
-    FUNCTION_CODE_READ_DISCRETE_INPUTS, FUNCTION_CODE_READ_HOLDING_REGISTERS,
-    FUNCTION_CODE_READ_INPUT_REGISTERS, FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
-    FUNCTION_CODE_REPORT_SERVER_ID, FUNCTION_CODE_WRITE_MULTIPLE_COILS,
-    FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS, FUNCTION_CODE_WRITE_SINGLE_COIL,
-    FUNCTION_CODE_WRITE_SINGLE_REGISTER, MaskWriteRegisterRequest, MaskWriteRegisterResponse,
-    ReadCoilsRequest, ReadCoilsResponse, ReadDeviceIdentificationRequest,
-    ReadDiscreteInputsRequest, ReadDiscreteInputsResponse, ReadHoldingRegistersRequest,
+    FUNCTION_CODE_READ_DISCRETE_INPUTS, FUNCTION_CODE_READ_FILE_RECORD,
+    FUNCTION_CODE_READ_HOLDING_REGISTERS, FUNCTION_CODE_READ_INPUT_REGISTERS,
+    FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS, FUNCTION_CODE_REPORT_SERVER_ID,
+    FUNCTION_CODE_WRITE_MULTIPLE_COILS, FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
+    FUNCTION_CODE_WRITE_SINGLE_COIL, FUNCTION_CODE_WRITE_SINGLE_REGISTER, MaskWriteRegisterRequest,
+    MaskWriteRegisterResponse, ReadCoilsRequest, ReadCoilsResponse,
+    ReadDeviceIdentificationRequest, ReadDiscreteInputsRequest, ReadDiscreteInputsResponse,
+    ReadFileRecordRequest, ReadFileRecordResponse, ReadHoldingRegistersRequest,
     ReadHoldingRegistersResponse, ReadInputRegistersRequest, ReadInputRegistersResponse,
     ReadWriteMultipleRegistersRequest, ReadWriteMultipleRegistersResponse, ReportServerIdRequest,
     ReportServerIdResponse, WriteMultipleCoilsRequest, WriteMultipleCoilsResponse,
@@ -57,6 +59,12 @@ use protocol::pdu::{
     WriteSingleCoilResponse, WriteSingleRegisterRequest, WriteSingleRegisterResponse,
 };
 use std::sync::{Mutex, PoisonError};
+
+// The spec caps a whole PDU at 253 bytes — same constant/reasoning as
+// device_identification::MAX_PDU_LEN, duplicated locally rather than
+// shared across modules since there's no concrete third use yet (per this
+// project's extraction-based-programming convention).
+const MAX_PDU_LEN: usize = 253;
 
 #[allow(clippy::too_many_arguments)]
 pub fn handle_request(
@@ -70,6 +78,8 @@ pub fn handle_request(
     discrete_input_store: &Mutex<DiscreteInputStore>,
     input_registers: &[InputRegisterDescription],
     input_register_store: &Mutex<InputRegisterStore>,
+    file_records: &[FileRecordDescription],
+    file_record_store: &Mutex<FileRecordStore>,
     mem_layout: MemLayout,
     input_register_mem_layout: MemLayout,
     toml_source: &str,
@@ -127,6 +137,9 @@ pub fn handle_request(
         FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT => {
             handle_encapsulated_interface_transport(pdu, toml_source)
         }
+        FUNCTION_CODE_READ_FILE_RECORD => {
+            handle_read_file_record(pdu, file_records, file_record_store)
+        }
         _ => ExceptionResponse {
             function_code,
             exception_code: EXCEPTION_ILLEGAL_FUNCTION,
@@ -153,6 +166,83 @@ fn handle_encapsulated_interface_transport(pdu: &[u8], toml_source: &str) -> Vec
     };
     let objects = build_objects(toml_source);
     handle_read_device_identification(&request, &objects)
+}
+
+// Resolves every sub-request against the static file-record descriptions
+// before touching `file_record_store` at all — a problem with any one
+// sub-request (unknown file/record number, or a record_length that doesn't
+// match what's declared) rejects the whole request rather than answering
+// some sub-requests and silently omitting others, the same "validate
+// before applying" discipline handle_read_write_multiple_registers already
+// applies to its write half (even though FC 0x14 never writes, a partial/
+// wrong-shaped response would be just as misleading). Values are served
+// straight from the store, uninterpreted — see CLAUDE.md's "FC 0x14 (Read
+// File Record)" section for why this project doesn't attempt to decode
+// what a record's bytes mean.
+fn handle_read_file_record(
+    pdu: &[u8],
+    file_records: &[FileRecordDescription],
+    file_record_store: &Mutex<FileRecordStore>,
+) -> Vec<u8> {
+    let Ok(request) = ReadFileRecordRequest::decode(pdu) else {
+        return ExceptionResponse {
+            function_code: FUNCTION_CODE_READ_FILE_RECORD,
+            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+        }
+        .encode();
+    };
+
+    let mut resolved: Vec<&FileRecordDescription> = Vec::with_capacity(request.sub_requests.len());
+    for sub_request in &request.sub_requests {
+        let Some(description) = file_records.iter().find(|description| {
+            description.file_number == sub_request.file_number
+                && description.record_number == sub_request.record_number
+        }) else {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+            .encode();
+        };
+        // Same "must land on an exact boundary" discipline as handle_read's
+        // register-by-register walk — a request asking for a different
+        // length than what's declared has no well-defined answer, rather
+        // than silently truncating/padding to what was actually asked for.
+        if description.record_length != sub_request.record_length {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+            }
+            .encode();
+        }
+        resolved.push(description);
+    }
+
+    let store = file_record_store
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let records: Vec<Vec<u8>> = resolved
+        .iter()
+        .map(|description| {
+            store
+                .get(description.file_number, description.record_number)
+                .cloned()
+                .unwrap_or_else(|| vec![0u8; description.record_length as usize * 2])
+        })
+        .collect();
+    drop(store);
+
+    let encoded = ReadFileRecordResponse { records }.encode();
+    // The spec caps the whole PDU at 253 bytes — reject rather than send a
+    // response no real Modbus transport could carry.
+    if encoded.len() > MAX_PDU_LEN {
+        return ExceptionResponse {
+            function_code: FUNCTION_CODE_READ_FILE_RECORD,
+            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+        }
+        .encode();
+    }
+    encoded
 }
 
 // Zero (or 0.0) for every DataType — what an unset register reads back as,
@@ -760,6 +850,7 @@ fn handle_write_multiple_coils(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::pdu::FileRecordSubRequest;
 
     fn registers() -> Vec<RegisterDescription> {
         vec![
@@ -843,6 +934,21 @@ mod tests {
         ]
     }
 
+    fn file_records() -> Vec<FileRecordDescription> {
+        vec![
+            FileRecordDescription {
+                file_number: 4,
+                record_number: 1,
+                record_length: 2,
+            },
+            FileRecordDescription {
+                file_number: 3,
+                record_number: 9,
+                record_length: 2,
+            },
+        ]
+    }
+
     #[test]
     fn read_returns_current_store_values() {
         let store = Mutex::new(RegisterStore::new());
@@ -868,6 +974,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -902,6 +1010,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -935,6 +1045,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -972,6 +1084,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1009,6 +1123,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1050,6 +1166,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Cdab,
             MemLayout::Abcd,
             "",
@@ -1084,6 +1202,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1124,6 +1244,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1164,6 +1286,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1210,6 +1334,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1252,6 +1378,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1294,6 +1422,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1327,6 +1457,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1359,6 +1491,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1395,6 +1529,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1442,6 +1578,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Dcba,
             MemLayout::Abcd,
             "",
@@ -1486,6 +1624,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1535,6 +1675,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1580,6 +1722,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1628,6 +1772,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1672,6 +1818,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1705,6 +1853,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1734,6 +1884,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1771,6 +1923,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "name = \"X\"",
@@ -1807,6 +1961,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1841,6 +1997,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1874,6 +2032,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1909,6 +2069,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1949,6 +2111,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1985,6 +2149,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2032,6 +2198,8 @@ mod tests {
             &Mutex::new(DiscreteInputStore::new()),
             &Vec::new(),
             &Mutex::new(InputRegisterStore::new()),
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2076,6 +2244,8 @@ mod tests {
             &discrete_input_store,
             &input_registers(),
             &input_register_store,
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2113,6 +2283,8 @@ mod tests {
             &discrete_input_store,
             &input_registers(),
             &input_register_store,
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2150,6 +2322,8 @@ mod tests {
             &discrete_input_store,
             &input_registers(),
             &input_register_store,
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2192,6 +2366,8 @@ mod tests {
             &discrete_input_store,
             &input_registers(),
             &input_register_store,
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2229,6 +2405,8 @@ mod tests {
             &discrete_input_store,
             &input_registers(),
             &input_register_store,
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2272,6 +2450,8 @@ mod tests {
             &discrete_input_store,
             &input_registers(),
             &input_register_store,
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Cdab,
             "",
@@ -2308,6 +2488,8 @@ mod tests {
             &discrete_input_store,
             &input_registers(),
             &input_register_store,
+            &Vec::new(),
+            &Mutex::new(FileRecordStore::new()),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2319,6 +2501,291 @@ mod tests {
             ExceptionResponse {
                 function_code: FUNCTION_CODE_READ_INPUT_REGISTERS,
                 exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
+    }
+
+    #[test]
+    fn read_file_record_returns_stored_bytes_for_every_sub_request() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let file_record_store = Mutex::new(FileRecordStore::new());
+        file_record_store
+            .lock()
+            .unwrap()
+            .set(4, 1, vec![0x0D, 0xFE, 0x00, 0x20]);
+        file_record_store
+            .lock()
+            .unwrap()
+            .set(3, 9, vec![0x33, 0xCD, 0x00, 0x40]);
+
+        let request = ReadFileRecordRequest {
+            sub_requests: vec![
+                FileRecordSubRequest {
+                    file_number: 4,
+                    record_number: 1,
+                    record_length: 2,
+                },
+                FileRecordSubRequest {
+                    file_number: 3,
+                    record_number: 9,
+                    record_length: 2,
+                },
+            ],
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &ServerOptions::allow_all(),
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            &file_records(),
+            &file_record_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ReadFileRecordResponse::decode(&response).unwrap(),
+            ReadFileRecordResponse {
+                records: vec![vec![0x0D, 0xFE, 0x00, 0x20], vec![0x33, 0xCD, 0x00, 0x40],]
+            }
+        );
+    }
+
+    #[test]
+    fn read_file_record_defaults_to_zero_filled_bytes_when_unset() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let file_record_store = Mutex::new(FileRecordStore::new());
+
+        let request = ReadFileRecordRequest {
+            sub_requests: vec![FileRecordSubRequest {
+                file_number: 4,
+                record_number: 1,
+                record_length: 2,
+            }],
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &ServerOptions::allow_all(),
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            &file_records(),
+            &file_record_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ReadFileRecordResponse::decode(&response).unwrap(),
+            ReadFileRecordResponse {
+                records: vec![vec![0x00, 0x00, 0x00, 0x00]]
+            }
+        );
+    }
+
+    #[test]
+    fn read_file_record_of_unknown_file_number_returns_an_exception() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let file_record_store = Mutex::new(FileRecordStore::new());
+
+        let request = ReadFileRecordRequest {
+            sub_requests: vec![FileRecordSubRequest {
+                file_number: 999,
+                record_number: 1,
+                record_length: 2,
+            }],
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &ServerOptions::allow_all(),
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            &file_records(),
+            &file_record_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
+    }
+
+    #[test]
+    fn read_file_record_with_wrong_record_length_returns_an_exception() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let file_record_store = Mutex::new(FileRecordStore::new());
+
+        // file_records() declares (4, 1) with record_length 2, not 3.
+        let request = ReadFileRecordRequest {
+            sub_requests: vec![FileRecordSubRequest {
+                file_number: 4,
+                record_number: 1,
+                record_length: 3,
+            }],
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &ServerOptions::allow_all(),
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            &file_records(),
+            &file_record_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+            }
+        );
+    }
+
+    #[test]
+    fn read_file_record_rejects_a_response_that_would_exceed_the_pdu_limit() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let file_record_store = Mutex::new(FileRecordStore::new());
+        // 200 words = 400 data bytes alone, already past the 253-byte PDU
+        // cap once the response header/sub-response framing is added.
+        let oversized_file_records = vec![FileRecordDescription {
+            file_number: 4,
+            record_number: 1,
+            record_length: 200,
+        }];
+
+        let request = ReadFileRecordRequest {
+            sub_requests: vec![FileRecordSubRequest {
+                file_number: 4,
+                record_number: 1,
+                record_length: 200,
+            }],
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &ServerOptions::allow_all(),
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            &oversized_file_records,
+            &file_record_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+            }
+        );
+    }
+
+    #[test]
+    fn read_file_record_is_rejected_when_disabled_via_server_options() {
+        let store = Mutex::new(RegisterStore::new());
+        let coil_store = Mutex::new(CoilStore::new());
+        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let file_record_store = Mutex::new(FileRecordStore::new());
+
+        let request = ReadFileRecordRequest {
+            sub_requests: vec![FileRecordSubRequest {
+                file_number: 4,
+                record_number: 1,
+                record_length: 2,
+            }],
+        }
+        .encode();
+        let response = handle_request(
+            &request,
+            &ServerOptions::default(),
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &discrete_inputs(),
+            &discrete_input_store,
+            &input_registers(),
+            &input_register_store,
+            &file_records(),
+            &file_record_store,
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            "",
+            None,
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_FUNCTION,
             }
         );
     }

@@ -11,17 +11,19 @@
 // client's version, just without needing a tokio runtime handle.
 
 use fuse_fs::{
-    CoilStore, DiscreteInputStore, InputRegisterStore, RegisterStore, StagedValue, WriteReport,
-    WriteStatus,
+    CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore, StagedValue,
+    WriteReport, WriteStatus,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_transaction_consumer(
     store: &Arc<Mutex<RegisterStore>>,
     coil_store: &Arc<Mutex<CoilStore>>,
     discrete_input_store: &Arc<Mutex<DiscreteInputStore>>,
     input_register_store: &Arc<Mutex<InputRegisterStore>>,
+    file_record_store: &Arc<Mutex<FileRecordStore>>,
     report: &Arc<Mutex<WriteReport>>,
     transaction_receiver: mpsc::Receiver<HashMap<String, StagedValue>>,
 ) {
@@ -32,6 +34,9 @@ pub fn run_transaction_consumer(
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut input_register_store = input_register_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut file_record_store = file_record_store
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut report = report.lock().unwrap_or_else(PoisonError::into_inner);
@@ -51,6 +56,14 @@ pub fn run_transaction_consumer(
                 }
                 StagedValue::InputRegister(value) => {
                     input_register_store.set(name.clone(), value);
+                    report.set(name, WriteStatus::Ok);
+                }
+                StagedValue::FileRecord {
+                    file_number,
+                    record_number,
+                    value,
+                } => {
+                    file_record_store.set(file_number, record_number, value);
                     report.set(name, WriteStatus::Ok);
                 }
                 // Never actually produced on the server: MASK-format
@@ -85,6 +98,7 @@ mod tests {
         let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
         let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, receiver) = mpsc::channel();
 
@@ -101,6 +115,7 @@ mod tests {
             &coil_store,
             &discrete_input_store,
             &input_register_store,
+            &file_record_store,
             &report,
             receiver,
         );
@@ -121,6 +136,7 @@ mod tests {
         let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
         let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, receiver) = mpsc::channel();
 
@@ -137,6 +153,7 @@ mod tests {
             &coil_store,
             &discrete_input_store,
             &input_register_store,
+            &file_record_store,
             &report,
             receiver,
         );
@@ -153,6 +170,7 @@ mod tests {
         let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
         let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, receiver) = mpsc::channel();
 
@@ -169,6 +187,7 @@ mod tests {
             &coil_store,
             &discrete_input_store,
             &input_register_store,
+            &file_record_store,
             &report,
             receiver,
         );
@@ -189,6 +208,7 @@ mod tests {
         let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
         let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, receiver) = mpsc::channel();
 
@@ -205,6 +225,7 @@ mod tests {
             &coil_store,
             &discrete_input_store,
             &input_register_store,
+            &file_record_store,
             &report,
             receiver,
         );
@@ -225,6 +246,7 @@ mod tests {
         let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
         let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, receiver) = mpsc::channel();
 
@@ -241,6 +263,7 @@ mod tests {
             &coil_store,
             &discrete_input_store,
             &input_register_store,
+            &file_record_store,
             &report,
             receiver,
         );
@@ -253,5 +276,44 @@ mod tests {
             report.lock().unwrap().get("Flow_Rate"),
             Some(&WriteStatus::Ok)
         );
+    }
+
+    #[test]
+    fn applies_a_staged_file_record_directly_and_marks_it_ok() {
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let (sender, receiver) = mpsc::channel();
+
+        let mut transaction = HashMap::new();
+        transaction.insert(
+            "4:1".to_string(),
+            StagedValue::FileRecord {
+                file_number: 4,
+                record_number: 1,
+                value: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            },
+        );
+        sender.send(transaction).unwrap();
+        drop(sender);
+
+        run_transaction_consumer(
+            &store,
+            &coil_store,
+            &discrete_input_store,
+            &input_register_store,
+            &file_record_store,
+            &report,
+            receiver,
+        );
+
+        assert_eq!(
+            file_record_store.lock().unwrap().get(4, 1),
+            Some(&vec![0xDE, 0xAD, 0xBE, 0xEF])
+        );
+        assert_eq!(report.lock().unwrap().get("4:1"), Some(&WriteStatus::Ok));
     }
 }

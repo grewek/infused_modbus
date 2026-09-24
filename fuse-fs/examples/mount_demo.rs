@@ -24,8 +24,8 @@
 
 use fuse_fs::filesystem::{InfusedFilesystem, WriteMode};
 use fuse_fs::{
-    CoilStore, CoilValue, DiscreteInputStore, InputRegisterStore, RegisterStore, RegisterValue,
-    StagedValue, WriteReport, WriteStatus,
+    CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore,
+    RegisterValue, StagedValue, WriteReport, WriteStatus,
 };
 use protocol::device_description::{
     AccessRight, CoilDescription, DataType, DeviceDescription, RegisterDescription,
@@ -127,7 +127,9 @@ fn main() {
                                 ),
                             );
                         }
-                        StagedValue::DiscreteInput(_) | StagedValue::InputRegister(_) => {
+                        StagedValue::DiscreteInput(_)
+                        | StagedValue::InputRegister(_)
+                        | StagedValue::FileRecord { .. } => {
                             // This demo only mounts in WriteMode::Staged, so
                             // these are never actually produced — see
                             // fuse_fs::filesystem's "server direct-write
@@ -167,16 +169,19 @@ fn main() {
 
     let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
     let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+    let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
 
     let filesystem = InfusedFilesystem::new(
         registers,
         coils,
         discrete_inputs,
         input_registers,
+        Vec::new(),
         store,
         coil_store,
         discrete_input_store,
         input_register_store,
+        file_record_store,
         transaction_sender,
         report,
         None,
