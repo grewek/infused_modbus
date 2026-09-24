@@ -5,5 +5,6 @@ pub mod device_identification;
 pub mod handler;
 pub mod live_connections;
 pub mod persistence;
+pub mod server_options;
 pub mod tls;
 pub mod transaction_consumer;

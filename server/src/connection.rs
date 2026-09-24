@@ -4,6 +4,7 @@
 // its own spawned tokio task, which needs 'static ownership.
 
 use crate::handler::handle_request;
+use crate::server_options::ServerOptions;
 use fuse_fs::{CoilStore, DiscreteInputStore, InputRegisterStore, RegisterStore};
 use protocol::device_description::{
     CoilDescription, DiscreteInputDescription, InputRegisterDescription, MemLayout,
@@ -22,6 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_tcp_connection<S>(
     mut stream: S,
+    server_options: ServerOptions,
     registers: Arc<Vec<RegisterDescription>>,
     store: Arc<Mutex<RegisterStore>>,
     coils: Arc<Vec<CoilDescription>>,
@@ -61,6 +63,7 @@ pub async fn serve_tcp_connection<S>(
             async move |pdu: &[u8]| {
                 handle_request(
                     pdu,
+                    &server_options,
                     &handler_registers,
                     &handler_store,
                     &handler_coils,
@@ -95,6 +98,7 @@ pub async fn serve_tcp_connection<S>(
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_rtu_connection<S>(
     mut stream: S,
+    server_options: ServerOptions,
     registers: Arc<Vec<RegisterDescription>>,
     store: Arc<Mutex<RegisterStore>>,
     coils: Arc<Vec<CoilDescription>>,
@@ -128,6 +132,7 @@ pub async fn serve_rtu_connection<S>(
             async move |pdu: &[u8]| {
                 handle_request(
                     pdu,
+                    &server_options,
                     &handler_registers,
                     &handler_store,
                     &handler_coils,
@@ -216,6 +221,7 @@ mod tests {
 
         tokio::spawn(serve_tcp_connection(
             server_stream,
+            ServerOptions::allow_all(),
             registers(),
             Arc::clone(&store),
             coils(),
@@ -263,6 +269,7 @@ mod tests {
 
         tokio::spawn(serve_tcp_connection(
             server_stream,
+            ServerOptions::allow_all(),
             registers(),
             Arc::clone(&store),
             coils(),
@@ -316,6 +323,7 @@ mod tests {
 
         tokio::spawn(serve_tcp_connection(
             server_stream,
+            ServerOptions::allow_all(),
             registers(),
             Arc::clone(&store),
             coils(),
@@ -371,6 +379,7 @@ mod tests {
 
         tokio::spawn(serve_rtu_connection(
             server_stream,
+            ServerOptions::allow_all(),
             registers(),
             Arc::clone(&store),
             coils(),
@@ -419,6 +428,7 @@ mod tests {
 
         tokio::spawn(serve_rtu_connection(
             server_stream,
+            ServerOptions::allow_all(),
             registers(),
             Arc::clone(&store),
             coils(),

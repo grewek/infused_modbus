@@ -558,6 +558,7 @@ mod tests {
             let tls_stream = acceptor.accept(tcp_stream).await.unwrap();
             serve_tcp_connection(
                 tls_stream,
+                crate::server_options::ServerOptions::allow_all(),
                 registers,
                 store,
                 coils,

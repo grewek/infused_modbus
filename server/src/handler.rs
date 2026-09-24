@@ -30,6 +30,7 @@
 // old or the fully-requested new one.
 
 use crate::device_identification::{build_objects, handle_read_device_identification};
+use crate::server_options::ServerOptions;
 use fuse_fs::register_encoding::{register_value_from_words, register_value_to_words};
 use fuse_fs::{
     CoilStore, CoilValue, DiscreteInputStore, InputRegisterStore, RegisterStore, RegisterValue,
@@ -60,6 +61,7 @@ use std::sync::{Mutex, PoisonError};
 #[allow(clippy::too_many_arguments)]
 pub fn handle_request(
     pdu: &[u8],
+    server_options: &ServerOptions,
     registers: &[RegisterDescription],
     store: &Mutex<RegisterStore>,
     coils: &[CoilDescription],
@@ -80,6 +82,20 @@ pub fn handle_request(
         }
         .encode();
     };
+
+    // Every function code's availability is an explicit technician
+    // opt-in (CLAUDE.md's "server-options.toml" section) — a disabled
+    // function code gets the exact same ILLEGAL_FUNCTION exception as one
+    // that isn't implemented at all, deliberately indistinguishable on the
+    // wire so a remote peer can't fingerprint "implemented but disabled"
+    // apart from "never implemented".
+    if !server_options.is_enabled(function_code) {
+        return ExceptionResponse {
+            function_code,
+            exception_code: EXCEPTION_ILLEGAL_FUNCTION,
+        }
+        .encode();
+    }
 
     match function_code {
         FUNCTION_CODE_READ_HOLDING_REGISTERS => handle_read(pdu, registers, store, mem_layout),
@@ -843,6 +859,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -876,6 +893,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -908,6 +926,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -944,6 +963,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -980,6 +1000,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1020,6 +1041,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1053,6 +1075,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1092,6 +1115,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1131,6 +1155,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1176,6 +1201,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1217,6 +1243,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1258,6 +1285,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1290,6 +1318,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1321,6 +1350,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1356,6 +1386,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1402,6 +1433,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1445,6 +1477,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1493,6 +1526,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1537,6 +1571,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1584,6 +1619,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1627,6 +1663,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1659,6 +1696,7 @@ mod tests {
         let request = vec![0x11, 0x00, 0x00, 0x00, 0x01];
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1687,6 +1725,7 @@ mod tests {
         let coil_store = Mutex::new(CoilStore::new());
         let response = handle_request(
             &[],
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1723,6 +1762,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1758,6 +1798,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1791,6 +1832,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1823,6 +1865,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1857,6 +1900,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1896,6 +1940,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1931,6 +1976,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -1977,6 +2023,7 @@ mod tests {
 
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -2020,6 +2067,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -2056,6 +2104,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -2092,6 +2141,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -2133,6 +2183,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -2169,6 +2220,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -2211,6 +2263,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),
@@ -2246,6 +2299,7 @@ mod tests {
         .encode();
         let response = handle_request(
             &request,
+            &ServerOptions::allow_all(),
             &registers(),
             &store,
             &coils(),

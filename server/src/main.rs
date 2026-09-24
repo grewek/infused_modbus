@@ -84,12 +84,15 @@ const APPROVED_CLIENTS_PATH: &str = "approved-clients.toml";
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: server <mountpoint> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>]\n\
+        "Usage: server <mountpoint> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>] [--server-options <server-options.toml>]\n\
          <connection> is tcp://<bind-address:port>, tls+tcp://<bind-address:port>, or rtu://<serial-path>:<baud-rate>\n\
          --fuse-permissions sets custom mode/uid/gid per top-level FUSE directory — \
          without it, every directory keeps its historical hardcoded behavior.\n\
          --max-clients bounds how many TLS client fingerprints can be approved at once \
          (tls+tcp:// only) — without it, there is no limit.\n\
+         --server-options explicitly enables function codes this server will answer — \
+         without it (or with an empty file), every function code is disabled and every \
+         request gets ILLEGAL_FUNCTION.\n\
          \n\
          Usage: server admin approve|revoke <fingerprint>\n\
          Usage: server admin list"
@@ -135,6 +138,26 @@ fn extract_max_clients(args: &mut Vec<String>) -> Option<usize> {
     )
 }
 
+/// Pulls `--server-options <path>` out of `args` if present (order-
+/// independent, same shape as `--fuse-permissions`), leaving the rest of
+/// `args` untouched. Absent entirely, behaves exactly like a present-but-
+/// empty file (`ServerOptions::default()`) — every function code disabled,
+/// not a startup error (CLAUDE.md's "server-options.toml" section).
+fn extract_server_options(args: &mut Vec<String>) -> server::server_options::ServerOptions {
+    let Some(flag_index) = args.iter().position(|arg| arg == "--server-options") else {
+        return server::server_options::ServerOptions::default();
+    };
+    if flag_index + 1 >= args.len() {
+        panic!("--server-options requires a path");
+    }
+    args.remove(flag_index);
+    let path = args.remove(flag_index);
+    let toml_source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
+    server::server_options::ServerOptions::parse(&toml_source)
+        .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
+}
+
 fn admin_usage() -> ! {
     eprintln!("Usage: server admin approve|revoke <fingerprint>\nUsage: server admin list");
     std::process::exit(1);
@@ -176,6 +199,7 @@ fn run_admin_subcommand(mut args: impl Iterator<Item = String>) {
 fn start_serving(
     runtime: &tokio::runtime::Runtime,
     connection_string: &str,
+    server_options: server::server_options::ServerOptions,
     registers: Arc<Vec<RegisterDescription>>,
     store: Arc<Mutex<RegisterStore>>,
     coils: Arc<Vec<CoilDescription>>,
@@ -222,6 +246,7 @@ fn start_serving(
                     tokio::spawn(async move {
                         serve_tcp_connection(
                             stream,
+                            server_options,
                             registers,
                             store,
                             coils,
@@ -343,6 +368,7 @@ fn start_serving(
                         let Some(fingerprint) = fingerprint else {
                             serve_tcp_connection(
                                 stream,
+                                server_options,
                                 registers,
                                 store,
                                 coils,
@@ -374,6 +400,7 @@ fn start_serving(
                         tokio::select! {
                             _ = serve_tcp_connection(
                                 stream,
+                                server_options,
                                 registers,
                                 store,
                                 coils,
@@ -419,6 +446,7 @@ fn start_serving(
             runtime.spawn(async move {
                 serve_rtu_connection(
                     stream,
+                    server_options,
                     registers,
                     store,
                     coils,
@@ -444,6 +472,7 @@ fn main() {
     let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
     let fuse_permissions = extract_fuse_permissions(&mut raw_args);
     let max_clients = extract_max_clients(&mut raw_args);
+    let server_options = extract_server_options(&mut raw_args);
     let mut args = raw_args.into_iter();
     let Some(first_argument) = args.next() else {
         usage();
@@ -451,6 +480,20 @@ fn main() {
     if first_argument == "admin" {
         run_admin_subcommand(args);
         return;
+    }
+    // "The server starts fine but answers nothing" is a real footgun for a
+    // forgotten/empty --server-options file — every function code defaults
+    // to disabled (CLAUDE.md's "server-options.toml" section), so a
+    // technician who didn't mean that needs to notice immediately, not
+    // after wondering why every real Modbus master gets ILLEGAL_FUNCTION.
+    // Checked here rather than right after extraction, since the `admin`
+    // subcommand above never actually serves anything and has no use for
+    // this warning.
+    if !server_options.any_enabled() {
+        eprintln!(
+            "WARNING: no function codes are enabled (see --server-options) — \
+             this server will answer ILLEGAL_FUNCTION to every request."
+        );
     }
     let mountpoint = first_argument;
     let Some(device_description_path) = args.next() else {
@@ -578,6 +621,7 @@ fn main() {
     start_serving(
         &runtime,
         &connection_string,
+        server_options,
         Arc::new(registers.clone()),
         Arc::clone(&store),
         Arc::new(coils.clone()),
