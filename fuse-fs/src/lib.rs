@@ -3,9 +3,10 @@ pub mod filesystem;
 pub mod permissions;
 pub mod register_encoding;
 
-use protocol::device_description::DataType;
+use protocol::device_description::{DataType, MachineDescription};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 // Mirrors protocol::device_description::DataType — a register's value is
 // whichever of these its TOML description declares it to be. U24/I24 have
@@ -362,6 +363,57 @@ impl WriteReport {
     }
 }
 
+// Bundles one instance of every per-machine store type + its write report —
+// see CLAUDE.md's "Planned: multi-machine device description & FUSE layout"
+// section. A multi-machine deployment holds one of these per configured
+// machine name rather than each of `InfusedFilesystem`'s constructor/
+// polling/transaction-consumer call sites separately threading five (now
+// six) individual stores through per machine. Every field is already
+// `Arc<Mutex<_>>` exactly as it was before this bundling, so cloning a
+// `MachineStores` handle is cheap and every clone still refers to the same
+// underlying data — needed since `InfusedFilesystem`, polling, and the
+// transaction consumer all need to see the same machine's stores.
+#[derive(Debug, Clone)]
+pub struct MachineStores {
+    pub registers: Arc<Mutex<RegisterStore>>,
+    pub coils: Arc<Mutex<CoilStore>>,
+    pub discrete_inputs: Arc<Mutex<DiscreteInputStore>>,
+    pub input_registers: Arc<Mutex<InputRegisterStore>>,
+    pub file_records: Arc<Mutex<FileRecordStore>>,
+    pub report: Arc<Mutex<WriteReport>>,
+}
+
+impl MachineStores {
+    pub fn new() -> Self {
+        Self {
+            registers: Arc::new(Mutex::new(RegisterStore::new())),
+            coils: Arc::new(Mutex::new(CoilStore::new())),
+            discrete_inputs: Arc::new(Mutex::new(DiscreteInputStore::new())),
+            input_registers: Arc::new(Mutex::new(InputRegisterStore::new())),
+            file_records: Arc::new(Mutex::new(FileRecordStore::new())),
+            report: Arc::new(Mutex::new(WriteReport::new())),
+        }
+    }
+}
+
+impl Default for MachineStores {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// One fresh `MachineStores` per configured machine, keyed by machine name —
+// the construction step both `client` and `server` need identically once
+// they build their `InfusedFilesystem`/polling/transaction-consumer setup
+// per machine, so it's extracted here rather than duplicated in both
+// binaries' `main.rs`.
+pub fn build_machine_stores(machines: &[MachineDescription]) -> HashMap<String, MachineStores> {
+    machines
+        .iter()
+        .map(|machine| (machine.name.clone(), MachineStores::new()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,5 +757,102 @@ mod tests {
         store.set(20, 5, vec![0x01]);
         store.set(20, 5, vec![0x02]);
         assert_eq!(store.get(20, 5), Some(&vec![0x02]));
+    }
+
+    fn minimal_machine(name: &str) -> MachineDescription {
+        MachineDescription {
+            name: name.to_string(),
+            unit_id: 1,
+            registers: vec![],
+            coils: vec![],
+            discrete_inputs: vec![],
+            input_registers: vec![],
+            file_records: vec![],
+            mem_layout: Default::default(),
+            input_register_mem_layout: Default::default(),
+            server_id: None,
+        }
+    }
+
+    #[test]
+    fn machine_stores_new_starts_with_every_store_empty() {
+        let stores = MachineStores::new();
+        assert_eq!(
+            stores.registers.lock().unwrap().get("Tank_Temperature"),
+            None
+        );
+        assert_eq!(stores.coils.lock().unwrap().get("Motor_Running"), None);
+        assert_eq!(
+            stores
+                .discrete_inputs
+                .lock()
+                .unwrap()
+                .get("Door_Open_Sensor"),
+            None
+        );
+        assert_eq!(
+            stores.input_registers.lock().unwrap().get("Flow_Rate"),
+            None
+        );
+        assert_eq!(stores.file_records.lock().unwrap().get(20, 5), None);
+        assert_eq!(stores.report.lock().unwrap().get("Stop_Process"), None);
+    }
+
+    #[test]
+    fn machine_stores_clone_shares_the_same_underlying_data() {
+        let stores = MachineStores::new();
+        let cloned = stores.clone();
+
+        stores
+            .registers
+            .lock()
+            .unwrap()
+            .set("Tank_Temperature", RegisterValue::U16(42));
+
+        assert_eq!(
+            cloned.registers.lock().unwrap().get("Tank_Temperature"),
+            Some(RegisterValue::U16(42))
+        );
+    }
+
+    #[test]
+    fn build_machine_stores_creates_one_entry_per_machine_name() {
+        let machines = vec![minimal_machine("PumpA"), minimal_machine("PumpB")];
+
+        let stores = build_machine_stores(&machines);
+
+        assert_eq!(stores.len(), 2);
+        assert!(stores.contains_key("PumpA"));
+        assert!(stores.contains_key("PumpB"));
+    }
+
+    #[test]
+    fn build_machine_stores_gives_each_machine_independent_stores() {
+        let machines = vec![minimal_machine("PumpA"), minimal_machine("PumpB")];
+
+        let stores = build_machine_stores(&machines);
+
+        stores["PumpA"]
+            .registers
+            .lock()
+            .unwrap()
+            .set("Tank_Temperature", RegisterValue::U16(42));
+
+        assert_eq!(
+            stores["PumpA"]
+                .registers
+                .lock()
+                .unwrap()
+                .get("Tank_Temperature"),
+            Some(RegisterValue::U16(42))
+        );
+        assert_eq!(
+            stores["PumpB"]
+                .registers
+                .lock()
+                .unwrap()
+                .get("Tank_Temperature"),
+            None
+        );
     }
 }
