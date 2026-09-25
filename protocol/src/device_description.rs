@@ -139,14 +139,32 @@ pub struct FileRecordDescription {
     pub record_length: u16,
 }
 
+// One machine on a shared link (a multi-drop RTU bus, or a device reachable
+// through a Unit-ID-aware TCP gateway) — see CLAUDE.md's "Planned:
+// multi-machine device description & FUSE layout" section. Everything that
+// used to be a flat, single-device `DeviceDescription` now lives here
+// instead, one level down, per machine.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DeviceDescription {
+pub struct MachineDescription {
+    // Used directly as the machine's top-level FUSE directory name — must be
+    // unique across the whole file and restricted to ASCII alphanumeric plus
+    // `_`/`-` (see `validate_machine_name`), enforced as a parse error rather
+    // than a runtime surprise, since two machines sharing a name would
+    // collide on one FUSE inode and other characters could break path
+    // handling.
+    pub name: String,
+    // Which Modbus Unit ID on the shared link this machine answers to. A
+    // deliberate, flagged exception to this project's usual "TOML describes
+    // data shape, CLI/config describes connection" separation — a Unit ID is
+    // normally connection/wire-addressing information, but it's needed here
+    // to tell multiple machines described in one file apart.
+    pub unit_id: u8,
     pub registers: Vec<RegisterDescription>,
     pub coils: Vec<CoilDescription>,
     pub discrete_inputs: Vec<DiscreteInputDescription>,
     pub input_registers: Vec<InputRegisterDescription>,
     pub file_records: Vec<FileRecordDescription>,
-    // Global for the whole device, not per-register: real devices bake
+    // Global for the whole machine, not per-register: real devices bake
     // their word/byte order into firmware once, not per data point — see
     // MemLayout's own doc comment. Meaningless when `registers` is empty.
     pub mem_layout: MemLayout,
@@ -161,8 +179,14 @@ pub struct DeviceDescription {
     // section) — `None` means "not configured", not "empty string": the
     // server answers FC11 with ILLEGAL_FUNCTION rather than an empty
     // identity, and the client's `server-id` file doesn't exist at all
-    // rather than existing-but-blank.
+    // rather than existing-but-blank. Per-machine since FC11 answers per
+    // Unit ID, and each machine on a shared link has its own identity.
     pub server_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceDescription {
+    pub machines: Vec<MachineDescription>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,13 +255,15 @@ struct RawFileRecordEntry {
 }
 
 // `registers`/`coils`/`discrete-inputs`/`input-registers` are each optional
-// at the top level (default: no entries) so a device that only has some of
-// the four doesn't need to spell out empty sections for the rest. Once a
+// per machine (default: no entries) so a machine that only has some of the
+// four doesn't need to spell out empty sections for the rest. Once a
 // section *is* present, though, its own `base_address` stays a required
 // field — see `DeviceDescription`'s existing `parse_rejects_missing_base_address`
 // test.
-#[derive(Debug, Default, Deserialize)]
-struct RawDeviceDescription {
+#[derive(Debug, Deserialize)]
+struct RawMachine {
+    name: String,
+    unit_id: u8,
     #[serde(default)]
     registers: RawRegisterSection,
     #[serde(default)]
@@ -252,13 +278,35 @@ struct RawDeviceDescription {
     server_id: Option<String>,
 }
 
+// The whole file is just an array of machines — `machines` itself is
+// optional (default: empty) so an empty/whitespace-only TOML source parses
+// to a `DeviceDescription` with no machines at all, rather than an error.
+#[derive(Debug, Default, Deserialize)]
+struct RawDeviceDescription {
+    #[serde(default)]
+    machines: Vec<RawMachine>,
+}
+
 #[derive(Debug)]
 pub enum DeviceDescriptionError {
     Toml(toml::de::Error),
     AddressOverflow {
+        machine: String,
         name: String,
         base_address: u16,
         offset: u16,
+    },
+    // A machine `name` that is empty or contains a character other than
+    // ASCII alphanumeric, `_`, or `-` — enforced at parse time since it
+    // becomes a FUSE directory name, and other characters could break path
+    // handling.
+    InvalidMachineName {
+        name: String,
+    },
+    // Two machines in the same file sharing a `name` — would collide on one
+    // FUSE inode, so rejected outright rather than picking a winner.
+    DuplicateMachineName {
+        name: String,
     },
 }
 
@@ -267,13 +315,21 @@ impl fmt::Display for DeviceDescriptionError {
         match self {
             DeviceDescriptionError::Toml(error) => write!(formatter, "{error}"),
             DeviceDescriptionError::AddressOverflow {
+                machine,
                 name,
                 base_address,
                 offset,
             } => write!(
                 formatter,
-                "'{name}' address overflows u16: base_address {base_address} + offset {offset}"
+                "machine '{machine}': '{name}' address overflows u16: base_address {base_address} + offset {offset}"
             ),
+            DeviceDescriptionError::InvalidMachineName { name } => write!(
+                formatter,
+                "invalid machine name '{name}': must be non-empty and contain only ASCII alphanumeric characters, '_', or '-'"
+            ),
+            DeviceDescriptionError::DuplicateMachineName { name } => {
+                write!(formatter, "duplicate machine name '{name}'")
+            }
         }
     }
 }
@@ -286,10 +342,26 @@ impl From<toml::de::Error> for DeviceDescriptionError {
     }
 }
 
+fn validate_machine_name(name: &str) -> Result<(), DeviceDescriptionError> {
+    let is_valid = !name.is_empty()
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        });
+
+    if is_valid {
+        Ok(())
+    } else {
+        Err(DeviceDescriptionError::InvalidMachineName {
+            name: name.to_string(),
+        })
+    }
+}
+
 // Resolves `base_address + offset` for every entry in a section, sharing the
 // same overflow handling regardless of whether the caller is registers or
 // coils.
 fn resolve_addresses<Entry>(
+    machine_name: &str,
     base_address: u16,
     entries: Vec<Entry>,
     offset_of: impl Fn(&Entry) -> u16,
@@ -301,6 +373,7 @@ fn resolve_addresses<Entry>(
             let offset = offset_of(&entry);
             let address = base_address.checked_add(offset).ok_or_else(|| {
                 DeviceDescriptionError::AddressOverflow {
+                    machine: machine_name.to_string(),
                     name: name_of(&entry),
                     base_address,
                     offset,
@@ -311,88 +384,114 @@ fn resolve_addresses<Entry>(
         .collect()
 }
 
+fn resolve_machine(raw: RawMachine) -> Result<MachineDescription, DeviceDescriptionError> {
+    let machine_name = raw.name.as_str();
+    let mem_layout = raw.registers.mem_layout;
+
+    let registers = resolve_addresses(
+        machine_name,
+        raw.registers.base_address,
+        raw.registers.entries,
+        |entry: &RawRegisterEntry| entry.offset,
+        |entry: &RawRegisterEntry| entry.name.clone(),
+    )?
+    .into_iter()
+    .map(|(entry, address)| RegisterDescription {
+        name: entry.name,
+        address,
+        data_type: entry.data_type,
+        access: entry.access,
+    })
+    .collect();
+
+    let coils = resolve_addresses(
+        machine_name,
+        raw.coils.base_address,
+        raw.coils.entries,
+        |entry: &RawCoilEntry| entry.offset,
+        |entry: &RawCoilEntry| entry.name.clone(),
+    )?
+    .into_iter()
+    .map(|(entry, address)| CoilDescription {
+        name: entry.name,
+        address,
+    })
+    .collect();
+
+    let input_register_mem_layout = raw.input_registers.mem_layout;
+
+    let input_registers = resolve_addresses(
+        machine_name,
+        raw.input_registers.base_address,
+        raw.input_registers.entries,
+        |entry: &RawInputRegisterEntry| entry.offset,
+        |entry: &RawInputRegisterEntry| entry.name.clone(),
+    )?
+    .into_iter()
+    .map(|(entry, address)| InputRegisterDescription {
+        name: entry.name,
+        address,
+        data_type: entry.data_type,
+    })
+    .collect();
+
+    let discrete_inputs = resolve_addresses(
+        machine_name,
+        raw.discrete_inputs.base_address,
+        raw.discrete_inputs.entries,
+        |entry: &RawDiscreteInputEntry| entry.offset,
+        |entry: &RawDiscreteInputEntry| entry.name.clone(),
+    )?
+    .into_iter()
+    .map(|(entry, address)| DiscreteInputDescription {
+        name: entry.name,
+        address,
+    })
+    .collect();
+
+    let file_records = raw
+        .file_records
+        .into_iter()
+        .map(|entry| FileRecordDescription {
+            file_number: entry.file_number,
+            record_number: entry.record_number,
+            record_length: entry.record_length,
+        })
+        .collect();
+
+    Ok(MachineDescription {
+        name: raw.name,
+        unit_id: raw.unit_id,
+        registers,
+        coils,
+        discrete_inputs,
+        input_registers,
+        file_records,
+        mem_layout,
+        input_register_mem_layout,
+        server_id: raw.server_id,
+    })
+}
+
 impl DeviceDescription {
     pub fn parse(toml_source: &str) -> Result<Self, DeviceDescriptionError> {
         let raw: RawDeviceDescription = toml::from_str(toml_source)?;
-        let mem_layout = raw.registers.mem_layout;
 
-        let registers = resolve_addresses(
-            raw.registers.base_address,
-            raw.registers.entries,
-            |entry: &RawRegisterEntry| entry.offset,
-            |entry: &RawRegisterEntry| entry.name.clone(),
-        )?
-        .into_iter()
-        .map(|(entry, address)| RegisterDescription {
-            name: entry.name,
-            address,
-            data_type: entry.data_type,
-            access: entry.access,
-        })
-        .collect();
+        let mut seen_names = std::collections::HashSet::new();
+        let mut machines = Vec::with_capacity(raw.machines.len());
 
-        let coils = resolve_addresses(
-            raw.coils.base_address,
-            raw.coils.entries,
-            |entry: &RawCoilEntry| entry.offset,
-            |entry: &RawCoilEntry| entry.name.clone(),
-        )?
-        .into_iter()
-        .map(|(entry, address)| CoilDescription {
-            name: entry.name,
-            address,
-        })
-        .collect();
+        for raw_machine in raw.machines {
+            validate_machine_name(&raw_machine.name)?;
+            if !seen_names.insert(raw_machine.name.clone()) {
+                return Err(DeviceDescriptionError::DuplicateMachineName {
+                    name: raw_machine.name,
+                });
+            }
 
-        let input_register_mem_layout = raw.input_registers.mem_layout;
+            machines.push(resolve_machine(raw_machine)?);
+        }
 
-        let input_registers = resolve_addresses(
-            raw.input_registers.base_address,
-            raw.input_registers.entries,
-            |entry: &RawInputRegisterEntry| entry.offset,
-            |entry: &RawInputRegisterEntry| entry.name.clone(),
-        )?
-        .into_iter()
-        .map(|(entry, address)| InputRegisterDescription {
-            name: entry.name,
-            address,
-            data_type: entry.data_type,
-        })
-        .collect();
-
-        let discrete_inputs = resolve_addresses(
-            raw.discrete_inputs.base_address,
-            raw.discrete_inputs.entries,
-            |entry: &RawDiscreteInputEntry| entry.offset,
-            |entry: &RawDiscreteInputEntry| entry.name.clone(),
-        )?
-        .into_iter()
-        .map(|(entry, address)| DiscreteInputDescription {
-            name: entry.name,
-            address,
-        })
-        .collect();
-
-        let file_records = raw
-            .file_records
-            .into_iter()
-            .map(|entry| FileRecordDescription {
-                file_number: entry.file_number,
-                record_number: entry.record_number,
-                record_length: entry.record_length,
-            })
-            .collect();
-
-        Ok(DeviceDescription {
-            registers,
-            coils,
-            discrete_inputs,
-            input_registers,
-            file_records,
-            mem_layout,
-            input_register_mem_layout,
-            server_id: raw.server_id,
-        })
+        Ok(DeviceDescription { machines })
     }
 }
 
@@ -422,30 +521,34 @@ mod tests {
     #[test]
     fn parse_reads_valid_device_description() {
         let toml_source = r#"
-            [registers]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.registers]
             base_address = 40000
             mem-layout = "abcd"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "Tank_Temperature"
             offset = 1
             data_type = "u16"
             access = "read_only"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "Stop_Process"
             offset = 2
             data_type = "f32"
             access = "read_write"
 
-            [coils]
+            [machines.coils]
             base_address = 0
 
-            [[coils.entries]]
+            [[machines.coils.entries]]
             name = "Motor_Running"
             offset = 1
 
-            [[coils.entries]]
+            [[machines.coils.entries]]
             name = "Alarm_Active"
             offset = 2
         "#;
@@ -455,49 +558,177 @@ mod tests {
         assert_eq!(
             description,
             DeviceDescription {
-                registers: vec![
-                    RegisterDescription {
-                        name: "Tank_Temperature".to_string(),
-                        address: 40001,
-                        data_type: DataType::U16,
-                        access: AccessRight::ReadOnly,
-                    },
-                    RegisterDescription {
-                        name: "Stop_Process".to_string(),
-                        address: 40002,
-                        data_type: DataType::F32,
-                        access: AccessRight::ReadWrite,
-                    },
-                ],
-                coils: vec![
-                    CoilDescription {
-                        name: "Motor_Running".to_string(),
-                        address: 1,
-                    },
-                    CoilDescription {
-                        name: "Alarm_Active".to_string(),
-                        address: 2,
-                    },
-                ],
-                discrete_inputs: vec![],
-                input_registers: vec![],
-                file_records: vec![],
-                mem_layout: MemLayout::Abcd,
-                input_register_mem_layout: MemLayout::Abcd,
-                server_id: None,
+                machines: vec![MachineDescription {
+                    name: "PumpA".to_string(),
+                    unit_id: 1,
+                    registers: vec![
+                        RegisterDescription {
+                            name: "Tank_Temperature".to_string(),
+                            address: 40001,
+                            data_type: DataType::U16,
+                            access: AccessRight::ReadOnly,
+                        },
+                        RegisterDescription {
+                            name: "Stop_Process".to_string(),
+                            address: 40002,
+                            data_type: DataType::F32,
+                            access: AccessRight::ReadWrite,
+                        },
+                    ],
+                    coils: vec![
+                        CoilDescription {
+                            name: "Motor_Running".to_string(),
+                            address: 1,
+                        },
+                        CoilDescription {
+                            name: "Alarm_Active".to_string(),
+                            address: 2,
+                        },
+                    ],
+                    discrete_inputs: vec![],
+                    input_registers: vec![],
+                    file_records: vec![],
+                    mem_layout: MemLayout::Abcd,
+                    input_register_mem_layout: MemLayout::Abcd,
+                    server_id: None,
+                }],
             }
         );
     }
 
     #[test]
+    fn parse_of_empty_source_has_no_machines() {
+        let description = DeviceDescription::parse("").unwrap();
+        assert_eq!(description.machines, vec![]);
+    }
+
+    #[test]
+    fn parse_reads_several_independent_machines() {
+        let toml_source = r#"
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.coils]
+            base_address = 0
+
+            [[machines.coils.entries]]
+            name = "Motor_Running"
+            offset = 1
+
+            [[machines]]
+            name = "PumpB"
+            unit_id = 2
+
+            [machines.coils]
+            base_address = 0
+
+            [[machines.coils.entries]]
+            name = "Motor_Running"
+            offset = 1
+        "#;
+
+        let description = DeviceDescription::parse(toml_source).unwrap();
+
+        assert_eq!(description.machines.len(), 2);
+        assert_eq!(description.machines[0].name, "PumpA");
+        assert_eq!(description.machines[0].unit_id, 1);
+        assert_eq!(description.machines[1].name, "PumpB");
+        assert_eq!(description.machines[1].unit_id, 2);
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_machine_names() {
+        let toml_source = r#"
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [[machines]]
+            name = "PumpA"
+            unit_id = 2
+        "#;
+
+        let error = DeviceDescription::parse(toml_source).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeviceDescriptionError::DuplicateMachineName { name } if name == "PumpA"
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_empty_machine_name() {
+        let toml_source = r#"
+            [[machines]]
+            name = ""
+            unit_id = 1
+        "#;
+
+        let error = DeviceDescription::parse(toml_source).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeviceDescriptionError::InvalidMachineName { name } if name.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_machine_name_with_disallowed_characters() {
+        for name in ["Pump A", "Pump.A", "Pump/A", "Pümp"] {
+            let toml_source = format!(
+                r#"
+                    [[machines]]
+                    name = "{name}"
+                    unit_id = 1
+                "#
+            );
+
+            let error = DeviceDescription::parse(&toml_source).unwrap_err();
+
+            assert!(
+                matches!(error, DeviceDescriptionError::InvalidMachineName { .. }),
+                "expected {name:?} to be rejected, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_accepts_machine_name_with_underscores_and_hyphens() {
+        let toml_source = r#"
+            [[machines]]
+            name = "Pump_A-1"
+            unit_id = 1
+        "#;
+
+        let description = DeviceDescription::parse(toml_source).unwrap();
+
+        assert_eq!(description.machines[0].name, "Pump_A-1");
+    }
+
+    #[test]
+    fn parse_rejects_machine_missing_unit_id() {
+        let toml_source = r#"
+            [[machines]]
+            name = "PumpA"
+        "#;
+
+        assert!(DeviceDescription::parse(toml_source).is_err());
+    }
+
+    #[test]
     fn parse_reads_file_record_entries() {
         let toml_source = r#"
-            [[file-records]]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [[machines.file-records]]
             file_number = 20
             record_number = 5
             record_length = 9
 
-            [[file-records]]
+            [[machines.file-records]]
             file_number = 20
             record_number = 6
             record_length = 9
@@ -506,7 +737,7 @@ mod tests {
         let description = DeviceDescription::parse(toml_source).unwrap();
 
         assert_eq!(
-            description.file_records,
+            description.machines[0].file_records,
             vec![
                 FileRecordDescription {
                     file_number: 20,
@@ -523,58 +754,76 @@ mod tests {
     }
 
     #[test]
-    fn parse_of_empty_source_has_no_file_records() {
-        let description = DeviceDescription::parse("").unwrap();
-        assert_eq!(description.file_records, vec![]);
+    fn parse_of_machine_with_no_file_records_has_none() {
+        let toml_source = r#"
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+        "#;
+
+        let description = DeviceDescription::parse(toml_source).unwrap();
+        assert_eq!(description.machines[0].file_records, vec![]);
     }
 
     #[test]
     fn parse_reads_a_configured_server_id() {
         let toml_source = r#"
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
             server-id = "infused_modbus-demo-plc"
         "#;
         let description = DeviceDescription::parse(toml_source).unwrap();
         assert_eq!(
-            description.server_id,
+            description.machines[0].server_id,
             Some("infused_modbus-demo-plc".to_string())
         );
     }
 
     #[test]
     fn parse_treats_an_absent_server_id_as_none() {
-        let toml_source = "";
+        let toml_source = r#"
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+        "#;
         let description = DeviceDescription::parse(toml_source).unwrap();
-        assert_eq!(description.server_id, None);
+        assert_eq!(description.machines[0].server_id, None);
     }
 
     #[test]
     fn parse_reads_discrete_inputs_and_input_registers() {
         let toml_source = r#"
-            [discrete-inputs]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.discrete-inputs]
             base_address = 10000
 
-            [[discrete-inputs.entries]]
+            [[machines.discrete-inputs.entries]]
             name = "Door_Open_Sensor"
             offset = 1
 
-            [[discrete-inputs.entries]]
+            [[machines.discrete-inputs.entries]]
             name = "Emergency_Stop_Pressed"
             offset = 2
 
-            [input-registers]
+            [machines.input-registers]
             base_address = 30000
             mem-layout = "cdab"
 
-            [[input-registers.entries]]
+            [[machines.input-registers.entries]]
             name = "Flow_Rate"
             offset = 1
             data_type = "f32"
         "#;
 
         let description = DeviceDescription::parse(toml_source).unwrap();
+        let machine = &description.machines[0];
 
         assert_eq!(
-            description.discrete_inputs,
+            machine.discrete_inputs,
             vec![
                 DiscreteInputDescription {
                     name: "Door_Open_Sensor".to_string(),
@@ -587,52 +836,64 @@ mod tests {
             ]
         );
         assert_eq!(
-            description.input_registers,
+            machine.input_registers,
             vec![InputRegisterDescription {
                 name: "Flow_Rate".to_string(),
                 address: 30001,
                 data_type: DataType::F32,
             }]
         );
-        assert_eq!(description.input_register_mem_layout, MemLayout::Cdab);
+        assert_eq!(machine.input_register_mem_layout, MemLayout::Cdab);
     }
 
     #[test]
     fn parse_treats_an_absent_discrete_inputs_section_as_no_discrete_inputs() {
         let toml_source = r#"
-            [coils]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.coils]
             base_address = 0
 
-            [[coils.entries]]
+            [[machines.coils.entries]]
             name = "Motor_Running"
             offset = 1
         "#;
 
         let description = DeviceDescription::parse(toml_source).unwrap();
 
-        assert!(description.discrete_inputs.is_empty());
+        assert!(description.machines[0].discrete_inputs.is_empty());
     }
 
     #[test]
     fn parse_treats_an_absent_input_registers_section_as_no_input_registers() {
         let toml_source = r#"
-            [coils]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.coils]
             base_address = 0
 
-            [[coils.entries]]
+            [[machines.coils.entries]]
             name = "Motor_Running"
             offset = 1
         "#;
 
         let description = DeviceDescription::parse(toml_source).unwrap();
 
-        assert!(description.input_registers.is_empty());
+        assert!(description.machines[0].input_registers.is_empty());
     }
 
     #[test]
     fn parse_rejects_discrete_input_missing_base_address() {
         let toml_source = r#"
-            [[discrete-inputs.entries]]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [[machines.discrete-inputs.entries]]
             name = "Door_Open_Sensor"
             offset = 1
         "#;
@@ -643,7 +904,11 @@ mod tests {
     #[test]
     fn parse_rejects_input_register_missing_base_address() {
         let toml_source = r#"
-            [[input-registers.entries]]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [[machines.input-registers.entries]]
             name = "Flow_Rate"
             offset = 1
             data_type = "f32"
@@ -655,10 +920,14 @@ mod tests {
     #[test]
     fn parse_rejects_input_register_missing_mem_layout() {
         let toml_source = r#"
-            [input-registers]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.input-registers]
             base_address = 30000
 
-            [[input-registers.entries]]
+            [[machines.input-registers.entries]]
             name = "Flow_Rate"
             offset = 1
             data_type = "f32"
@@ -670,10 +939,14 @@ mod tests {
     #[test]
     fn parse_rejects_discrete_input_address_overflow() {
         let toml_source = r#"
-            [discrete-inputs]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.discrete-inputs]
             base_address = 65535
 
-            [[discrete-inputs.entries]]
+            [[machines.discrete-inputs.entries]]
             name = "Door_Open_Sensor"
             offset = 1
         "#;
@@ -693,11 +966,15 @@ mod tests {
     #[test]
     fn parse_rejects_input_register_address_overflow() {
         let toml_source = r#"
-            [input-registers]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.input-registers]
             base_address = 65535
             mem-layout = "abcd"
 
-            [[input-registers.entries]]
+            [[machines.input-registers.entries]]
             name = "Flow_Rate"
             offset = 1
             data_type = "f32"
@@ -718,77 +995,81 @@ mod tests {
     #[test]
     fn parse_reads_every_data_type() {
         let toml_source = r#"
-            [registers]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.registers]
             base_address = 0
             mem-layout = "abcd"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "A"
             offset = 0
             data_type = "u8"
             access = "read_only"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "B"
             offset = 1
             data_type = "i8"
             access = "read_only"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "C"
             offset = 2
             data_type = "u16"
             access = "read_only"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "D"
             offset = 3
             data_type = "i16"
             access = "read_only"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "E"
             offset = 4
             data_type = "u24"
             access = "read_only"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "F"
             offset = 5
             data_type = "i24"
             access = "read_only"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "G"
             offset = 6
             data_type = "u32"
             access = "read_only"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "H"
             offset = 7
             data_type = "i32"
             access = "read_only"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "I"
             offset = 8
             data_type = "u64"
             access = "read_only"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "J"
             offset = 9
             data_type = "i64"
             access = "read_only"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "K"
             offset = 10
             data_type = "f32"
             access = "read_only"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "L"
             offset = 11
             data_type = "f64"
@@ -797,7 +1078,7 @@ mod tests {
 
         let description = DeviceDescription::parse(toml_source).unwrap();
 
-        let data_types: Vec<DataType> = description
+        let data_types: Vec<DataType> = description.machines[0]
             .registers
             .iter()
             .map(|register| register.data_type)
@@ -831,11 +1112,15 @@ mod tests {
         ] {
             let toml_source = format!(
                 r#"
-                    [registers]
+                    [[machines]]
+                    name = "PumpA"
+                    unit_id = 1
+
+                    [machines.registers]
                     base_address = 0
                     mem-layout = "{tag}"
 
-                    [[registers.entries]]
+                    [[machines.registers.entries]]
                     name = "A"
                     offset = 0
                     data_type = "u16"
@@ -844,17 +1129,21 @@ mod tests {
             );
 
             let description = DeviceDescription::parse(&toml_source).unwrap();
-            assert_eq!(description.mem_layout, expected);
+            assert_eq!(description.machines[0].mem_layout, expected);
         }
     }
 
     #[test]
     fn parse_rejects_missing_mem_layout() {
         let toml_source = r#"
-            [registers]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.registers]
             base_address = 40000
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "Tank_Temperature"
             offset = 1
             data_type = "u16"
@@ -867,11 +1156,15 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_mem_layout() {
         let toml_source = r#"
-            [registers]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.registers]
             base_address = 40000
             mem-layout = "wxyz"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "Tank_Temperature"
             offset = 1
             data_type = "u16"
@@ -884,11 +1177,15 @@ mod tests {
     #[test]
     fn parse_treats_an_absent_coils_section_as_no_coils() {
         let toml_source = r#"
-            [registers]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.registers]
             base_address = 40000
             mem-layout = "abcd"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "Tank_Temperature"
             offset = 1
             data_type = "u16"
@@ -897,34 +1194,42 @@ mod tests {
 
         let description = DeviceDescription::parse(toml_source).unwrap();
 
-        assert!(description.coils.is_empty());
+        assert!(description.machines[0].coils.is_empty());
     }
 
     #[test]
     fn parse_treats_an_absent_registers_section_as_no_registers() {
         let toml_source = r#"
-            [coils]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.coils]
             base_address = 0
 
-            [[coils.entries]]
+            [[machines.coils.entries]]
             name = "Motor_Running"
             offset = 1
         "#;
 
         let description = DeviceDescription::parse(toml_source).unwrap();
 
-        assert!(description.registers.is_empty());
-        assert_eq!(description.coils.len(), 1);
+        assert!(description.machines[0].registers.is_empty());
+        assert_eq!(description.machines[0].coils.len(), 1);
     }
 
     #[test]
     fn parse_rejects_missing_required_field() {
         let toml_source = r#"
-            [registers]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.registers]
             base_address = 40000
             mem-layout = "abcd"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "Tank_Temperature"
             data_type = "u16"
             access = "read_only"
@@ -936,7 +1241,11 @@ mod tests {
     #[test]
     fn parse_rejects_missing_base_address() {
         let toml_source = r#"
-            [[registers.entries]]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [[machines.registers.entries]]
             name = "Tank_Temperature"
             offset = 1
             data_type = "u16"
@@ -949,7 +1258,11 @@ mod tests {
     #[test]
     fn parse_rejects_coil_missing_base_address() {
         let toml_source = r#"
-            [[coils.entries]]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [[machines.coils.entries]]
             name = "Motor_Running"
             offset = 1
         "#;
@@ -960,10 +1273,14 @@ mod tests {
     #[test]
     fn parse_rejects_coil_missing_offset() {
         let toml_source = r#"
-            [coils]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.coils]
             base_address = 0
 
-            [[coils.entries]]
+            [[machines.coils.entries]]
             name = "Motor_Running"
         "#;
 
@@ -973,11 +1290,15 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_data_type() {
         let toml_source = r#"
-            [registers]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.registers]
             base_address = 40000
             mem-layout = "abcd"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "Tank_Temperature"
             offset = 1
             data_type = "u128"
@@ -990,11 +1311,15 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_access_right() {
         let toml_source = r#"
-            [registers]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.registers]
             base_address = 40000
             mem-layout = "abcd"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "Tank_Temperature"
             offset = 1
             data_type = "u16"
@@ -1014,11 +1339,15 @@ mod tests {
     #[test]
     fn parse_rejects_address_overflow() {
         let toml_source = r#"
-            [registers]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.registers]
             base_address = 65535
             mem-layout = "abcd"
 
-            [[registers.entries]]
+            [[machines.registers.entries]]
             name = "Tank_Temperature"
             offset = 1
             data_type = "u16"
@@ -1040,10 +1369,14 @@ mod tests {
     #[test]
     fn parse_rejects_coil_address_overflow() {
         let toml_source = r#"
-            [coils]
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.coils]
             base_address = 65535
 
-            [[coils.entries]]
+            [[machines.coils.entries]]
             name = "Motor_Running"
             offset = 1
         "#;
