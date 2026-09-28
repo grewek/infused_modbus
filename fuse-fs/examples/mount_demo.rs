@@ -5,15 +5,22 @@
 // Usage:
 //   cargo run -p fuse-fs --example mount_demo -- <mountpoint> [device-description.toml]
 //
+// If given a TOML file, only its *first* configured machine is mounted —
+// this rig predates the multi-machine device description and is a manual
+// smoke-test tool, not a full multi-machine demo (see `client`/`server`'s
+// own `main.rs` for that). The mounted machine is always named "Demo", so
+// every path below is under <mountpoint>/Demo/ (every machine gets its own
+// top-level directory — see fuse_fs::filesystem::InfusedFilesystem).
+//
 // Then, in another terminal:
-//   ls <mountpoint>/holding-registers
-//   cat <mountpoint>/holding-registers/Tank_Temperature
-//   echo 0xbad > <mountpoint>/transactions/Stop_Process
-//   cat <mountpoint>/transactions/Stop_Process
-//   ls <mountpoint>/transactions
-//   rm <mountpoint>/transactions/Stop_Process
-//   touch <mountpoint>/transactions/TRANSACTION_END
-//   cat <mountpoint>/report/Stop_Process
+//   ls <mountpoint>/Demo/holding-registers
+//   cat <mountpoint>/Demo/holding-registers/Tank_Temperature
+//   echo 0xbad > <mountpoint>/Demo/transactions/Stop_Process
+//   cat <mountpoint>/Demo/transactions/Stop_Process
+//   ls <mountpoint>/Demo/transactions
+//   rm <mountpoint>/Demo/transactions/Stop_Process
+//   touch <mountpoint>/Demo/transactions/TRANSACTION_END
+//   cat <mountpoint>/Demo/report/Stop_Process
 //
 // There's no real Modbus device here, so "confirming" a transaction is
 // faked by a background thread that applies it to the store and reports it
@@ -22,7 +29,7 @@
 //
 // Ctrl+C to stop; the kernel unmounts automatically once the process exits.
 
-use fuse_fs::filesystem::{InfusedFilesystem, WriteMode};
+use fuse_fs::filesystem::{InfusedFilesystem, MachineConfig, WriteMode};
 use fuse_fs::{
     CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore,
     RegisterValue, StagedValue, WriteReport, WriteStatus,
@@ -30,7 +37,10 @@ use fuse_fs::{
 use protocol::device_description::{
     AccessRight, CoilDescription, DataType, DeviceDescription, RegisterDescription,
 };
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
+
+const DEMO_MACHINE_NAME: &str = "Demo";
 
 fn demo_registers() -> Vec<RegisterDescription> {
     vec![
@@ -75,11 +85,16 @@ fn main() {
                 .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
             let description = DeviceDescription::parse(&toml_source)
                 .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"));
+            let machine = description
+                .machines
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("{path} has no [[machines]] entries"));
             (
-                description.registers,
-                description.coils,
-                description.discrete_inputs,
-                description.input_registers,
+                machine.registers,
+                machine.coils,
+                machine.discrete_inputs,
+                machine.input_registers,
             )
         }
         None => (demo_registers(), demo_coils(), Vec::new(), Vec::new()),
@@ -103,12 +118,12 @@ fn main() {
     let report = Arc::new(Mutex::new(WriteReport::new()));
 
     let (transaction_sender, transaction_receiver) =
-        mpsc::channel::<std::collections::HashMap<String, StagedValue>>();
+        mpsc::channel::<(String, HashMap<String, StagedValue>)>();
     {
         let store = Arc::clone(&store);
         let report = Arc::clone(&report);
         std::thread::spawn(move || {
-            for transaction in transaction_receiver {
+            for (_machine_name, transaction) in transaction_receiver {
                 let mut store = store.lock().unwrap();
                 let mut report = report.lock().unwrap();
                 for (name, value) in transaction {
@@ -154,16 +169,16 @@ fn main() {
     println!("Mounting infused_modbus demo filesystem at {mountpoint}");
     println!();
     println!("Try, from another terminal:");
-    println!("  ls {mountpoint}/holding-registers");
-    println!("  cat {mountpoint}/holding-registers/Tank_Temperature");
-    println!("  ls {mountpoint}/coils");
-    println!("  cat {mountpoint}/coils/Motor_Running");
-    println!("  echo 0xbad > {mountpoint}/transactions/Stop_Process");
-    println!("  cat {mountpoint}/transactions/Stop_Process");
-    println!("  ls {mountpoint}/transactions");
-    println!("  rm {mountpoint}/transactions/Stop_Process");
-    println!("  touch {mountpoint}/transactions/TRANSACTION_END");
-    println!("  cat {mountpoint}/report/Stop_Process");
+    println!("  ls {mountpoint}/{DEMO_MACHINE_NAME}/holding-registers");
+    println!("  cat {mountpoint}/{DEMO_MACHINE_NAME}/holding-registers/Tank_Temperature");
+    println!("  ls {mountpoint}/{DEMO_MACHINE_NAME}/coils");
+    println!("  cat {mountpoint}/{DEMO_MACHINE_NAME}/coils/Motor_Running");
+    println!("  echo 0xbad > {mountpoint}/{DEMO_MACHINE_NAME}/transactions/Stop_Process");
+    println!("  cat {mountpoint}/{DEMO_MACHINE_NAME}/transactions/Stop_Process");
+    println!("  ls {mountpoint}/{DEMO_MACHINE_NAME}/transactions");
+    println!("  rm {mountpoint}/{DEMO_MACHINE_NAME}/transactions/Stop_Process");
+    println!("  touch {mountpoint}/{DEMO_MACHINE_NAME}/transactions/TRANSACTION_END");
+    println!("  cat {mountpoint}/{DEMO_MACHINE_NAME}/report/Stop_Process");
     println!();
     println!("Ctrl+C to stop (the kernel unmounts automatically on exit).");
 
@@ -171,24 +186,24 @@ fn main() {
     let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
     let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
 
-    let filesystem = InfusedFilesystem::new(
+    let machine = MachineConfig {
+        name: DEMO_MACHINE_NAME.to_string(),
         registers,
         coils,
         discrete_inputs,
         input_registers,
-        Vec::new(),
+        file_records: Vec::new(),
         store,
         coil_store,
         discrete_input_store,
         input_register_store,
         file_record_store,
-        transaction_sender,
         report,
-        None,
-        fuse_fs::permissions::FusePermissions::default(),
-        WriteMode::Staged,
-        None,
-    );
+        permissions: fuse_fs::permissions::FusePermissions::default(),
+        server_id: None,
+    };
+    let filesystem =
+        InfusedFilesystem::new(vec![machine], transaction_sender, WriteMode::Staged, None);
     let mut config = fuser::Config::default();
     config.mount_options = vec![fuser::MountOption::DefaultPermissions];
     fuser::mount(filesystem, &mountpoint, &config)
