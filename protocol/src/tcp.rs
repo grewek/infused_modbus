@@ -65,15 +65,22 @@ where
     Ok(response)
 }
 
-/// Reads one request off `stream`, passes its PDU bytes to `handler`, and
-/// writes the handler's response PDU back with the same transaction ID and
-/// unit ID. `timeout` bounds the read and the write as separate steps (see
-/// `with_timeout`) so a stalled peer can't tie up the connection forever;
-/// `handler` itself is not subject to `timeout`, since how long it's allowed
-/// to take is the caller's own business, not a network-peer concern.
-/// `handler` is PDU-agnostic here too — it's whoever calls this that
-/// knows how to turn request bytes into response bytes (e.g. an exception
-/// response's own bytes, if it wants to signal a Modbus-level error).
+/// Reads one request off `stream`, passes its unit ID and PDU bytes to
+/// `handler`, and writes the handler's response PDU back with the same
+/// transaction ID and unit ID — unless `handler` returns `None`, in which
+/// case nothing is written at all: this is how a caller that serves several
+/// machines on one link signals "no configured machine claims this unit
+/// ID", mirroring real RTU multi-drop bus behavior (an unaddressed slave
+/// stays silent; the master's own timeout handles it) rather than
+/// synthesizing an exception response for a case that isn't really about
+/// the function code at all. `timeout` bounds the read and the write as
+/// separate steps (see `with_timeout`) so a stalled peer can't tie up the
+/// connection forever; `handler` itself is not subject to `timeout`, since
+/// how long it's allowed to take is the caller's own business, not a
+/// network-peer concern. `handler` is PDU-agnostic here too — it's whoever
+/// calls this that knows how to turn request bytes into response bytes
+/// (e.g. an exception response's own bytes, if it wants to signal a
+/// Modbus-level error).
 pub async fn serve_request<S, H>(
     stream: &mut S,
     mut handler: H,
@@ -81,10 +88,12 @@ pub async fn serve_request<S, H>(
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    H: AsyncFnMut(&[u8]) -> Vec<u8>,
+    H: AsyncFnMut(u8, &[u8]) -> Option<Vec<u8>>,
 {
     let request = with_timeout(timeout, read_adu(stream)).await?;
-    let response_pdu = handler(&request.pdu).await;
+    let Some(response_pdu) = handler(request.unit_id, &request.pdu).await else {
+        return Ok(());
+    };
     let response = TcpAdu {
         transaction_id: request.transaction_id,
         unit_id: request.unit_id,
@@ -234,9 +243,10 @@ mod tests {
 
         serve_request(
             &mut server,
-            async move |pdu: &[u8]| {
+            async move |unit_id: u8, pdu: &[u8]| {
+                assert_eq!(unit_id, 0x01);
                 assert_eq!(pdu, &[0x03, 0x00, 0x00, 0x00, 0x0A]);
-                response_pdu.clone()
+                Some(response_pdu.clone())
             },
             Duration::from_secs(1),
         )
@@ -255,10 +265,49 @@ mod tests {
         // but idle: the peer never sends a request, it doesn't just vanish.
         let result = serve_request(
             &mut server,
-            async move |_pdu: &[u8]| Vec::new(),
+            async move |_unit_id: u8, _pdu: &[u8]| Some(Vec::new()),
             Duration::from_millis(50),
         )
         .await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn serve_request_writes_nothing_when_handler_returns_none() {
+        let (mut server, mut client) = tokio::io::duplex(1024);
+
+        let request = TcpAdu {
+            transaction_id: 0x0009,
+            unit_id: 0x02,
+            pdu: vec![0x03, 0x00, 0x00, 0x00, 0x0A],
+        };
+        let request_bytes = request.encode();
+
+        let client_task = tokio::spawn(async move {
+            client.write_all(&request_bytes).await.unwrap();
+            // No response should ever arrive — bound the read with a short
+            // timeout instead of blocking forever if this assumption is
+            // ever violated.
+            let mut buffer = [0u8; 1];
+            let read_result =
+                tokio::time::timeout(Duration::from_millis(100), client.read(&mut buffer)).await;
+            assert!(
+                read_result.is_err(),
+                "expected the read to time out (nothing written), but got {read_result:?}"
+            );
+        });
+
+        serve_request(
+            &mut server,
+            async move |unit_id: u8, _pdu: &[u8]| {
+                assert_eq!(unit_id, 0x02);
+                None
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        client_task.await.unwrap();
     }
 }

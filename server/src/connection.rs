@@ -3,14 +3,10 @@
 // handler::handle_request does) because each connection/port is served as
 // its own spawned tokio task, which needs 'static ownership.
 
-use crate::handler::handle_request;
+use crate::handler::{ServerMachineState, handle_request};
 use crate::server_options::ServerOptions;
-use fuse_fs::{CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore};
-use protocol::device_description::{
-    CoilDescription, DiscreteInputDescription, FileRecordDescription, InputRegisterDescription,
-    MemLayout, RegisterDescription,
-};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -20,68 +16,33 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// hardening — a stalled peer can't hang this forever). Ending the loop
 /// here just means this one connection is done — the accept loop that
 /// spawned this task keeps accepting new ones.
-#[allow(clippy::too_many_arguments)]
 pub async fn serve_tcp_connection<S>(
     mut stream: S,
     server_options: ServerOptions,
-    registers: Arc<Vec<RegisterDescription>>,
-    store: Arc<Mutex<RegisterStore>>,
-    coils: Arc<Vec<CoilDescription>>,
-    coil_store: Arc<Mutex<CoilStore>>,
-    discrete_inputs: Arc<Vec<DiscreteInputDescription>>,
-    discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
-    input_registers: Arc<Vec<InputRegisterDescription>>,
-    input_register_store: Arc<Mutex<InputRegisterStore>>,
-    file_records: Arc<Vec<FileRecordDescription>>,
-    file_record_store: Arc<Mutex<FileRecordStore>>,
-    mem_layout: MemLayout,
-    input_register_mem_layout: MemLayout,
+    machines: Arc<HashMap<u8, ServerMachineState>>,
     toml_source: Arc<String>,
-    server_id: Arc<Option<String>>,
     timeout: Duration,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
         // Clone the Arcs into the closure by value (not by reference) each
-        // iteration: an async closure that instead *borrows* `registers`/
-        // `store` from the surrounding scope runs into a higher-ranked
-        // Send inference issue ("implementation of Send is not general
-        // enough") once this whole function is spawned as its own task —
-        // owned clones sidestep it entirely, and Arc::clone is cheap.
-        // `mem_layout` is plain Copy data, no Arc needed.
-        let handler_registers = Arc::clone(&registers);
-        let handler_store = Arc::clone(&store);
-        let handler_coils = Arc::clone(&coils);
-        let handler_coil_store = Arc::clone(&coil_store);
-        let handler_discrete_inputs = Arc::clone(&discrete_inputs);
-        let handler_discrete_input_store = Arc::clone(&discrete_input_store);
-        let handler_input_registers = Arc::clone(&input_registers);
-        let handler_input_register_store = Arc::clone(&input_register_store);
-        let handler_file_records = Arc::clone(&file_records);
-        let handler_file_record_store = Arc::clone(&file_record_store);
+        // iteration: an async closure that instead *borrows* `machines`
+        // from the surrounding scope runs into a higher-ranked Send
+        // inference issue ("implementation of Send is not general enough")
+        // once this whole function is spawned as its own task — owned
+        // clones sidestep it entirely, and Arc::clone is cheap.
+        let handler_machines = Arc::clone(&machines);
         let handler_toml_source = Arc::clone(&toml_source);
-        let handler_server_id = Arc::clone(&server_id);
         let result = protocol::tcp::serve_request(
             &mut stream,
-            async move |pdu: &[u8]| {
+            async move |unit_id: u8, pdu: &[u8]| {
                 handle_request(
+                    unit_id,
                     pdu,
                     &server_options,
-                    &handler_registers,
-                    &handler_store,
-                    &handler_coils,
-                    &handler_coil_store,
-                    &handler_discrete_inputs,
-                    &handler_discrete_input_store,
-                    &handler_input_registers,
-                    &handler_input_register_store,
-                    &handler_file_records,
-                    &handler_file_record_store,
-                    mem_layout,
-                    input_register_mem_layout,
+                    &handler_machines,
                     &handler_toml_source,
-                    handler_server_id.as_deref(),
                 )
             },
             timeout,
@@ -101,62 +62,28 @@ pub async fn serve_tcp_connection<S>(
 /// breaking out of it: there's nothing else to fall back to or reconnect
 /// to, and one glitched frame shouldn't take the whole server offline
 /// until it's manually restarted.
-#[allow(clippy::too_many_arguments)]
 pub async fn serve_rtu_connection<S>(
     mut stream: S,
     server_options: ServerOptions,
-    registers: Arc<Vec<RegisterDescription>>,
-    store: Arc<Mutex<RegisterStore>>,
-    coils: Arc<Vec<CoilDescription>>,
-    coil_store: Arc<Mutex<CoilStore>>,
-    discrete_inputs: Arc<Vec<DiscreteInputDescription>>,
-    discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
-    input_registers: Arc<Vec<InputRegisterDescription>>,
-    input_register_store: Arc<Mutex<InputRegisterStore>>,
-    file_records: Arc<Vec<FileRecordDescription>>,
-    file_record_store: Arc<Mutex<FileRecordStore>>,
-    mem_layout: MemLayout,
-    input_register_mem_layout: MemLayout,
+    machines: Arc<HashMap<u8, ServerMachineState>>,
     toml_source: Arc<String>,
-    server_id: Arc<Option<String>>,
     frame_silence: Duration,
     timeout: Duration,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
-        let handler_registers = Arc::clone(&registers);
-        let handler_store = Arc::clone(&store);
-        let handler_coils = Arc::clone(&coils);
-        let handler_coil_store = Arc::clone(&coil_store);
-        let handler_discrete_inputs = Arc::clone(&discrete_inputs);
-        let handler_discrete_input_store = Arc::clone(&discrete_input_store);
-        let handler_input_registers = Arc::clone(&input_registers);
-        let handler_input_register_store = Arc::clone(&input_register_store);
-        let handler_file_records = Arc::clone(&file_records);
-        let handler_file_record_store = Arc::clone(&file_record_store);
+        let handler_machines = Arc::clone(&machines);
         let handler_toml_source = Arc::clone(&toml_source);
-        let handler_server_id = Arc::clone(&server_id);
         let result = protocol::rtu::serve_request(
             &mut stream,
-            async move |pdu: &[u8]| {
+            async move |unit_id: u8, pdu: &[u8]| {
                 handle_request(
+                    unit_id,
                     pdu,
                     &server_options,
-                    &handler_registers,
-                    &handler_store,
-                    &handler_coils,
-                    &handler_coil_store,
-                    &handler_discrete_inputs,
-                    &handler_discrete_input_store,
-                    &handler_input_registers,
-                    &handler_input_register_store,
-                    &handler_file_records,
-                    &handler_file_record_store,
-                    mem_layout,
-                    input_register_mem_layout,
+                    &handler_machines,
                     &handler_toml_source,
-                    handler_server_id.as_deref(),
                 )
             },
             frame_silence,
@@ -172,17 +99,23 @@ pub async fn serve_rtu_connection<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuse_fs::RegisterValue;
+    use fuse_fs::{
+        CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore,
+        RegisterValue,
+    };
     use protocol::adu::TcpAdu;
-    use protocol::device_description::{AccessRight, DataType};
+    use protocol::device_description::{AccessRight, DataType, MemLayout, RegisterDescription};
     use protocol::pdu::{
         ReadHoldingRegistersRequest, ReadHoldingRegistersResponse, WriteSingleRegisterRequest,
         WriteSingleRegisterResponse,
     };
+    use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn registers() -> Arc<Vec<RegisterDescription>> {
-        Arc::new(vec![
+    const TEST_UNIT_ID: u8 = 0x01;
+
+    fn registers() -> Vec<RegisterDescription> {
+        vec![
             RegisterDescription {
                 name: "Tank_Temperature".to_string(),
                 address: 40001,
@@ -195,39 +128,34 @@ mod tests {
                 data_type: DataType::U16,
                 access: AccessRight::ReadWrite,
             },
-        ])
+        ]
     }
 
-    fn coils() -> Arc<Vec<CoilDescription>> {
-        Arc::new(Vec::new())
-    }
-
-    fn coil_store() -> Arc<Mutex<CoilStore>> {
-        Arc::new(Mutex::new(CoilStore::new()))
-    }
-
-    fn discrete_inputs() -> Arc<Vec<DiscreteInputDescription>> {
-        Arc::new(Vec::new())
-    }
-
-    fn discrete_input_store() -> Arc<Mutex<DiscreteInputStore>> {
-        Arc::new(Mutex::new(DiscreteInputStore::new()))
-    }
-
-    fn input_registers() -> Arc<Vec<InputRegisterDescription>> {
-        Arc::new(Vec::new())
-    }
-
-    fn input_register_store() -> Arc<Mutex<InputRegisterStore>> {
-        Arc::new(Mutex::new(InputRegisterStore::new()))
-    }
-
-    fn file_records() -> Arc<Vec<FileRecordDescription>> {
-        Arc::new(Vec::new())
-    }
-
-    fn file_record_store() -> Arc<Mutex<FileRecordStore>> {
-        Arc::new(Mutex::new(FileRecordStore::new()))
+    // Bundles `registers()` plus `store` under `TEST_UNIT_ID` — every test
+    // request below addresses unit_id 0x01, matching this. `store` is
+    // taken by the caller (not built fresh here) so a test can keep its own
+    // handle to assert against after the connection has processed a write.
+    fn test_machines(store: Arc<Mutex<RegisterStore>>) -> Arc<HashMap<u8, ServerMachineState>> {
+        let mut machines = HashMap::new();
+        machines.insert(
+            TEST_UNIT_ID,
+            ServerMachineState {
+                registers: Arc::new(registers()),
+                store,
+                coils: Arc::new(Vec::new()),
+                coil_store: Arc::new(Mutex::new(CoilStore::new())),
+                discrete_inputs: Arc::new(Vec::new()),
+                discrete_input_store: Arc::new(Mutex::new(DiscreteInputStore::new())),
+                input_registers: Arc::new(Vec::new()),
+                input_register_store: Arc::new(Mutex::new(InputRegisterStore::new())),
+                file_records: Arc::new(Vec::new()),
+                file_record_store: Arc::new(Mutex::new(FileRecordStore::new())),
+                mem_layout: MemLayout::Abcd,
+                input_register_mem_layout: MemLayout::Abcd,
+                server_id: None,
+            },
+        );
+        Arc::new(machines)
     }
 
     #[tokio::test]
@@ -242,20 +170,8 @@ mod tests {
         tokio::spawn(serve_tcp_connection(
             server_stream,
             ServerOptions::allow_all(),
-            registers(),
-            Arc::clone(&store),
-            coils(),
-            coil_store(),
-            discrete_inputs(),
-            discrete_input_store(),
-            input_registers(),
-            input_register_store(),
-            file_records(),
-            file_record_store(),
-            MemLayout::Abcd,
-            MemLayout::Abcd,
+            test_machines(Arc::clone(&store)),
             Arc::new(String::new()),
-            Arc::new(None),
             Duration::from_secs(1),
         ));
 
@@ -292,20 +208,8 @@ mod tests {
         tokio::spawn(serve_tcp_connection(
             server_stream,
             ServerOptions::allow_all(),
-            registers(),
-            Arc::clone(&store),
-            coils(),
-            coil_store(),
-            discrete_inputs(),
-            discrete_input_store(),
-            input_registers(),
-            input_register_store(),
-            file_records(),
-            file_record_store(),
-            MemLayout::Abcd,
-            MemLayout::Abcd,
+            test_machines(Arc::clone(&store)),
             Arc::new(String::new()),
-            Arc::new(None),
             Duration::from_secs(1),
         ));
 
@@ -348,20 +252,8 @@ mod tests {
         tokio::spawn(serve_tcp_connection(
             server_stream,
             ServerOptions::allow_all(),
-            registers(),
-            Arc::clone(&store),
-            coils(),
-            coil_store(),
-            discrete_inputs(),
-            discrete_input_store(),
-            input_registers(),
-            input_register_store(),
-            file_records(),
-            file_record_store(),
-            MemLayout::Abcd,
-            MemLayout::Abcd,
+            test_machines(Arc::clone(&store)),
             Arc::new(String::new()),
-            Arc::new(None),
             Duration::from_secs(1),
         ));
 
@@ -406,20 +298,8 @@ mod tests {
         tokio::spawn(serve_rtu_connection(
             server_stream,
             ServerOptions::allow_all(),
-            registers(),
-            Arc::clone(&store),
-            coils(),
-            coil_store(),
-            discrete_inputs(),
-            discrete_input_store(),
-            input_registers(),
-            input_register_store(),
-            file_records(),
-            file_record_store(),
-            MemLayout::Abcd,
-            MemLayout::Abcd,
+            test_machines(Arc::clone(&store)),
             Arc::new(String::new()),
-            Arc::new(None),
             Duration::from_millis(20),
             Duration::from_secs(1),
         ));
@@ -457,20 +337,8 @@ mod tests {
         tokio::spawn(serve_rtu_connection(
             server_stream,
             ServerOptions::allow_all(),
-            registers(),
-            Arc::clone(&store),
-            coils(),
-            coil_store(),
-            discrete_inputs(),
-            discrete_input_store(),
-            input_registers(),
-            input_register_store(),
-            file_records(),
-            file_record_store(),
-            MemLayout::Abcd,
-            MemLayout::Abcd,
+            test_machines(Arc::clone(&store)),
             Arc::new(String::new()),
-            Arc::new(None),
             Duration::from_millis(20),
             Duration::from_secs(1),
         ));

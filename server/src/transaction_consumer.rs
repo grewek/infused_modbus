@@ -9,37 +9,46 @@
 // No async/Modbus-protocol involvement here at all, so this is plain
 // blocking code — meant to run on its own dedicated OS thread, same as the
 // client's version, just without needing a tokio runtime handle.
+//
+// One consumer thread services every configured machine's writes, reading a
+// single shared channel tagged with the originating machine's *name* (see
+// fuse-fs's multi-machine `InfusedFilesystem`/`MachineFs::commit_transaction`
+// — every send is tagged this way, since that's how a machine identifies
+// itself on the FUSE side; `unit_id`, by contrast, is only meaningful for
+// wire dispatch in `handler.rs`/`connection.rs`, a completely different
+// lookup key from this one).
 
-use fuse_fs::{
-    CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore, StagedValue,
-    WriteReport, WriteStatus,
-};
+use fuse_fs::{MachineStores, StagedValue, WriteStatus};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{PoisonError, mpsc};
 
-#[allow(clippy::too_many_arguments)]
 pub fn run_transaction_consumer(
-    store: &Arc<Mutex<RegisterStore>>,
-    coil_store: &Arc<Mutex<CoilStore>>,
-    discrete_input_store: &Arc<Mutex<DiscreteInputStore>>,
-    input_register_store: &Arc<Mutex<InputRegisterStore>>,
-    file_record_store: &Arc<Mutex<FileRecordStore>>,
-    report: &Arc<Mutex<WriteReport>>,
-    transaction_receiver: mpsc::Receiver<HashMap<String, StagedValue>>,
+    machines: &HashMap<String, MachineStores>,
+    transaction_receiver: mpsc::Receiver<(String, HashMap<String, StagedValue>)>,
 ) {
-    for transaction in transaction_receiver {
-        let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut coil_store = coil_store.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut discrete_input_store = discrete_input_store
+    for (machine_name, transaction) in transaction_receiver {
+        let Some(stores) = machines.get(&machine_name) else {
+            eprintln!("received a transaction for unknown machine {machine_name:?}, dropping it");
+            continue;
+        };
+        let mut store = stores
+            .registers
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let mut input_register_store = input_register_store
+        let mut coil_store = stores.coils.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut discrete_input_store = stores
+            .discrete_inputs
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let mut file_record_store = file_record_store
+        let mut input_register_store = stores
+            .input_registers
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let mut report = report.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut file_record_store = stores
+            .file_records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut report = stores.report.lock().unwrap_or_else(PoisonError::into_inner);
         for (name, value) in transaction {
             match value {
                 StagedValue::Register(value) => {
@@ -92,14 +101,20 @@ mod tests {
     use super::*;
     use fuse_fs::{CoilValue, RegisterValue};
 
+    const TEST_MACHINE_NAME: &str = "TestMachine";
+
+    fn test_machines(stores: MachineStores) -> HashMap<String, MachineStores> {
+        let mut machines = HashMap::new();
+        machines.insert(TEST_MACHINE_NAME.to_string(), stores);
+        machines
+    }
+
     #[test]
     fn applies_a_staged_transaction_directly_and_marks_it_ok() {
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
-        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
-        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
-        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
-        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let stores = MachineStores::new();
+        let store = stores.registers.clone();
+        let report = stores.report.clone();
+        let machines = test_machines(stores);
         let (sender, receiver) = mpsc::channel();
 
         let mut transaction = HashMap::new();
@@ -107,18 +122,12 @@ mod tests {
             "Stop_Process".to_string(),
             StagedValue::Register(RegisterValue::U16(1)),
         );
-        sender.send(transaction).unwrap();
+        sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(sender);
 
-        run_transaction_consumer(
-            &store,
-            &coil_store,
-            &discrete_input_store,
-            &input_register_store,
-            &file_record_store,
-            &report,
-            receiver,
-        );
+        run_transaction_consumer(&machines, receiver);
 
         assert_eq!(
             store.lock().unwrap().get("Stop_Process"),
@@ -132,12 +141,9 @@ mod tests {
 
     #[test]
     fn applies_f32_values_too_since_no_wire_encoding_is_involved_locally() {
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
-        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
-        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
-        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
-        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let stores = MachineStores::new();
+        let store = stores.registers.clone();
+        let machines = test_machines(stores);
         let (sender, receiver) = mpsc::channel();
 
         let mut transaction = HashMap::new();
@@ -145,18 +151,12 @@ mod tests {
             "Flow_Rate".to_string(),
             StagedValue::Register(RegisterValue::F32(3.5)),
         );
-        sender.send(transaction).unwrap();
+        sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(sender);
 
-        run_transaction_consumer(
-            &store,
-            &coil_store,
-            &discrete_input_store,
-            &input_register_store,
-            &file_record_store,
-            &report,
-            receiver,
-        );
+        run_transaction_consumer(&machines, receiver);
 
         assert_eq!(
             store.lock().unwrap().get("Flow_Rate"),
@@ -166,12 +166,10 @@ mod tests {
 
     #[test]
     fn applies_a_staged_coil_directly_and_marks_it_ok() {
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
-        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
-        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
-        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
-        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let stores = MachineStores::new();
+        let coil_store = stores.coils.clone();
+        let report = stores.report.clone();
+        let machines = test_machines(stores);
         let (sender, receiver) = mpsc::channel();
 
         let mut transaction = HashMap::new();
@@ -179,18 +177,12 @@ mod tests {
             "Motor_Running".to_string(),
             StagedValue::Coil(CoilValue(true)),
         );
-        sender.send(transaction).unwrap();
+        sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(sender);
 
-        run_transaction_consumer(
-            &store,
-            &coil_store,
-            &discrete_input_store,
-            &input_register_store,
-            &file_record_store,
-            &report,
-            receiver,
-        );
+        run_transaction_consumer(&machines, receiver);
 
         assert_eq!(
             coil_store.lock().unwrap().get("Motor_Running"),
@@ -204,12 +196,10 @@ mod tests {
 
     #[test]
     fn applies_a_staged_discrete_input_directly_and_marks_it_ok() {
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
-        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
-        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
-        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
-        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let stores = MachineStores::new();
+        let discrete_input_store = stores.discrete_inputs.clone();
+        let report = stores.report.clone();
+        let machines = test_machines(stores);
         let (sender, receiver) = mpsc::channel();
 
         let mut transaction = HashMap::new();
@@ -217,18 +207,12 @@ mod tests {
             "Door_Open_Sensor".to_string(),
             StagedValue::DiscreteInput(CoilValue(true)),
         );
-        sender.send(transaction).unwrap();
+        sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(sender);
 
-        run_transaction_consumer(
-            &store,
-            &coil_store,
-            &discrete_input_store,
-            &input_register_store,
-            &file_record_store,
-            &report,
-            receiver,
-        );
+        run_transaction_consumer(&machines, receiver);
 
         assert_eq!(
             discrete_input_store.lock().unwrap().get("Door_Open_Sensor"),
@@ -242,12 +226,10 @@ mod tests {
 
     #[test]
     fn applies_a_staged_input_register_directly_and_marks_it_ok() {
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
-        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
-        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
-        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
-        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let stores = MachineStores::new();
+        let input_register_store = stores.input_registers.clone();
+        let report = stores.report.clone();
+        let machines = test_machines(stores);
         let (sender, receiver) = mpsc::channel();
 
         let mut transaction = HashMap::new();
@@ -255,18 +237,12 @@ mod tests {
             "Flow_Rate".to_string(),
             StagedValue::InputRegister(RegisterValue::F32(3.5)),
         );
-        sender.send(transaction).unwrap();
+        sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(sender);
 
-        run_transaction_consumer(
-            &store,
-            &coil_store,
-            &discrete_input_store,
-            &input_register_store,
-            &file_record_store,
-            &report,
-            receiver,
-        );
+        run_transaction_consumer(&machines, receiver);
 
         assert_eq!(
             input_register_store.lock().unwrap().get("Flow_Rate"),
@@ -280,12 +256,10 @@ mod tests {
 
     #[test]
     fn applies_a_staged_file_record_directly_and_marks_it_ok() {
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
-        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
-        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
-        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
-        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let stores = MachineStores::new();
+        let file_record_store = stores.file_records.clone();
+        let report = stores.report.clone();
+        let machines = test_machines(stores);
         let (sender, receiver) = mpsc::channel();
 
         let mut transaction = HashMap::new();
@@ -297,23 +271,42 @@ mod tests {
                 value: vec![0xDE, 0xAD, 0xBE, 0xEF],
             },
         );
-        sender.send(transaction).unwrap();
+        sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(sender);
 
-        run_transaction_consumer(
-            &store,
-            &coil_store,
-            &discrete_input_store,
-            &input_register_store,
-            &file_record_store,
-            &report,
-            receiver,
-        );
+        run_transaction_consumer(&machines, receiver);
 
         assert_eq!(
             file_record_store.lock().unwrap().get(4, 1),
             Some(&vec![0xDE, 0xAD, 0xBE, 0xEF])
         );
         assert_eq!(report.lock().unwrap().get("4:1"), Some(&WriteStatus::Ok));
+    }
+
+    #[test]
+    fn a_transaction_for_an_unknown_machine_is_dropped_without_affecting_a_real_machine() {
+        let stores = MachineStores::new();
+        let report = stores.report.clone();
+        let machines = test_machines(stores);
+        let (sender, receiver) = mpsc::channel();
+
+        let mut transaction = HashMap::new();
+        transaction.insert(
+            "Stop_Process".to_string(),
+            StagedValue::Register(RegisterValue::U16(1)),
+        );
+        // Tagged with a machine name that isn't in `machines` — this must
+        // be dropped (logged, not panicked on) rather than misrouted to
+        // the one real configured machine, `TEST_MACHINE_NAME`.
+        sender
+            .send(("GhostMachine".to_string(), transaction))
+            .unwrap();
+        drop(sender);
+
+        run_transaction_consumer(&machines, receiver);
+
+        assert_eq!(report.lock().unwrap().get("Stop_Process"), None);
     }
 }

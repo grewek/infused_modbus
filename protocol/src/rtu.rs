@@ -124,11 +124,15 @@ where
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))
 }
 
-/// Reads one request off `stream`, passes its PDU bytes to `handler`, and
-/// writes the handler's response PDU back under the same unit ID —
-/// mirrors `tcp::serve_request`'s shape and hardening (bounded read/write
-/// steps; `handler` itself is not subject to a timeout, same reasoning as
-/// the TCP version).
+/// Reads one request off `stream`, passes its unit ID and PDU bytes to
+/// `handler`, and writes the handler's response PDU back under the same
+/// unit ID — unless `handler` returns `None`, in which case nothing is
+/// written at all: on a real multi-drop RTU bus, a slave that isn't
+/// addressed by this unit ID stays silent, so this mirrors that directly
+/// (see `tcp::serve_request`'s doc comment, which has the same shape and
+/// the same reasoning). Otherwise mirrors `tcp::serve_request`'s hardening
+/// (bounded read/write steps; `handler` itself is not subject to a
+/// timeout, same reasoning as the TCP version).
 pub async fn serve_request<S, H>(
     stream: &mut S,
     mut handler: H,
@@ -137,12 +141,14 @@ pub async fn serve_request<S, H>(
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    H: AsyncFnMut(&[u8]) -> Vec<u8>,
+    H: AsyncFnMut(u8, &[u8]) -> Option<Vec<u8>>,
 {
     let frame = read_rtu_frame(stream, frame_silence, timeout).await?;
     let request = RtuAdu::decode(&frame)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))?;
-    let response_pdu = handler(&request.pdu).await;
+    let Some(response_pdu) = handler(request.unit_id, &request.pdu).await else {
+        return Ok(());
+    };
     let response = RtuAdu {
         unit_id: request.unit_id,
         pdu: response_pdu,
@@ -266,9 +272,10 @@ mod tests {
 
         serve_request(
             &mut server,
-            async move |pdu: &[u8]| {
+            async move |unit_id: u8, pdu: &[u8]| {
+                assert_eq!(unit_id, 0x07);
                 assert_eq!(pdu, &[0x03, 0x00, 0x00, 0x00, 0x0A]);
-                response_pdu.clone()
+                Some(response_pdu.clone())
             },
             Duration::from_millis(20),
             Duration::from_secs(1),
@@ -286,12 +293,51 @@ mod tests {
 
         let result = serve_request(
             &mut server,
-            async move |_pdu: &[u8]| Vec::new(),
+            async move |_unit_id: u8, _pdu: &[u8]| Some(Vec::new()),
             Duration::from_millis(20),
             Duration::from_millis(50),
         )
         .await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn serve_request_writes_nothing_when_handler_returns_none() {
+        let (mut server, mut client) = tokio::io::duplex(1024);
+
+        let request = RtuAdu {
+            unit_id: 0x09,
+            pdu: vec![0x03, 0x00, 0x00, 0x00, 0x0A],
+        };
+        let request_bytes = request.encode();
+
+        let client_task = tokio::spawn(async move {
+            client.write_all(&request_bytes).await.unwrap();
+            // No response should ever arrive — bound the read with a short
+            // timeout instead of blocking forever if this assumption is
+            // ever violated.
+            let mut buffer = [0u8; 1];
+            let read_result =
+                tokio::time::timeout(Duration::from_millis(100), client.read(&mut buffer)).await;
+            assert!(
+                read_result.is_err(),
+                "expected the read to time out (nothing written), but got {read_result:?}"
+            );
+        });
+
+        serve_request(
+            &mut server,
+            async move |unit_id: u8, _pdu: &[u8]| {
+                assert_eq!(unit_id, 0x09);
+                None
+            },
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        client_task.await.unwrap();
     }
 
     #[tokio::test]

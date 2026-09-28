@@ -40,17 +40,13 @@
 // over the wire instead of needing its own local copy — see
 // device_identification.rs for the object layout.
 
-use fuse_fs::filesystem::{InfusedFilesystem, WriteMode};
-use fuse_fs::{
-    CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore, WriteReport,
-};
+use fuse_fs::filesystem::{InfusedFilesystem, MachineConfig, WriteMode};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
-use protocol::device_description::{
-    CoilDescription, DeviceDescription, DiscreteInputDescription, FileRecordDescription,
-    InputRegisterDescription, MemLayout, RegisterDescription,
-};
+use protocol::device_description::DeviceDescription;
 use server::connection::{serve_rtu_connection, serve_tcp_connection};
+use server::handler::ServerMachineState;
 use server::transaction_consumer::run_transaction_consumer;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -202,20 +198,8 @@ fn start_serving(
     runtime: &tokio::runtime::Runtime,
     connection_string: &str,
     server_options: server::server_options::ServerOptions,
-    registers: Arc<Vec<RegisterDescription>>,
-    store: Arc<Mutex<RegisterStore>>,
-    coils: Arc<Vec<CoilDescription>>,
-    coil_store: Arc<Mutex<CoilStore>>,
-    discrete_inputs: Arc<Vec<DiscreteInputDescription>>,
-    discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
-    input_registers: Arc<Vec<InputRegisterDescription>>,
-    input_register_store: Arc<Mutex<InputRegisterStore>>,
-    file_records: Arc<Vec<FileRecordDescription>>,
-    file_record_store: Arc<Mutex<FileRecordStore>>,
-    mem_layout: MemLayout,
-    input_register_mem_layout: MemLayout,
+    machines: Arc<HashMap<u8, ServerMachineState>>,
     toml_source: Arc<String>,
-    server_id: Arc<Option<String>>,
     client_trust: Arc<Mutex<fuse_fs::client_trust::ClientTrustState>>,
     approved_clients: Arc<Mutex<server::client_trust::ApprovedClients>>,
     live_connections: Arc<Mutex<server::live_connections::LiveConnections>>,
@@ -237,36 +221,14 @@ fn start_serving(
                         // limit) shouldn't take the whole server down.
                         Err(_) => continue,
                     };
-                    let registers = Arc::clone(&registers);
-                    let store = Arc::clone(&store);
-                    let coils = Arc::clone(&coils);
-                    let coil_store = Arc::clone(&coil_store);
-                    let discrete_inputs = Arc::clone(&discrete_inputs);
-                    let discrete_input_store = Arc::clone(&discrete_input_store);
-                    let input_registers = Arc::clone(&input_registers);
-                    let input_register_store = Arc::clone(&input_register_store);
-                    let file_records = Arc::clone(&file_records);
-                    let file_record_store = Arc::clone(&file_record_store);
+                    let machines = Arc::clone(&machines);
                     let toml_source = Arc::clone(&toml_source);
-                    let server_id = Arc::clone(&server_id);
                     tokio::spawn(async move {
                         serve_tcp_connection(
                             stream,
                             server_options,
-                            registers,
-                            store,
-                            coils,
-                            coil_store,
-                            discrete_inputs,
-                            discrete_input_store,
-                            input_registers,
-                            input_register_store,
-                            file_records,
-                            file_record_store,
-                            mem_layout,
-                            input_register_mem_layout,
+                            machines,
                             toml_source,
-                            server_id,
                             REQUEST_TIMEOUT,
                         )
                         .await;
@@ -318,18 +280,8 @@ fn start_serving(
                         Err(_) => continue,
                     };
                     let acceptor = acceptor.clone();
-                    let registers = Arc::clone(&registers);
-                    let store = Arc::clone(&store);
-                    let coils = Arc::clone(&coils);
-                    let coil_store = Arc::clone(&coil_store);
-                    let discrete_inputs = Arc::clone(&discrete_inputs);
-                    let discrete_input_store = Arc::clone(&discrete_input_store);
-                    let input_registers = Arc::clone(&input_registers);
-                    let input_register_store = Arc::clone(&input_register_store);
-                    let file_records = Arc::clone(&file_records);
-                    let file_record_store = Arc::clone(&file_record_store);
+                    let machines = Arc::clone(&machines);
                     let toml_source = Arc::clone(&toml_source);
-                    let server_id = Arc::clone(&server_id);
                     let live_connections = Arc::clone(&live_connections);
                     let connection_semaphore = Arc::clone(&connection_semaphore);
                     tokio::spawn(async move {
@@ -379,20 +331,8 @@ fn start_serving(
                             serve_tcp_connection(
                                 stream,
                                 server_options,
-                                registers,
-                                store,
-                                coils,
-                                coil_store,
-                                discrete_inputs,
-                                discrete_input_store,
-                                input_registers,
-                                input_register_store,
-                                file_records,
-                                file_record_store,
-                                mem_layout,
-                                input_register_mem_layout,
+                                machines,
                                 toml_source,
-                                server_id,
                                 REQUEST_TIMEOUT,
                             )
                             .await;
@@ -413,20 +353,8 @@ fn start_serving(
                             _ = serve_tcp_connection(
                                 stream,
                                 server_options,
-                                registers,
-                                store,
-                                coils,
-                                coil_store,
-                                discrete_inputs,
-                                discrete_input_store,
-                                input_registers,
-                                input_register_store,
-                                file_records,
-                                file_record_store,
-                                mem_layout,
-                                input_register_mem_layout,
+                                machines,
                                 toml_source,
-                                server_id,
                                 REQUEST_TIMEOUT,
                             ) => {}
                             // Resolves once `server admin revoke` drops this
@@ -461,20 +389,8 @@ fn start_serving(
                 serve_rtu_connection(
                     stream,
                     server_options,
-                    registers,
-                    store,
-                    coils,
-                    coil_store,
-                    discrete_inputs,
-                    discrete_input_store,
-                    input_registers,
-                    input_register_store,
-                    file_records,
-                    file_record_store,
-                    mem_layout,
-                    input_register_mem_layout,
+                    machines,
                     toml_source,
-                    server_id,
                     frame_silence,
                     REQUEST_TIMEOUT,
                 )
@@ -523,44 +439,58 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed to read {device_description_path}: {error}"));
     let description = DeviceDescription::parse(&toml_source)
         .unwrap_or_else(|error| panic!("failed to parse {device_description_path}: {error}"));
-    let registers = description.registers;
-    let coils = description.coils;
-    // Not yet wired into `handle_request`/the direct-write model (see
-    // CLAUDE.md's "read-only Modbus data types" and "server direct-write
-    // model" sections) — the directories exist and show the right file
-    // names, just with empty content until that lands.
-    let discrete_inputs = description.discrete_inputs;
-    let input_registers = description.input_registers;
-    let file_records = description.file_records;
-    let mem_layout = description.mem_layout;
-    let input_register_mem_layout = description.input_register_mem_layout;
-    let server_id = description.server_id;
 
-    let store = Arc::new(Mutex::new(RegisterStore::new()));
-    let coil_store = Arc::new(Mutex::new(CoilStore::new()));
-    let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
-    let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
-    let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
-    let report = Arc::new(Mutex::new(WriteReport::new()));
+    // One fresh set of stores per configured machine, name-keyed — shared
+    // by the transaction consumer (below) and the FUSE tree (further down).
+    // See fuse_fs::build_machine_stores.
+    let machine_stores: HashMap<String, fuse_fs::MachineStores> =
+        fuse_fs::build_machine_stores(&description.machines);
+
     let (transaction_sender, transaction_receiver) = mpsc::channel();
 
-    let consumer_store = Arc::clone(&store);
-    let consumer_coil_store = Arc::clone(&coil_store);
-    let consumer_discrete_input_store = Arc::clone(&discrete_input_store);
-    let consumer_input_register_store = Arc::clone(&input_register_store);
-    let consumer_file_record_store = Arc::clone(&file_record_store);
-    let consumer_report = Arc::clone(&report);
-    std::thread::spawn(move || {
-        run_transaction_consumer(
-            &consumer_store,
-            &consumer_coil_store,
-            &consumer_discrete_input_store,
-            &consumer_input_register_store,
-            &consumer_file_record_store,
-            &consumer_report,
-            transaction_receiver,
-        );
+    // One consumer thread services every machine's direct writes, reading a
+    // single shared channel tagged with the originating machine's name (see
+    // fuse-fs's multi-machine `InfusedFilesystem`).
+    std::thread::spawn({
+        let machine_stores = machine_stores.clone();
+        move || {
+            run_transaction_consumer(&machine_stores, transaction_receiver);
+        }
     });
+
+    // Unit-ID-keyed, separate from `machine_stores` above (which is
+    // name-keyed) — this is what `handle_request`/`start_serving` use to
+    // route an incoming request's `unit_id` to the right machine's static
+    // descriptions and stores. Two different keys for two different
+    // purposes: `machine_stores` by name (FUSE + transaction consumer),
+    // `machines` by unit_id (wire dispatch).
+    let machines: Arc<HashMap<u8, ServerMachineState>> = Arc::new(
+        description
+            .machines
+            .iter()
+            .map(|machine| {
+                let stores = &machine_stores[&machine.name];
+                (
+                    machine.unit_id,
+                    ServerMachineState {
+                        registers: Arc::new(machine.registers.clone()),
+                        store: Arc::clone(&stores.registers),
+                        coils: Arc::new(machine.coils.clone()),
+                        coil_store: Arc::clone(&stores.coils),
+                        discrete_inputs: Arc::new(machine.discrete_inputs.clone()),
+                        discrete_input_store: Arc::clone(&stores.discrete_inputs),
+                        input_registers: Arc::new(machine.input_registers.clone()),
+                        input_register_store: Arc::clone(&stores.input_registers),
+                        file_records: Arc::new(machine.file_records.clone()),
+                        file_record_store: Arc::clone(&stores.file_records),
+                        mem_layout: machine.mem_layout,
+                        input_register_mem_layout: machine.input_register_mem_layout,
+                        server_id: machine.server_id.clone(),
+                    },
+                )
+            })
+            .collect(),
+    );
 
     // Shared between the TLS handshake path (which logs connection
     // attempts and, later, checks approvals) and the FUSE `client-trust/`
@@ -638,53 +568,66 @@ fn main() {
         }
     });
 
+    let toml_source = Arc::new(toml_source);
+
     start_serving(
         &runtime,
         &connection_string,
         server_options,
-        Arc::new(registers.clone()),
-        Arc::clone(&store),
-        Arc::new(coils.clone()),
-        Arc::clone(&coil_store),
-        Arc::new(discrete_inputs.clone()),
-        Arc::clone(&discrete_input_store),
-        Arc::new(input_registers.clone()),
-        Arc::clone(&input_register_store),
-        Arc::new(file_records.clone()),
-        Arc::clone(&file_record_store),
-        mem_layout,
-        input_register_mem_layout,
-        Arc::new(toml_source.clone()),
-        Arc::new(server_id),
+        Arc::clone(&machines),
+        Arc::clone(&toml_source),
         Arc::clone(&client_trust),
         approved_clients,
         live_connections,
     );
 
     std::fs::create_dir_all(&mountpoint).ok();
-    println!("Mounting infused_modbus server at {mountpoint}, serving via {connection_string}");
+    let machine_names: Vec<&str> = description
+        .machines
+        .iter()
+        .map(|machine| machine.name.as_str())
+        .collect();
+    println!(
+        "Mounting infused_modbus server at {mountpoint}, serving via {connection_string} — machines: {}",
+        machine_names.join(", ")
+    );
+
+    let machines_for_fs: Vec<MachineConfig> = description
+        .machines
+        .into_iter()
+        .map(|machine| {
+            let stores = machine_stores
+                .get(&machine.name)
+                .expect("machine_stores was built from the same machine list");
+            MachineConfig {
+                name: machine.name,
+                registers: machine.registers,
+                coils: machine.coils,
+                discrete_inputs: machine.discrete_inputs,
+                input_registers: machine.input_registers,
+                file_records: machine.file_records,
+                store: Arc::clone(&stores.registers),
+                coil_store: Arc::clone(&stores.coils),
+                discrete_input_store: Arc::clone(&stores.discrete_inputs),
+                input_register_store: Arc::clone(&stores.input_registers),
+                file_record_store: Arc::clone(&stores.file_records),
+                report: Arc::clone(&stores.report),
+                permissions: fuse_permissions,
+                // Deliberately not `machine.server_id` — the server never
+                // mirrors its own configured server-id into its FUSE tree,
+                // only answers real FC11 requests with it (already carried
+                // into `ServerMachineState.server_id` above). See CLAUDE.md's
+                // "FC 0x11 (Report Server ID)" section.
+                server_id: None,
+            }
+        })
+        .collect();
 
     let filesystem = InfusedFilesystem::new(
-        registers,
-        coils,
-        discrete_inputs,
-        input_registers,
-        file_records,
-        store,
-        coil_store,
-        discrete_input_store,
-        input_register_store,
-        file_record_store,
+        machines_for_fs,
         transaction_sender,
-        report,
-        Some(client_trust),
-        fuse_permissions,
         WriteMode::Direct,
-        // Deliberately not `server_id` (already moved into `start_serving`
-        // above anyway) — the server never mirrors its own configured
-        // server-id into its FUSE tree, only answers real FC11 requests
-        // with it (see CLAUDE.md's "FC 0x11 (Report Server ID)" section).
-        None,
+        Some(client_trust),
     );
     // default_permissions makes the kernel actually enforce what getattr
     // reports (see fuse_fs::permissions) instead of every request being

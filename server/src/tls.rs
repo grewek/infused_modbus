@@ -546,14 +546,26 @@ mod tests {
             .lock()
             .unwrap()
             .set("Tank_Temperature", fuse_fs::RegisterValue::U16(72));
-        let coils = Arc::new(Vec::new());
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
-        let discrete_inputs = Arc::new(Vec::new());
-        let discrete_input_store = Arc::new(Mutex::new(fuse_fs::DiscreteInputStore::new()));
-        let input_registers = Arc::new(Vec::new());
-        let input_register_store = Arc::new(Mutex::new(fuse_fs::InputRegisterStore::new()));
-        let file_records = Arc::new(Vec::new());
-        let file_record_store = Arc::new(Mutex::new(fuse_fs::FileRecordStore::new()));
+        let mut machines = std::collections::HashMap::new();
+        machines.insert(
+            0x01,
+            crate::handler::ServerMachineState {
+                registers,
+                store,
+                coils: Arc::new(Vec::new()),
+                coil_store: Arc::new(Mutex::new(CoilStore::new())),
+                discrete_inputs: Arc::new(Vec::new()),
+                discrete_input_store: Arc::new(Mutex::new(fuse_fs::DiscreteInputStore::new())),
+                input_registers: Arc::new(Vec::new()),
+                input_register_store: Arc::new(Mutex::new(fuse_fs::InputRegisterStore::new())),
+                file_records: Arc::new(Vec::new()),
+                file_record_store: Arc::new(Mutex::new(fuse_fs::FileRecordStore::new())),
+                mem_layout: MemLayout::Abcd,
+                input_register_mem_layout: MemLayout::Abcd,
+                server_id: None,
+            },
+        );
+        let machines = Arc::new(machines);
 
         tokio::spawn(async move {
             let (tcp_stream, _peer) = listener.accept().await.unwrap();
@@ -561,20 +573,8 @@ mod tests {
             serve_tcp_connection(
                 tls_stream,
                 crate::server_options::ServerOptions::allow_all(),
-                registers,
-                store,
-                coils,
-                coil_store,
-                discrete_inputs,
-                discrete_input_store,
-                input_registers,
-                input_register_store,
-                file_records,
-                file_record_store,
-                MemLayout::Abcd,
-                MemLayout::Abcd,
+                machines,
                 Arc::new(String::new()),
-                Arc::new(None),
                 Duration::from_secs(1),
             )
             .await;

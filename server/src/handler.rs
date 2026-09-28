@@ -60,7 +60,8 @@ use protocol::pdu::{
     WriteSingleCoilRequest, WriteSingleCoilResponse, WriteSingleRegisterRequest,
     WriteSingleRegisterResponse,
 };
-use std::sync::{Mutex, PoisonError};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 // The spec caps a whole PDU at 253 bytes — same constant/reasoning as
 // device_identification::MAX_PDU_LEN, duplicated locally rather than
@@ -68,31 +69,56 @@ use std::sync::{Mutex, PoisonError};
 // project's extraction-based-programming convention).
 const MAX_PDU_LEN: usize = 253;
 
+/// One configured machine's full dispatch-time state — everything
+/// `handle_request` needs once it has resolved an incoming request's
+/// `unit_id` to a specific machine (see CLAUDE.md's multi-machine design).
+/// The caller owns one of these per configured machine in a
+/// `HashMap<u8, ServerMachineState>` keyed by that machine's `unit_id`.
+/// Description fields are `Arc<Vec<T>>` and store fields `Arc<Mutex<T>>` —
+/// matching `server::connection`'s existing convention for cheap sharing
+/// across spawned per-connection tasks.
+pub struct ServerMachineState {
+    pub registers: Arc<Vec<RegisterDescription>>,
+    pub store: Arc<Mutex<RegisterStore>>,
+    pub coils: Arc<Vec<CoilDescription>>,
+    pub coil_store: Arc<Mutex<CoilStore>>,
+    pub discrete_inputs: Arc<Vec<DiscreteInputDescription>>,
+    pub discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
+    pub input_registers: Arc<Vec<InputRegisterDescription>>,
+    pub input_register_store: Arc<Mutex<InputRegisterStore>>,
+    pub file_records: Arc<Vec<FileRecordDescription>>,
+    pub file_record_store: Arc<Mutex<FileRecordStore>>,
+    pub mem_layout: MemLayout,
+    pub input_register_mem_layout: MemLayout,
+    pub server_id: Option<String>,
+}
+
+/// Returns `None` when `unit_id` matches no configured machine and the
+/// function code needs one — mirrors real RTU multi-drop bus behavior (an
+/// unaddressed slave stays silent; the master's own timeout handles it)
+/// rather than synthesizing an exception for a case that isn't really
+/// about the function code at all (confirmed with the project owner
+/// directly, not assumed). FC 43 (Encapsulated Interface Transport) is the
+/// one exception: it answers with the whole multi-machine device
+/// description regardless of `unit_id`, since it's how a client bootstraps
+/// its knowledge of every machine before it even knows which unit_ids are
+/// valid (see CLAUDE.md's multi-machine section).
 #[allow(clippy::too_many_arguments)]
 pub fn handle_request(
+    unit_id: u8,
     pdu: &[u8],
     server_options: &ServerOptions,
-    registers: &[RegisterDescription],
-    store: &Mutex<RegisterStore>,
-    coils: &[CoilDescription],
-    coil_store: &Mutex<CoilStore>,
-    discrete_inputs: &[DiscreteInputDescription],
-    discrete_input_store: &Mutex<DiscreteInputStore>,
-    input_registers: &[InputRegisterDescription],
-    input_register_store: &Mutex<InputRegisterStore>,
-    file_records: &[FileRecordDescription],
-    file_record_store: &Mutex<FileRecordStore>,
-    mem_layout: MemLayout,
-    input_register_mem_layout: MemLayout,
+    machines: &HashMap<u8, ServerMachineState>,
     toml_source: &str,
-    server_id: Option<&str>,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let Some(&function_code) = pdu.first() else {
-        return ExceptionResponse {
-            function_code: 0,
-            exception_code: EXCEPTION_ILLEGAL_FUNCTION,
-        }
-        .encode();
+        return Some(
+            ExceptionResponse {
+                function_code: 0,
+                exception_code: EXCEPTION_ILLEGAL_FUNCTION,
+            }
+            .encode(),
+        );
     };
 
     // Every function code's availability is an explicit technician
@@ -100,57 +126,80 @@ pub fn handle_request(
     // function code gets the exact same ILLEGAL_FUNCTION exception as one
     // that isn't implemented at all, deliberately indistinguishable on the
     // wire so a remote peer can't fingerprint "implemented but disabled"
-    // apart from "never implemented".
+    // apart from "never implemented". Stays unit_id-independent: a
+    // disabled function code is disabled process-wide, regardless of which
+    // machine would've handled it.
     if !server_options.is_enabled(function_code) {
-        return ExceptionResponse {
-            function_code,
-            exception_code: EXCEPTION_ILLEGAL_FUNCTION,
-        }
-        .encode();
+        return Some(
+            ExceptionResponse {
+                function_code,
+                exception_code: EXCEPTION_ILLEGAL_FUNCTION,
+            }
+            .encode(),
+        );
     }
 
-    match function_code {
-        FUNCTION_CODE_READ_HOLDING_REGISTERS => handle_read(pdu, registers, store, mem_layout),
+    if function_code == FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT {
+        return Some(handle_encapsulated_interface_transport(pdu, toml_source));
+    }
+
+    let machine = machines.get(&unit_id)?;
+
+    Some(match function_code {
+        FUNCTION_CODE_READ_HOLDING_REGISTERS => {
+            handle_read(pdu, &machine.registers, &machine.store, machine.mem_layout)
+        }
         FUNCTION_CODE_WRITE_SINGLE_REGISTER => {
-            handle_write_single(pdu, registers, store, mem_layout)
+            handle_write_single(pdu, &machine.registers, &machine.store, machine.mem_layout)
         }
-        FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS => {
-            handle_write_multiple_registers(pdu, registers, store, mem_layout)
-        }
+        FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS => handle_write_multiple_registers(
+            pdu,
+            &machine.registers,
+            &machine.store,
+            machine.mem_layout,
+        ),
         FUNCTION_CODE_MASK_WRITE_REGISTER => {
-            handle_mask_write_register(pdu, registers, store, mem_layout)
+            handle_mask_write_register(pdu, &machine.registers, &machine.store, machine.mem_layout)
         }
-        FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS => {
-            handle_read_write_multiple_registers(pdu, registers, store, mem_layout)
+        FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS => handle_read_write_multiple_registers(
+            pdu,
+            &machine.registers,
+            &machine.store,
+            machine.mem_layout,
+        ),
+        FUNCTION_CODE_REPORT_SERVER_ID => {
+            handle_report_server_id(pdu, machine.server_id.as_deref())
         }
-        FUNCTION_CODE_REPORT_SERVER_ID => handle_report_server_id(pdu, server_id),
-        FUNCTION_CODE_READ_COILS => handle_read_coils(pdu, coils, coil_store),
-        FUNCTION_CODE_WRITE_SINGLE_COIL => handle_write_single_coil(pdu, coils, coil_store),
-        FUNCTION_CODE_WRITE_MULTIPLE_COILS => handle_write_multiple_coils(pdu, coils, coil_store),
-        FUNCTION_CODE_READ_DISCRETE_INPUTS => {
-            handle_read_discrete_inputs(pdu, discrete_inputs, discrete_input_store)
+        FUNCTION_CODE_READ_COILS => handle_read_coils(pdu, &machine.coils, &machine.coil_store),
+        FUNCTION_CODE_WRITE_SINGLE_COIL => {
+            handle_write_single_coil(pdu, &machine.coils, &machine.coil_store)
         }
+        FUNCTION_CODE_WRITE_MULTIPLE_COILS => {
+            handle_write_multiple_coils(pdu, &machine.coils, &machine.coil_store)
+        }
+        FUNCTION_CODE_READ_DISCRETE_INPUTS => handle_read_discrete_inputs(
+            pdu,
+            &machine.discrete_inputs,
+            &machine.discrete_input_store,
+        ),
         FUNCTION_CODE_READ_INPUT_REGISTERS => handle_read_input_registers(
             pdu,
-            input_registers,
-            input_register_store,
-            input_register_mem_layout,
+            &machine.input_registers,
+            &machine.input_register_store,
+            machine.input_register_mem_layout,
         ),
-        FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT => {
-            handle_encapsulated_interface_transport(pdu, toml_source)
-        }
         FUNCTION_CODE_READ_FILE_RECORD => {
-            handle_read_file_record(pdu, file_records, file_record_store)
+            handle_read_file_record(pdu, &machine.file_records, &machine.file_record_store)
         }
         FUNCTION_CODE_WRITE_FILE_RECORD => {
-            handle_write_file_record(pdu, file_records, file_record_store)
+            handle_write_file_record(pdu, &machine.file_records, &machine.file_record_store)
         }
         _ => ExceptionResponse {
             function_code,
             exception_code: EXCEPTION_ILLEGAL_FUNCTION,
         }
         .encode(),
-    }
+    })
 }
 
 // See device_identification.rs for the object layout and continuation
@@ -919,6 +968,62 @@ mod tests {
     use super::*;
     use protocol::pdu::{FileRecordSubRequest, WriteFileRecordSubRequest};
 
+    const TEST_UNIT_ID: u8 = 0x01;
+
+    // Every test below predates multi-machine dispatch and was written
+    // against `handle_request`'s old flat, single-machine signature. Rather
+    // than rewriting all ~49 call sites' argument lists, this wraps the new
+    // `handle_request(unit_id, pdu, server_options, machines, toml_source)`
+    // behind the old flat shape: bundles its arguments into one
+    // `ServerMachineState` under `TEST_UNIT_ID` and unwraps the `Option`
+    // (every existing test expects a real response, never the "unknown
+    // unit_id" `None` case — that's covered separately below by tests that
+    // call the real `handle_request` directly). Store parameters are
+    // `&Arc<Mutex<T>>` rather than the old bare `&Mutex<T>` so a test can
+    // still assert against the same store afterwards (`Arc::clone` shares
+    // the same underlying store, not a copy).
+    #[allow(clippy::too_many_arguments)]
+    fn test_handle_request(
+        pdu: &[u8],
+        server_options: &ServerOptions,
+        registers: &[RegisterDescription],
+        store: &Arc<Mutex<RegisterStore>>,
+        coils: &[CoilDescription],
+        coil_store: &Arc<Mutex<CoilStore>>,
+        discrete_inputs: &[DiscreteInputDescription],
+        discrete_input_store: &Arc<Mutex<DiscreteInputStore>>,
+        input_registers: &[InputRegisterDescription],
+        input_register_store: &Arc<Mutex<InputRegisterStore>>,
+        file_records: &[FileRecordDescription],
+        file_record_store: &Arc<Mutex<FileRecordStore>>,
+        mem_layout: MemLayout,
+        input_register_mem_layout: MemLayout,
+        toml_source: &str,
+        server_id: Option<&str>,
+    ) -> Vec<u8> {
+        let mut machines = HashMap::new();
+        machines.insert(
+            TEST_UNIT_ID,
+            ServerMachineState {
+                registers: Arc::new(registers.to_vec()),
+                store: Arc::clone(store),
+                coils: Arc::new(coils.to_vec()),
+                coil_store: Arc::clone(coil_store),
+                discrete_inputs: Arc::new(discrete_inputs.to_vec()),
+                discrete_input_store: Arc::clone(discrete_input_store),
+                input_registers: Arc::new(input_registers.to_vec()),
+                input_register_store: Arc::clone(input_register_store),
+                file_records: Arc::new(file_records.to_vec()),
+                file_record_store: Arc::clone(file_record_store),
+                mem_layout,
+                input_register_mem_layout,
+                server_id: server_id.map(str::to_string),
+            },
+        );
+        handle_request(TEST_UNIT_ID, pdu, server_options, &machines, toml_source)
+            .expect("TEST_UNIT_ID is always configured in this helper")
+    }
+
     fn registers() -> Vec<RegisterDescription> {
         vec![
             RegisterDescription {
@@ -1018,19 +1123,19 @@ mod tests {
 
     #[test]
     fn read_returns_current_store_values() {
-        let store = Mutex::new(RegisterStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
         store
             .lock()
             .unwrap()
             .set("Tank_Temperature", RegisterValue::U16(72));
-        let coil_store = Mutex::new(CoilStore::new());
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
 
         let request = ReadHoldingRegistersRequest {
             starting_address: 40001,
             quantity: 1,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1038,11 +1143,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1059,14 +1164,14 @@ mod tests {
 
     #[test]
     fn read_defaults_to_zero_for_a_register_with_no_value_yet() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = ReadHoldingRegistersRequest {
             starting_address: 40001,
             quantity: 1,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1074,11 +1179,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1094,14 +1199,14 @@ mod tests {
 
     #[test]
     fn read_of_unknown_address_returns_an_exception() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = ReadHoldingRegistersRequest {
             starting_address: 49999,
             quantity: 1,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1109,11 +1214,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1130,8 +1235,8 @@ mod tests {
 
     #[test]
     fn read_with_a_quantity_smaller_than_the_register_s_width_returns_an_exception() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         // Flow_Rate is F32 (2 registers wide) — asking for only 1 register
         // starting at its address can't be answered, since the value
         // doesn't fit in what was actually requested.
@@ -1140,7 +1245,7 @@ mod tests {
             quantity: 1,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1148,11 +1253,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1169,8 +1274,8 @@ mod tests {
 
     #[test]
     fn read_starting_mid_way_through_a_multi_register_value_returns_an_exception() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         // 40004 is Flow_Rate's second word (F32 spans 40003-40004), not a
         // register's own starting address — nothing is described as
         // starting there.
@@ -1179,7 +1284,7 @@ mod tests {
             quantity: 1,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1187,11 +1292,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1210,19 +1315,19 @@ mod tests {
     fn read_returns_a_correctly_assembled_multi_register_value() {
         use fuse_fs::register_encoding::register_value_from_words;
 
-        let store = Mutex::new(RegisterStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
         store
             .lock()
             .unwrap()
             .set("Flow_Rate", RegisterValue::F32(3.5));
-        let coil_store = Mutex::new(CoilStore::new());
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = ReadHoldingRegistersRequest {
             starting_address: 40003,
             quantity: 2,
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1230,11 +1335,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Cdab,
             MemLayout::Abcd,
             "",
@@ -1250,15 +1355,15 @@ mod tests {
 
     #[test]
     fn write_single_applies_to_the_store_and_echoes_the_request() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = WriteSingleRegisterRequest {
             register_address: 40002,
             register_value: 1,
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1266,11 +1371,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1292,15 +1397,15 @@ mod tests {
 
     #[test]
     fn write_single_to_a_read_only_register_returns_an_exception_and_does_not_apply() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = WriteSingleRegisterRequest {
             register_address: 40001,
             register_value: 99,
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1308,11 +1413,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1331,8 +1436,8 @@ mod tests {
 
     #[test]
     fn write_single_of_a_multi_register_type_returns_an_exception() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         // Precise_Value is F64 (4 registers wide) and read/write — Write
         // Single Register (FC6) can only ever carry one wire word, so
         // this can never succeed no matter the access rights.
@@ -1342,7 +1447,7 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1350,11 +1455,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1377,12 +1482,12 @@ mod tests {
         // Modbus spec's own worked example (Application Protocol V1.1b3,
         // section 6.8) — reused here rather than an arbitrary value so the
         // expected result is independently verifiable against the spec.
-        let store = Mutex::new(RegisterStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
         store
             .lock()
             .unwrap()
             .set("Stop_Process", RegisterValue::U16(0x0012));
-        let coil_store = Mutex::new(CoilStore::new());
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = MaskWriteRegisterRequest {
             reference_address: 40002,
             and_mask: 0x00F2,
@@ -1390,7 +1495,7 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1398,11 +1503,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1425,8 +1530,8 @@ mod tests {
 
     #[test]
     fn mask_write_register_to_a_read_only_register_returns_an_exception_and_does_not_apply() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = MaskWriteRegisterRequest {
             reference_address: 40001,
             and_mask: 0x0000,
@@ -1434,7 +1539,7 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1442,11 +1547,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1465,8 +1570,8 @@ mod tests {
 
     #[test]
     fn mask_write_register_of_a_multi_register_type_returns_an_exception() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         // Precise_Value is F64 (4 registers wide) and read/write — Mask
         // Write Register, like Write Single Register, can only ever carry
         // one wire word, so this can never succeed no matter the access
@@ -1478,7 +1583,7 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1486,11 +1591,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1509,11 +1614,11 @@ mod tests {
 
     #[test]
     fn report_server_id_responds_with_the_configured_id_when_present() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = ReportServerIdRequest.encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1521,11 +1626,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1543,11 +1648,11 @@ mod tests {
 
     #[test]
     fn report_server_id_without_a_configured_id_returns_an_exception() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = ReportServerIdRequest.encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1555,11 +1660,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1577,15 +1682,15 @@ mod tests {
 
     #[test]
     fn write_multiple_registers_applies_all_and_echoes_the_request() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = WriteMultipleRegistersRequest {
             starting_address: 40010,
             register_values: vec![11, 22],
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1593,11 +1698,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1625,8 +1730,8 @@ mod tests {
     fn write_multiple_registers_writes_a_correctly_assembled_multi_register_value() {
         use fuse_fs::register_encoding::register_value_to_words;
 
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let words = register_value_to_words(RegisterValue::F64(3.5), MemLayout::Dcba);
         let request = WriteMultipleRegistersRequest {
             starting_address: 40020,
@@ -1634,7 +1739,7 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1642,11 +1747,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Dcba,
             MemLayout::Abcd,
             "",
@@ -1668,8 +1773,8 @@ mod tests {
 
     #[test]
     fn write_multiple_registers_rejects_the_whole_batch_without_partial_apply_on_a_bad_address() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         // First address (40001, Tank_Temperature) is read-only and should
         // reject the whole request; the second address (40002,
         // Stop_Process) is writable on its own, so this also proves a
@@ -1680,7 +1785,7 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1688,11 +1793,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1717,12 +1822,12 @@ mod tests {
         // Writes and reads the *same* register in one request — the read
         // half must see the value this same request just wrote, not
         // whatever was there before.
-        let store = Mutex::new(RegisterStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
         store
             .lock()
             .unwrap()
             .set("Stop_Process", RegisterValue::U16(1));
-        let coil_store = Mutex::new(CoilStore::new());
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = ReadWriteMultipleRegistersRequest {
             read_starting_address: 40002,
             read_quantity: 1,
@@ -1731,7 +1836,7 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1739,11 +1844,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1764,12 +1869,12 @@ mod tests {
 
     #[test]
     fn read_write_multiple_registers_write_and_read_ranges_can_differ() {
-        let store = Mutex::new(RegisterStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
         store
             .lock()
             .unwrap()
             .set("Tank_Temperature", RegisterValue::U16(72));
-        let coil_store = Mutex::new(CoilStore::new());
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = ReadWriteMultipleRegistersRequest {
             read_starting_address: 40001,
             read_quantity: 1,
@@ -1778,7 +1883,7 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1786,11 +1891,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1815,8 +1920,8 @@ mod tests {
 
     #[test]
     fn read_write_multiple_registers_rejects_without_applying_when_the_write_half_is_invalid() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         // Tank_Temperature (40001) is read-only, so the write half must be
         // rejected — the (otherwise valid) read half must not run either,
         // and nothing should be applied.
@@ -1828,7 +1933,7 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1836,11 +1941,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1859,8 +1964,8 @@ mod tests {
 
     #[test]
     fn read_write_multiple_registers_rejects_without_applying_when_the_read_half_is_invalid() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         // The write half (Stop_Process, 40002) is perfectly valid on its
         // own; the read half targets an address with no register at all.
         // The whole request must still be rejected, and the write must
@@ -1874,7 +1979,7 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1882,11 +1987,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1905,11 +2010,11 @@ mod tests {
 
     #[test]
     fn unimplemented_function_code_returns_illegal_function() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         // Report Server ID (0x11) — not implemented at all.
         let request = vec![0x11, 0x00, 0x00, 0x00, 0x01];
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1917,11 +2022,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1938,9 +2043,9 @@ mod tests {
 
     #[test]
     fn empty_pdu_returns_illegal_function_without_panicking() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let response = handle_request(
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let response = test_handle_request(
             &[],
             &ServerOptions::allow_all(),
             &registers(),
@@ -1948,11 +2053,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -1971,15 +2076,15 @@ mod tests {
             ReadDeviceIdentificationResponse,
         };
 
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = ReadDeviceIdentificationRequest {
             read_device_id_code: READ_DEVICE_ID_EXTENDED,
             object_id: 0x80,
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -1987,11 +2092,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "name = \"X\"",
@@ -2004,9 +2109,80 @@ mod tests {
     }
 
     #[test]
+    fn an_unconfigured_unit_id_gets_no_response_at_all() {
+        // Mirrors real RTU multi-drop bus behavior: an unaddressed slave
+        // stays silent rather than answering with an exception, since
+        // "wrong device address" isn't really about the function code at
+        // all (confirmed with the project owner, see handle_request's own
+        // doc comment).
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let machines = {
+            let mut machines = HashMap::new();
+            machines.insert(
+                TEST_UNIT_ID,
+                ServerMachineState {
+                    registers: Arc::new(registers()),
+                    store,
+                    coils: Arc::new(coils()),
+                    coil_store,
+                    discrete_inputs: Arc::new(Vec::new()),
+                    discrete_input_store: Arc::new(Mutex::new(DiscreteInputStore::new())),
+                    input_registers: Arc::new(Vec::new()),
+                    input_register_store: Arc::new(Mutex::new(InputRegisterStore::new())),
+                    file_records: Arc::new(Vec::new()),
+                    file_record_store: Arc::new(Mutex::new(FileRecordStore::new())),
+                    mem_layout: MemLayout::Abcd,
+                    input_register_mem_layout: MemLayout::Abcd,
+                    server_id: None,
+                },
+            );
+            machines
+        };
+
+        let request = ReadHoldingRegistersRequest {
+            starting_address: 40001,
+            quantity: 1,
+        }
+        .encode();
+        let unconfigured_unit_id = TEST_UNIT_ID.wrapping_add(1);
+        let response = handle_request(
+            unconfigured_unit_id,
+            &request,
+            &ServerOptions::allow_all(),
+            &machines,
+            "",
+        );
+
+        assert_eq!(response, None);
+    }
+
+    #[test]
+    fn fc43_answers_regardless_of_unit_id_even_with_no_machines_configured() {
+        use protocol::pdu::{READ_DEVICE_ID_EXTENDED, ReadDeviceIdentificationRequest};
+
+        let machines: HashMap<u8, ServerMachineState> = HashMap::new();
+        let request = ReadDeviceIdentificationRequest {
+            read_device_id_code: READ_DEVICE_ID_EXTENDED,
+            object_id: 0x80,
+        }
+        .encode();
+
+        let response = handle_request(
+            0xFF, // no machine configured at all, not even TEST_UNIT_ID
+            &request,
+            &ServerOptions::allow_all(),
+            &machines,
+            "name = \"X\"",
+        );
+
+        assert!(response.is_some());
+    }
+
+    #[test]
     fn read_coils_returns_current_store_values() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         coil_store
             .lock()
             .unwrap()
@@ -2017,7 +2193,7 @@ mod tests {
             quantity: 2,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2025,11 +2201,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2046,14 +2222,14 @@ mod tests {
 
     #[test]
     fn read_coils_defaults_to_false_for_a_coil_with_no_value_yet() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = ReadCoilsRequest {
             starting_address: 1,
             quantity: 1,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2061,11 +2237,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2081,14 +2257,14 @@ mod tests {
 
     #[test]
     fn read_coils_of_unknown_address_returns_an_exception() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = ReadCoilsRequest {
             starting_address: 99,
             quantity: 1,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2096,11 +2272,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2117,15 +2293,15 @@ mod tests {
 
     #[test]
     fn write_single_coil_applies_to_the_store_and_echoes_the_request() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = WriteSingleCoilRequest {
             coil_address: 1,
             coil_value: true,
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2133,11 +2309,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2159,15 +2335,15 @@ mod tests {
 
     #[test]
     fn write_single_coil_of_unknown_address_returns_an_exception_and_does_not_apply() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = WriteSingleCoilRequest {
             coil_address: 99,
             coil_value: true,
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2175,11 +2351,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2197,15 +2373,15 @@ mod tests {
 
     #[test]
     fn write_multiple_coils_applies_all_and_echoes_the_request() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let request = WriteMultipleCoilsRequest {
             starting_address: 1,
             coil_values: vec![true, false],
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2213,11 +2389,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2243,8 +2419,8 @@ mod tests {
 
     #[test]
     fn write_multiple_coils_rejects_the_whole_batch_without_partial_apply_on_a_bad_address() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         // Address 1 (Motor_Running) is valid, but address 2 doesn't exist
         // in this fixture beyond Alarm_Reset — use an out-of-range third
         // address instead so the batch starts valid and then rejects.
@@ -2254,7 +2430,7 @@ mod tests {
         }
         .encode();
 
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2262,11 +2438,11 @@ mod tests {
             &coils(),
             &coil_store,
             &Vec::new(),
-            &Mutex::new(DiscreteInputStore::new()),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
             &Vec::new(),
-            &Mutex::new(InputRegisterStore::new()),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2286,21 +2462,21 @@ mod tests {
 
     #[test]
     fn read_discrete_inputs_returns_current_store_values() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
         discrete_input_store
             .lock()
             .unwrap()
             .set("Door_Open_Sensor", CoilValue(true));
-        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
 
         let request = ReadDiscreteInputsRequest {
             starting_address: 1,
             quantity: 2,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2312,7 +2488,7 @@ mod tests {
             &input_registers(),
             &input_register_store,
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2329,17 +2505,17 @@ mod tests {
 
     #[test]
     fn read_discrete_inputs_defaults_to_false_for_an_input_with_no_value_yet() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
 
         let request = ReadDiscreteInputsRequest {
             starting_address: 1,
             quantity: 1,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2351,7 +2527,7 @@ mod tests {
             &input_registers(),
             &input_register_store,
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2368,17 +2544,17 @@ mod tests {
 
     #[test]
     fn read_discrete_inputs_of_unknown_address_returns_an_exception() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
 
         let request = ReadDiscreteInputsRequest {
             starting_address: 99,
             quantity: 1,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2390,7 +2566,7 @@ mod tests {
             &input_registers(),
             &input_register_store,
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2408,10 +2584,10 @@ mod tests {
 
     #[test]
     fn read_input_registers_returns_current_store_values() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
         input_register_store
             .lock()
             .unwrap()
@@ -2422,7 +2598,7 @@ mod tests {
             quantity: 1,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2434,7 +2610,7 @@ mod tests {
             &input_registers(),
             &input_register_store,
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2451,17 +2627,17 @@ mod tests {
 
     #[test]
     fn read_input_registers_defaults_to_zero_for_a_register_with_no_value_yet() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
 
         let request = ReadInputRegistersRequest {
             starting_address: 30001,
             quantity: 1,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2473,7 +2649,7 @@ mod tests {
             &input_registers(),
             &input_register_store,
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2492,10 +2668,10 @@ mod tests {
     fn read_input_registers_returns_a_correctly_assembled_multi_register_value() {
         use fuse_fs::register_encoding::register_value_from_words;
 
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
         input_register_store
             .lock()
             .unwrap()
@@ -2506,7 +2682,7 @@ mod tests {
             quantity: 2,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2518,7 +2694,7 @@ mod tests {
             &input_registers(),
             &input_register_store,
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Cdab,
             "",
@@ -2534,17 +2710,17 @@ mod tests {
 
     #[test]
     fn read_input_registers_of_unknown_address_returns_an_exception() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
 
         let request = ReadInputRegistersRequest {
             starting_address: 39999,
             quantity: 1,
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2556,7 +2732,7 @@ mod tests {
             &input_registers(),
             &input_register_store,
             &Vec::new(),
-            &Mutex::new(FileRecordStore::new()),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
             MemLayout::Abcd,
             MemLayout::Abcd,
             "",
@@ -2574,11 +2750,11 @@ mod tests {
 
     #[test]
     fn read_file_record_returns_stored_bytes_for_every_sub_request() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
-        let file_record_store = Mutex::new(FileRecordStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
         file_record_store
             .lock()
             .unwrap()
@@ -2603,7 +2779,7 @@ mod tests {
             ],
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2632,11 +2808,11 @@ mod tests {
 
     #[test]
     fn read_file_record_defaults_to_zero_filled_bytes_when_unset() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
-        let file_record_store = Mutex::new(FileRecordStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
 
         let request = ReadFileRecordRequest {
             sub_requests: vec![FileRecordSubRequest {
@@ -2646,7 +2822,7 @@ mod tests {
             }],
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2675,11 +2851,11 @@ mod tests {
 
     #[test]
     fn read_file_record_of_unknown_file_number_returns_an_exception() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
-        let file_record_store = Mutex::new(FileRecordStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
 
         let request = ReadFileRecordRequest {
             sub_requests: vec![FileRecordSubRequest {
@@ -2689,7 +2865,7 @@ mod tests {
             }],
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2719,11 +2895,11 @@ mod tests {
 
     #[test]
     fn read_file_record_with_wrong_record_length_returns_an_exception() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
-        let file_record_store = Mutex::new(FileRecordStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
 
         // file_records() declares (4, 1) with record_length 2, not 3.
         let request = ReadFileRecordRequest {
@@ -2734,7 +2910,7 @@ mod tests {
             }],
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2764,11 +2940,11 @@ mod tests {
 
     #[test]
     fn read_file_record_rejects_a_response_that_would_exceed_the_pdu_limit() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
-        let file_record_store = Mutex::new(FileRecordStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
         // 200 words = 400 data bytes alone, already past the 253-byte PDU
         // cap once the response header/sub-response framing is added.
         let oversized_file_records = vec![FileRecordDescription {
@@ -2785,7 +2961,7 @@ mod tests {
             }],
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2815,11 +2991,11 @@ mod tests {
 
     #[test]
     fn read_file_record_is_rejected_when_disabled_via_server_options() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
-        let file_record_store = Mutex::new(FileRecordStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
 
         let request = ReadFileRecordRequest {
             sub_requests: vec![FileRecordSubRequest {
@@ -2829,7 +3005,7 @@ mod tests {
             }],
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::default(),
             &registers(),
@@ -2859,11 +3035,11 @@ mod tests {
 
     #[test]
     fn write_file_record_applies_every_sub_request_and_echoes_the_request() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
-        let file_record_store = Mutex::new(FileRecordStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
 
         let sub_requests = vec![
             WriteFileRecordSubRequest {
@@ -2881,7 +3057,7 @@ mod tests {
             sub_requests: sub_requests.clone(),
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2916,11 +3092,11 @@ mod tests {
 
     #[test]
     fn write_file_record_of_unknown_file_number_returns_an_exception_and_writes_nothing() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
-        let file_record_store = Mutex::new(FileRecordStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
 
         let request = WriteFileRecordRequest {
             sub_requests: vec![WriteFileRecordSubRequest {
@@ -2930,7 +3106,7 @@ mod tests {
             }],
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -2961,11 +3137,11 @@ mod tests {
 
     #[test]
     fn write_file_record_with_wrong_record_length_returns_an_exception() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
-        let file_record_store = Mutex::new(FileRecordStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
 
         // file_records() declares (4, 1) with record_length 2 (4 bytes),
         // not 1 (2 bytes).
@@ -2977,7 +3153,7 @@ mod tests {
             }],
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -3007,11 +3183,11 @@ mod tests {
 
     #[test]
     fn write_file_record_rejects_the_whole_batch_when_one_sub_request_is_invalid() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
-        let file_record_store = Mutex::new(FileRecordStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
 
         // First sub-request is valid, second references an unknown record —
         // the whole request must be rejected, and the valid one must not
@@ -3031,7 +3207,7 @@ mod tests {
             ],
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
             &registers(),
@@ -3062,11 +3238,11 @@ mod tests {
 
     #[test]
     fn write_file_record_is_rejected_when_disabled_via_server_options() {
-        let store = Mutex::new(RegisterStore::new());
-        let coil_store = Mutex::new(CoilStore::new());
-        let discrete_input_store = Mutex::new(DiscreteInputStore::new());
-        let input_register_store = Mutex::new(InputRegisterStore::new());
-        let file_record_store = Mutex::new(FileRecordStore::new());
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
+        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
+        let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
 
         let request = WriteFileRecordRequest {
             sub_requests: vec![WriteFileRecordSubRequest {
@@ -3076,7 +3252,7 @@ mod tests {
             }],
         }
         .encode();
-        let response = handle_request(
+        let response = test_handle_request(
             &request,
             &ServerOptions::default(),
             &registers(),
