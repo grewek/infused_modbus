@@ -921,8 +921,25 @@ impl ReportServerIdResponse {
     }
 }
 
+// The spec's own limit on how many registers Read/Write Multiple Registers
+// (0x17) may *write* — lower than plain Write Multiple Registers' 123
+// (WriteMultipleRegistersRequest's own MAX_WRITE_MULTIPLE_REGISTERS_COUNT),
+// since this PDU's extra read-address/read-quantity/write-address fields eat
+// into the same 253-byte PDU budget. Same reason this needs enforcing as
+// that constant's own doc comment: write_quantity is a wire u16 and
+// write_byte_count a wire u8 (write_values.len() * 2), so an over-long
+// write_values would otherwise silently truncate through the `as u16`/
+// `as u8` casts below instead of failing loudly.
+const MAX_READ_WRITE_MULTIPLE_REGISTERS_WRITE_COUNT: usize = 121;
+
 impl ReadWriteMultipleRegistersRequest {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
+        if self.write_values.len() > MAX_READ_WRITE_MULTIPLE_REGISTERS_WRITE_COUNT {
+            return Err(EncodeError::TooManyRegisters {
+                count: self.write_values.len(),
+                max: MAX_READ_WRITE_MULTIPLE_REGISTERS_WRITE_COUNT,
+            });
+        }
         let mut buffer =
             Vec::with_capacity(READ_WRITE_REQUEST_HEADER_LEN + self.write_values.len() * 2);
         buffer.push(FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS);
@@ -935,7 +952,7 @@ impl ReadWriteMultipleRegistersRequest {
         for value in &self.write_values {
             buffer.extend_from_slice(&value.to_be_bytes());
         }
-        buffer
+        Ok(buffer)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
@@ -2349,7 +2366,7 @@ mod tests {
             write_starting_address: 0x000E,
             write_values: vec![0x00FF, 0x00FF],
         };
-        let encoded = request.encode();
+        let encoded = request.encode().unwrap();
         let decoded = ReadWriteMultipleRegistersRequest::decode(&encoded).unwrap();
         assert_eq!(request, decoded);
     }
@@ -2363,11 +2380,39 @@ mod tests {
             write_values: vec![0x00FF, 0x00FF],
         };
         assert_eq!(
-            request.encode(),
+            request.encode().unwrap(),
             vec![
                 0x17, 0x00, 0x03, 0x00, 0x02, 0x00, 0x0E, 0x00, 0x02, 0x04, 0x00, 0xFF, 0x00, 0xFF
             ]
         );
+    }
+
+    #[test]
+    fn read_write_multiple_registers_request_encode_rejects_more_than_121_write_values() {
+        let request = ReadWriteMultipleRegistersRequest {
+            read_starting_address: 0x0003,
+            read_quantity: 0x0002,
+            write_starting_address: 0x000E,
+            write_values: vec![0; 122],
+        };
+        assert_eq!(
+            request.encode(),
+            Err(EncodeError::TooManyRegisters {
+                count: 122,
+                max: 121
+            })
+        );
+    }
+
+    #[test]
+    fn read_write_multiple_registers_request_encode_accepts_exactly_121_write_values() {
+        let request = ReadWriteMultipleRegistersRequest {
+            read_starting_address: 0x0003,
+            read_quantity: 0x0002,
+            write_starting_address: 0x000E,
+            write_values: vec![0; 121],
+        };
+        assert!(request.encode().is_ok());
     }
 
     #[test]

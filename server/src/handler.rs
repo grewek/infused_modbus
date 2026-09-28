@@ -1837,7 +1837,8 @@ mod tests {
             write_starting_address: 40002,
             write_values: vec![42],
         }
-        .encode();
+        .encode()
+        .unwrap();
 
         let response = test_handle_request(
             &request,
@@ -1884,7 +1885,8 @@ mod tests {
             write_starting_address: 40010,
             write_values: vec![11, 22],
         }
-        .encode();
+        .encode()
+        .unwrap();
 
         let response = test_handle_request(
             &request,
@@ -1934,7 +1936,8 @@ mod tests {
             write_starting_address: 40001,
             write_values: vec![99],
         }
-        .encode();
+        .encode()
+        .unwrap();
 
         let response = test_handle_request(
             &request,
@@ -1980,7 +1983,8 @@ mod tests {
             write_starting_address: 40002,
             write_values: vec![5],
         }
-        .encode();
+        .encode()
+        .unwrap();
 
         let response = test_handle_request(
             &request,
