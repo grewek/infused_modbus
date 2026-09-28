@@ -44,19 +44,25 @@
 // Every register DataType is read (polling.rs) and written
 // (write_confirmation.rs/transaction_consumer.rs) over the wire now, honoring
 // the device description's mem_layout for anything wider than one register.
-// One persistent connection is shared between polling and writes, with no
-// reconnect logic. RTU's serial parameters beyond baud rate (data bits,
-// parity, stop bits) aren't configurable yet — this uses tokio-serial's
-// defaults (8 data bits, no parity, 1 stop bit).
+// One persistent connection is shared between polling and writes. If it
+// breaks (server restart, network blip, unplugged serial adapter, ...),
+// client::reconnect's dedicated background task notices (via polling, which
+// runs continuously regardless of write activity) and redials with
+// exponential backoff, retrying forever — see client/src/reconnect.rs's own
+// doc comment. RTU's serial parameters beyond baud rate (data bits, parity,
+// stop bits) aren't configurable yet — this uses tokio-serial's defaults (8
+// data bits, no parity, 1 stop bit).
 
 use client::connection::Connection;
 use client::device_identification::fetch_device_description;
 use client::polling::run_polling_loop;
+use client::reconnect::{ReconnectSignal, run_reconnect_loop};
 use client::transaction_consumer::{MachineTransactionConfig, run_transaction_consumer};
 use fuse_fs::filesystem::{InfusedFilesystem, WriteMode};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::DeviceDescription;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -120,40 +126,35 @@ fn extract_fuse_permissions(args: &mut Vec<String>) -> fuse_fs::permissions::Fus
 
 fn open_connection(
     runtime: &tokio::runtime::Runtime,
-    connection_string: &str,
+    target: &ConnectionTarget,
     expected_server_fingerprint: Option<protocol::tls::Fingerprint>,
 ) -> Connection {
-    let target =
-        parse_connection_string(connection_string).unwrap_or_else(|error| panic!("{error}"));
-    match target {
-        ConnectionTarget::Tcp { address } => runtime
-            .block_on(Connection::connect_tcp(&address))
-            .unwrap_or_else(|error| panic!("failed to connect to {address}: {error}")),
-        ConnectionTarget::TlsTcp { address } => {
-            // Not yet policed by the server (client approval is milestone
-            // N) — presenting it now proves the two-sided mTLS handshake
-            // itself works (M2) ahead of any real approval decision.
-            let client_identity = protocol::tls::load_or_generate_identity(std::path::Path::new(
-                CLIENT_TLS_IDENTITY_DIRECTORY,
-            ))
-            .unwrap_or_else(|error| panic!("failed to load/generate client TLS identity: {error}"));
-            println!(
-                "Client TLS fingerprint: {}",
-                protocol::tls::Fingerprint::of(&client_identity.public_key_der)
-            );
-            runtime
-                .block_on(Connection::connect_tls(
-                    &address,
-                    expected_server_fingerprint,
-                    Some(client_identity),
-                ))
-                .unwrap_or_else(|error| panic!("failed to connect over TLS to {address}: {error}"))
-        }
-        ConnectionTarget::Rtu { path, baud_rate } => {
-            Connection::open_rtu(runtime.handle(), &path, baud_rate)
-                .unwrap_or_else(|error| panic!("failed to open serial port {path:?}: {error}"))
-        }
+    if matches!(target, ConnectionTarget::TlsTcp { .. }) {
+        // Not yet policed by the server (client approval is milestone N) —
+        // presenting it now proves the two-sided mTLS handshake itself
+        // works (M2) ahead of any real approval decision. Printed once
+        // here at startup, ahead of it actually being presented, so the
+        // value's ready before it's needed — `client::reconnect::redial`
+        // loads the same persisted identity again on every reconnect
+        // attempt but doesn't reprint it, to avoid repeating this on every
+        // retry.
+        let client_identity = protocol::tls::load_or_generate_identity(std::path::Path::new(
+            CLIENT_TLS_IDENTITY_DIRECTORY,
+        ))
+        .unwrap_or_else(|error| panic!("failed to load/generate client TLS identity: {error}"));
+        println!(
+            "Client TLS fingerprint: {}",
+            protocol::tls::Fingerprint::of(&client_identity.public_key_der)
+        );
     }
+    runtime
+        .block_on(client::reconnect::redial(
+            runtime.handle(),
+            target,
+            expected_server_fingerprint,
+            std::path::Path::new(CLIENT_TLS_IDENTITY_DIRECTORY),
+        ))
+        .unwrap_or_else(|error| panic!("failed to connect via {target:?}: {error}"))
 }
 
 fn main() {
@@ -197,8 +198,11 @@ fn main() {
     let local_toml_source = std::fs::read_to_string(&device_description_path)
         .unwrap_or_else(|error| panic!("failed to read {device_description_path}: {error}"));
 
+    let connection_target =
+        parse_connection_string(&connection_string).unwrap_or_else(|error| panic!("{error}"));
+
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");
-    let mut connection = open_connection(&runtime, &connection_string, expected_server_fingerprint);
+    let mut connection = open_connection(&runtime, &connection_target, expected_server_fingerprint);
 
     // Ask the server to "introduce itself" (FC 43) before doing anything
     // else with the connection — see client/src/device_identification.rs.
@@ -227,6 +231,20 @@ fn main() {
     // multi-machine design: a single CLI-supplied connection string, each
     // machine dispatching via its own `unit_id` on that shared link.
     let connection = Arc::new(AsyncMutex::new(connection));
+
+    // Heals `connection` in the background if it ever breaks — see
+    // client/src/reconnect.rs's own doc comment. One signal/task per
+    // process, shared by every machine's polling task (spawned below) and
+    // the transaction consumer, exactly like `connection` itself is.
+    let reconnect_signal = Arc::new(ReconnectSignal::new());
+    runtime.spawn(run_reconnect_loop(
+        Arc::clone(&connection),
+        Arc::clone(&reconnect_signal),
+        runtime.handle().clone(),
+        connection_target,
+        expected_server_fingerprint,
+        PathBuf::from(CLIENT_TLS_IDENTITY_DIRECTORY),
+    ));
 
     // One fresh set of stores per configured machine — see
     // fuse_fs::build_machine_stores.
@@ -289,6 +307,7 @@ fn main() {
         let mem_layout = machine.mem_layout;
         let input_register_mem_layout = machine.input_register_mem_layout;
         let machine_unit_id = machine.unit_id;
+        let polling_reconnect_signal = Arc::clone(&reconnect_signal);
         runtime.spawn(async move {
             run_polling_loop(
                 polling_connection,
@@ -307,6 +326,7 @@ fn main() {
                 machine_unit_id,
                 poll_interval,
                 POLL_TIMEOUT,
+                polling_reconnect_signal,
             )
             .await;
         });

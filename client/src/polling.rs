@@ -23,6 +23,7 @@
 
 use crate::batching::{Batch, build_batches};
 use crate::connection::Connection;
+use crate::reconnect::ReconnectSignal;
 use fuse_fs::register_encoding::register_value_from_words;
 use fuse_fs::{
     CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore,
@@ -121,6 +122,7 @@ pub async fn poll_coils_once(
     coil_store: &Arc<Mutex<CoilStore>>,
     unit_id: u8,
     timeout: Duration,
+    reconnect_signal: &Arc<ReconnectSignal>,
 ) {
     for batch in batches {
         let request_pdu = ReadCoilsRequest {
@@ -142,6 +144,7 @@ pub async fn poll_coils_once(
                     batch.quantity(),
                     batch.starting_address
                 );
+                reconnect_signal.mark_broken();
                 continue;
             }
         };
@@ -176,6 +179,7 @@ pub async fn poll_discrete_inputs_once(
     discrete_input_store: &Arc<Mutex<DiscreteInputStore>>,
     unit_id: u8,
     timeout: Duration,
+    reconnect_signal: &Arc<ReconnectSignal>,
 ) {
     for batch in batches {
         let request_pdu = ReadDiscreteInputsRequest {
@@ -197,6 +201,7 @@ pub async fn poll_discrete_inputs_once(
                     batch.quantity(),
                     batch.starting_address
                 );
+                reconnect_signal.mark_broken();
                 continue;
             }
         };
@@ -236,6 +241,7 @@ pub async fn poll_once(
     mem_layout: MemLayout,
     unit_id: u8,
     timeout: Duration,
+    reconnect_signal: &Arc<ReconnectSignal>,
 ) {
     for batch in batches {
         let request_pdu = ReadHoldingRegistersRequest {
@@ -257,6 +263,7 @@ pub async fn poll_once(
                     batch.quantity(),
                     batch.starting_address
                 );
+                reconnect_signal.mark_broken();
                 continue;
             }
         };
@@ -300,6 +307,7 @@ pub async fn poll_input_registers_once(
     input_register_mem_layout: MemLayout,
     unit_id: u8,
     timeout: Duration,
+    reconnect_signal: &Arc<ReconnectSignal>,
 ) {
     for batch in batches {
         let request_pdu = ReadInputRegistersRequest {
@@ -321,6 +329,7 @@ pub async fn poll_input_registers_once(
                     batch.quantity(),
                     batch.starting_address
                 );
+                reconnect_signal.mark_broken();
                 continue;
             }
         };
@@ -375,6 +384,7 @@ pub async fn poll_file_records_once(
     file_record_store: &Arc<Mutex<FileRecordStore>>,
     unit_id: u8,
     timeout: Duration,
+    reconnect_signal: &Arc<ReconnectSignal>,
 ) {
     for description in file_records {
         let request_pdu = ReadFileRecordRequest {
@@ -398,6 +408,7 @@ pub async fn poll_file_records_once(
                     "poll: read of file record {}:{} failed: {error}",
                     description.file_number, description.record_number
                 );
+                reconnect_signal.mark_broken();
                 continue;
             }
         };
@@ -444,6 +455,7 @@ pub async fn run_polling_loop(
     unit_id: u8,
     poll_interval: Duration,
     timeout: Duration,
+    reconnect_signal: Arc<ReconnectSignal>,
 ) {
     let register_batches = build_read_batches(registers);
     let coil_batches = build_coil_read_batches(coils);
@@ -459,15 +471,25 @@ pub async fn run_polling_loop(
             mem_layout,
             unit_id,
             timeout,
+            &reconnect_signal,
         )
         .await;
-        poll_coils_once(&connection, &coil_batches, &coil_store, unit_id, timeout).await;
+        poll_coils_once(
+            &connection,
+            &coil_batches,
+            &coil_store,
+            unit_id,
+            timeout,
+            &reconnect_signal,
+        )
+        .await;
         poll_discrete_inputs_once(
             &connection,
             &discrete_input_batches,
             &discrete_input_store,
             unit_id,
             timeout,
+            &reconnect_signal,
         )
         .await;
         poll_input_registers_once(
@@ -477,6 +499,7 @@ pub async fn run_polling_loop(
             input_register_mem_layout,
             unit_id,
             timeout,
+            &reconnect_signal,
         )
         .await;
         poll_file_records_once(
@@ -485,6 +508,7 @@ pub async fn run_polling_loop(
             &file_record_store,
             unit_id,
             timeout,
+            &reconnect_signal,
         )
         .await;
     }
@@ -728,6 +752,10 @@ mod tests {
         (connection, device)
     }
 
+    fn test_reconnect_signal() -> Arc<ReconnectSignal> {
+        Arc::new(ReconnectSignal::new())
+    }
+
     #[tokio::test]
     async fn poll_once_applies_a_successful_batch_to_the_store() {
         let (connection, mut device) = connected_pair().await;
@@ -762,6 +790,7 @@ mod tests {
             MemLayout::Abcd,
             0x01,
             Duration::from_secs(1),
+            &test_reconnect_signal(),
         )
         .await;
 
@@ -777,6 +806,7 @@ mod tests {
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         let batches = build_read_batches(&[register("A", 40001, DataType::U16)]);
 
+        let reconnect_signal = test_reconnect_signal();
         poll_once(
             &connection,
             &batches,
@@ -784,10 +814,12 @@ mod tests {
             MemLayout::Abcd,
             0x01,
             Duration::from_millis(50),
+            &reconnect_signal,
         )
         .await;
 
         assert_eq!(store.lock().unwrap().get("A"), None);
+        assert!(reconnect_signal.is_broken());
     }
 
     #[tokio::test]
@@ -824,6 +856,7 @@ mod tests {
             MemLayout::Cdab,
             0x01,
             Duration::from_secs(1),
+            &test_reconnect_signal(),
         )
         .await;
 
@@ -864,6 +897,7 @@ mod tests {
             &coil_store,
             0x01,
             Duration::from_secs(1),
+            &test_reconnect_signal(),
         )
         .await;
 
@@ -879,16 +913,19 @@ mod tests {
         let coil_store = Arc::new(Mutex::new(CoilStore::new()));
         let batches = build_coil_read_batches(&[coil("A", 1)]);
 
+        let reconnect_signal = test_reconnect_signal();
         poll_coils_once(
             &connection,
             &batches,
             &coil_store,
             0x01,
             Duration::from_millis(50),
+            &reconnect_signal,
         )
         .await;
 
         assert_eq!(coil_store.lock().unwrap().get("A"), None);
+        assert!(reconnect_signal.is_broken());
     }
 
     #[tokio::test]
@@ -922,6 +959,7 @@ mod tests {
             &discrete_input_store,
             0x01,
             Duration::from_secs(1),
+            &test_reconnect_signal(),
         )
         .await;
 
@@ -943,16 +981,19 @@ mod tests {
         let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
         let batches = build_discrete_input_read_batches(&[discrete_input("A", 1)]);
 
+        let reconnect_signal = test_reconnect_signal();
         poll_discrete_inputs_once(
             &connection,
             &batches,
             &discrete_input_store,
             0x01,
             Duration::from_millis(50),
+            &reconnect_signal,
         )
         .await;
 
         assert_eq!(discrete_input_store.lock().unwrap().get("A"), None);
+        assert!(reconnect_signal.is_broken());
     }
 
     #[tokio::test]
@@ -989,6 +1030,7 @@ mod tests {
             MemLayout::Abcd,
             0x01,
             Duration::from_secs(1),
+            &test_reconnect_signal(),
         )
         .await;
 
@@ -1011,6 +1053,7 @@ mod tests {
         let batches =
             build_input_register_read_batches(&[input_register("A", 30001, DataType::U16)]);
 
+        let reconnect_signal = test_reconnect_signal();
         poll_input_registers_once(
             &connection,
             &batches,
@@ -1018,10 +1061,12 @@ mod tests {
             MemLayout::Abcd,
             0x01,
             Duration::from_millis(50),
+            &reconnect_signal,
         )
         .await;
 
         assert_eq!(input_register_store.lock().unwrap().get("A"), None);
+        assert!(reconnect_signal.is_broken());
     }
 
     #[tokio::test]
@@ -1054,6 +1099,7 @@ mod tests {
             &file_record_store,
             0x01,
             Duration::from_secs(1),
+            &test_reconnect_signal(),
         )
         .await;
 
@@ -1096,6 +1142,7 @@ mod tests {
             &file_record_store,
             0x01,
             Duration::from_secs(1),
+            &test_reconnect_signal(),
         )
         .await;
 
@@ -1117,15 +1164,18 @@ mod tests {
         let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
         let file_records = vec![file_record(4, 1, 2)];
 
+        let reconnect_signal = test_reconnect_signal();
         poll_file_records_once(
             &connection,
             &file_records,
             &file_record_store,
             0x01,
             Duration::from_millis(50),
+            &reconnect_signal,
         )
         .await;
 
         assert_eq!(file_record_store.lock().unwrap().get(4, 1), None);
+        assert!(reconnect_signal.is_broken());
     }
 }
