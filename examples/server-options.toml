@@ -1,0 +1,22 @@
+# Enables exactly the function codes examples/device-description.toml's
+# data needs to be exercised end-to-end. See the "server-options.toml"
+# section in the top-level README.md — every function code defaults to
+# disabled unless explicitly listed here, so this file has to exist (and
+# be passed via --server-options) or the server answers ILLEGAL_FUNCTION
+# to everything.
+
+[function-codes]
+read_coils = true                      # 0x01
+read_discrete_inputs = true            # 0x02
+read_holding_registers = true          # 0x03
+read_input_registers = true            # 0x04
+write_single_coil = true               # 0x05
+write_single_register = true           # 0x06
+write_multiple_coils = true            # 0x0F
+write_multiple_registers = true        # 0x10
+report_server_id = true                # 0x11
+read_file_record = true                # 0x14
+write_file_record = true               # 0x15
+mask_write_register = true             # 0x16
+read_write_multiple_registers = true   # 0x17
+read_device_identification = true      # 0x2B / MEI 0x0E

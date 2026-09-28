@@ -90,6 +90,8 @@ This lists every public function code defined by the Modbus Application Protocol
 
 ## Getting started
 
+Want to skip straight to running something real? [`examples/`](examples/) has a ready-to-use, two-machine `device-description.toml` (plus a matching `server-options.toml`) and a full copy-pasteable walkthrough — no edits needed.
+
 ### Build
 
 ```sh

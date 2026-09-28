@@ -1,0 +1,107 @@
+# Example multi-machine device description — two pumps sharing one link,
+# each answering its own Modbus Unit ID (see the "Device description TOML
+# format" section in the top-level README.md, and CLAUDE.md's "Multi-machine
+# device description & FUSE layout" for the design behind it).
+#
+# Run it directly, no edits needed — see examples/README.md for the full
+# walkthrough:
+#
+#   cargo run -p server -- /tmp/infused-modbus-server examples/device-description.toml tcp://127.0.0.1:15020 --server-options examples/server-options.toml
+#   cargo run -p client -- /tmp/infused-modbus-client examples/device-description.toml tcp://127.0.0.1:15020
+#
+# PumpA exercises every data type this project supports (holding registers
+# of several widths, coils, a discrete input, an input register, a file
+# record, and its own server-id); PumpB is deliberately minimal, to show
+# that a second machine doesn't need to repeat everything PumpA declares.
+
+[[machines]]
+name = "PumpA"
+unit_id = 1
+server-id = "infused_modbus-pump-a"
+
+[machines.registers]
+base_address = 40000
+mem-layout = "abcd"
+
+[[machines.registers.entries]]
+name = "Tank_Temperature"
+offset = 1
+data_type = "u16"
+access = "read_only"
+
+[[machines.registers.entries]]
+name = "Flow_Rate"
+offset = 2
+data_type = "f32"
+access = "read_only"
+
+[[machines.registers.entries]]
+name = "Stop_Process"
+offset = 4
+data_type = "u16"
+access = "read_write"
+
+[[machines.registers.entries]]
+name = "Setpoint"
+offset = 5
+data_type = "u16"
+access = "read_write"
+
+[machines.coils]
+base_address = 0
+
+[[machines.coils.entries]]
+name = "Motor_Running"
+offset = 1
+
+[[machines.coils.entries]]
+name = "Alarm_Reset"
+offset = 2
+
+[machines.discrete-inputs]
+base_address = 10000
+
+[[machines.discrete-inputs.entries]]
+name = "Door_Open_Sensor"
+offset = 1
+
+[machines.input-registers]
+base_address = 30000
+mem-layout = "abcd"
+
+[[machines.input-registers.entries]]
+name = "Line_Pressure"
+offset = 1
+data_type = "f32"
+
+[[machines.file-records]]
+file_number = 20
+record_number = 5
+record_length = 9
+
+[[machines]]
+name = "PumpB"
+unit_id = 2
+
+[machines.registers]
+base_address = 40000
+mem-layout = "abcd"
+
+[[machines.registers.entries]]
+name = "Tank_Temperature"
+offset = 1
+data_type = "u16"
+access = "read_only"
+
+[[machines.registers.entries]]
+name = "Stop_Process"
+offset = 2
+data_type = "u16"
+access = "read_write"
+
+[machines.coils]
+base_address = 0
+
+[[machines.coils.entries]]
+name = "Motor_Running"
+offset = 1
