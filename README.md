@@ -35,6 +35,7 @@ Nothing here shipped without a human decision behind it, but essentially all of 
 - **A `transactions/<name>` file can stage a Mask Write Register instead of a plain value**, atomically setting/clearing specific bits in a real device's register without needing to know its current contents first — client-only, see [Interacting with the filesystem](#interacting-with-the-filesystem).
 - **Client TLS certificates require server-side approval.** Over `tls+tcp://`, the server requires every connecting client to present a certificate, and only ones an operator has explicitly approved are allowed through — via a local admin channel kept separate from the FUSE mount itself, not through the filesystem. Approvals are persisted to disk, bounded by an optional `--max-clients` limit, and revoking one immediately disconnects it if it's already connected, not just future attempts. See [Connecting over TLS](#connecting-over-tls).
 - **FUSE directory permissions are configurable.** An optional `fuse-permissions.toml` sets `mode`/`uid`/`gid` per top-level directory, enforced by the kernel rather than just displayed — see [FUSE directory permissions](#fuse-directory-permissions).
+- **One device description can describe several machines sharing one link.** A TOML file's `[[machines]]` array describes multiple devices — e.g. several PLCs on one RTU multi-drop bus, or several TCP targets — each dispatched by its own Modbus Unit ID and mounted under its own top-level FUSE directory (`/PumpA/holding-registers/`, `/PumpB/holding-registers/`, ...). `client` mounts every machine in its device description by default; `server` answers each machine's own Unit ID and stays silent for any Unit ID it wasn't told about, matching how a real unaddressed device on an RTU bus behaves. See [Device description TOML format](#device-description-toml-format).
 
 ## Client vs. server
 
@@ -141,7 +142,9 @@ cargo run -p server -- admin list
 cargo run -p client -- <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>]
 ```
 
-`<connection>` uses the same `tcp://`/`rtu://`/`tls+tcp://` scheme as the server. `<device-description.toml>` is required as a fallback, but if the server it connects to supports FC 43 (see below), the client uses the server's own description instead. `--fuse-permissions` is optional — see [FUSE directory permissions](#fuse-directory-permissions).
+`<connection>` uses the same `tcp://`/`rtu://`/`tls+tcp://` scheme as the server. `<device-description.toml>` is required as a fallback, but if the server it connects to supports FC 43 (see below), the client uses the server's own description instead. `--fuse-permissions` is optional — see [FUSE directory permissions](#fuse-directory-permissions). `client` mounts **every** machine described in the effective device description — see [Device description TOML format](#device-description-toml-format) — each under its own top-level directory.
+
+`[unit-id]` is **only** used to address the initial FC 43 device-identification handshake — it's how the client asks *some* device on the link to introduce itself before it knows which Unit IDs are valid at all. Once the (possibly multi-machine) device description is known, each machine dispatches its own actual register/coil/etc. traffic via its own TOML-declared `unit_id`, not this CLI one. Defaults to `1` if omitted.
 
 Example:
 
@@ -202,24 +205,26 @@ This disconnects any already-open connection using that fingerprint immediately,
 
 ### Interacting with the filesystem
 
+Every configured machine gets its own top-level directory, named after that machine's `name` in the device description (see [Device description TOML format](#device-description-toml-format)) — the examples below use `PumpA`. Everything past that first path segment works exactly the same regardless of how many machines are mounted.
+
 Once mounted:
 
 ```sh
-ls holding-registers/                       # see all known registers
-cat holding-registers/Tank_Temperature      # read the current value
+ls PumpA/holding-registers/                       # see all known registers
+cat PumpA/holding-registers/Tank_Temperature      # read the current value
 
-echo 55 > transactions/Stop_Process         # stage a write
-ls transactions/                            # see what's staged
-rm transactions/Stop_Process                # ...or un-stage it
-touch transactions/TRANSACTION_END          # commit everything staged
+echo 55 > PumpA/transactions/Stop_Process         # stage a write
+ls PumpA/transactions/                            # see what's staged
+rm PumpA/transactions/Stop_Process                # ...or un-stage it
+touch PumpA/transactions/TRANSACTION_END          # commit everything staged
 
-cat report/Stop_Process                     # OK, or FAILED: <reason>
+cat PumpA/report/Stop_Process                     # OK, or FAILED: <reason>
 ```
 
-**This is the client's write path — `transactions/`, `TRANSACTION_END`, and `report/` don't exist on the server at all.** The server writes directly into `holding-registers/<name>` (or `coils/`/`discrete-inputs/`/`input-registers/`) instead — `echo 55 > holding-registers/Stop_Process` applies immediately, since the server's own state doesn't need staging or a round trip to confirm:
+**This is the client's write path — `transactions/`, `TRANSACTION_END`, and `report/` don't exist on the server at all.** The server writes directly into `holding-registers/<name>` (or `coils/`/`discrete-inputs/`/`input-registers/`) instead — `echo 55 > PumpA/holding-registers/Stop_Process` applies immediately, since the server's own state doesn't need staging or a round trip to confirm:
 
 ```sh
-echo 55 > holding-registers/Stop_Process    # server only — applies immediately, no transactions/
+echo 55 > PumpA/holding-registers/Stop_Process    # server only — applies immediately, no transactions/
 ```
 
 `discrete-inputs/` and `input-registers/` (FC 2/FC 4 data) sit alongside `holding-registers/`, same `ls`/`cat` shape — read-only on the client (populated by polling), directly writable on the server exactly like `holding-registers/` above.
@@ -227,44 +232,44 @@ echo 55 > holding-registers/Stop_Process    # server only — applies immediatel
 Coils work the same way as holding registers, under `coils/` instead — `transactions/` and `report/` are shared across both on the client (one register and one coil can even be staged in the same commit). A coil's value is `0` or `1`:
 
 ```sh
-cat coils/Motor_Running                     # 0 or 1
-echo 1 > transactions/Motor_Running         # stage turning it on
-touch transactions/TRANSACTION_END
+cat PumpA/coils/Motor_Running                     # 0 or 1
+echo 1 > PumpA/transactions/Motor_Running         # stage turning it on
+touch PumpA/transactions/TRANSACTION_END
 ```
 
 A `transactions/<name>` file can also stage a Mask Write Register (FC 0x16) instead of a plain value, by writing `MASK <and_mask> <or_mask>` as its content — sets/clears specific bits in a single-register-wide value atomically on the real device, without needing to know its current contents:
 
 ```sh
-echo "MASK 0x00F2 0x0025" > transactions/Stop_Process
-touch transactions/TRANSACTION_END
+echo "MASK 0x00F2 0x0025" > PumpA/transactions/Stop_Process
+touch PumpA/transactions/TRANSACTION_END
 ```
 
 This is client-only (the server has no local use for it — see the README's function-code table and `CLAUDE.md` for why) and, like every write, can only ever target a single-register-wide value (`u8`/`i8`/`u16`/`i16`).
 
-Declared `[[file-records]]` (FC 0x14/0x15) show up under `file-records/<file_number>/<record_number>` — nested one level deeper than everything else, since file/record numbers are two-axis and there's no human-readable name for them. Content is a plain hex dump; nothing decodes it into fields:
+Declared `[[machines.file-records]]` (FC 0x14/0x15) show up under `file-records/<file_number>/<record_number>` — nested one level deeper than everything else, since file/record numbers are two-axis and there's no human-readable name for them. Content is a plain hex dump; nothing decodes it into fields:
 
 ```sh
-ls file-records/20/                         # e.g. "5"
-cat file-records/20/5                       # e.g. "0D FE 00 20"
+ls PumpA/file-records/20/                         # e.g. "5"
+cat PumpA/file-records/20/5                       # e.g. "0D FE 00 20"
 
-echo "0D FE 00 20" > file-records/20/5      # server only — applies immediately, like holding-registers/
+echo "0D FE 00 20" > PumpA/file-records/20/5      # server only — applies immediately, like holding-registers/
 ```
 
 Read-only on the client's own `file-records/` mount, populated by polling one `Read File Record` request per configured entry at a time. To *write* one to the real device instead, stage it through `transactions/` with the colon-separated `<file_number>:<record_number>` naming, same commit/confirm flow as everything else there:
 
 ```sh
-echo "0D FE 00 20" > transactions/20:5
-touch transactions/TRANSACTION_END
-cat report/20:5                             # OK, or FAILED: <reason>
+echo "0D FE 00 20" > PumpA/transactions/20:5
+touch PumpA/transactions/TRANSACTION_END
+cat PumpA/report/20:5                             # OK, or FAILED: <reason>
 ```
 
-If the device description's optional `server-id` field is set (see below), the client's mount also has a read-only `server-id` file at its root, mirroring whatever the connected device (or its own local fallback) declared:
+If a machine's optional `server-id` field is set (see below), that machine's directory on the client's mount also has a read-only `server-id` file at its root, mirroring whatever the connected device (or its own local fallback) declared:
 
 ```sh
-cat server-id                               # e.g. infused_modbus-demo-plc
+cat PumpA/server-id                               # e.g. infused_modbus-demo-plc
 ```
 
-`server` never mirrors its own `server-id` into its FUSE tree this way — it only answers a real Modbus master's FC 0x11 (Report Server ID) request with it (the technician already set it in the TOML they own, so there's nothing new to show them locally).
+`server` never mirrors its own `server-id` into its FUSE tree this way — it only answers a real Modbus master's FC 0x11 (Report Server ID) request with it (the technician already set it in the TOML they own, so there's nothing new to show them locally). `client-trust/` (server-only, see [Connecting over TLS](#connecting-over-tls) below) is the one exception to the "everything lives under a machine directory" rule — it stays at the real filesystem root, since it's about which clients may connect at all, not about any one machine.
 
 Unmount with Ctrl+C or `SIGTERM` — both `client` and `server` unmount cleanly on shutdown.
 
@@ -274,28 +279,35 @@ The client always requires a local `device-description.toml` path on the command
 
 ## Device description TOML format
 
-An optional top-level `server-id` string identifies the device to a Modbus master asking via FC 0x11 (Report Server ID) — set once and not meant to be changed at runtime:
+A device description is a `[[machines]]` array — one entry per machine sharing the link this `client`/`server` instance connects to (a single-machine deployment is just an array with one entry). Each `[[machines]]` entry requires:
+
+- `name` — a unique (across the file), ASCII-alphanumeric-plus-`_`/`-` string, used directly as that machine's top-level FUSE directory name (`PumpA/`, `PumpB/`, ...) — a parse error if it collides with another machine's name or uses any other character.
+- `unit_id` — the Modbus Unit ID this machine answers to on the shared link. `client` dispatches each machine's register/coil/etc. traffic to its own `unit_id`; `server` resolves an incoming request's Unit ID back to the matching machine and stays silent (no response at all, mirroring how an unaddressed device on a real RTU bus behaves) if none matches.
+
+and optionally:
+
+- `server-id` — identifies this machine to a Modbus master asking via FC 0x11 (Report Server ID) — set once and not meant to be changed at runtime. `server` answers real FC 0x11 requests for this machine's Unit ID with it (and rejects the function code with `ILLEGAL_FUNCTION` if absent); `client` mirrors it read-only into that machine's own mount as `server-id` — see [Interacting with the filesystem](#interacting-with-the-filesystem).
+
+Every other section below is nested one level under `[[machines]]` (e.g. `[machines.registers]` instead of a top-level `[registers]`) and otherwise unchanged in shape.
+
+Registers live in a `[machines.registers]` table with a required `base_address`, a required `mem-layout` (see below), and one `[[machines.registers.entries]]` array entry per register:
 
 ```toml
-server-id = "infused_modbus-demo-plc"
-```
+[[machines]]
+name = "PumpA"
+unit_id = 1
 
-`server` answers real FC 0x11 requests with it (and rejects the function code with `ILLEGAL_FUNCTION` if it's absent); `client` mirrors it read-only into its own mount as `server-id` if its effective device description (local file or FC43-fetched) has one — see [Interacting with the filesystem](#interacting-with-the-filesystem).
-
-Registers live in a `[registers]` table with a required `base_address`, a required `mem-layout` (see below), and one `[[registers.entries]]` array entry per register:
-
-```toml
-[registers]
+[machines.registers]
 base_address = 40000
 mem-layout = "abcd"
 
-[[registers.entries]]
+[[machines.registers.entries]]
 name = "Tank_Temperature"
 offset = 1
 data_type = "u16"
 access = "read_only"
 
-[[registers.entries]]
+[[machines.registers.entries]]
 name = "Stop_Process"
 offset = 2
 data_type = "u16"
@@ -309,7 +321,7 @@ Each entry's actual Modbus address is `base_address + offset` — `Tank_Temperat
 - `data_type` — one of `u8`, `i8`, `u16`, `i16`, `u24`, `i24`, `u32`, `i32`, `u64`, `i64`, `f32`, `f64`. Anything wider than one 16-bit register (`u24` and up) spans consecutive registers, in the byte order `mem-layout` describes. `u24`/`i24` have no native Modbus width — they occupy two registers (32 bits) with the top byte always zero (`u24`) or sign-extended (`i24`).
 - `access` — `"read_only"` or `"read_write"`.
 
-`mem-layout` describes how a device lays a multi-register value's bytes across the wire — real devices vary, and getting this wrong silently produces the wrong number rather than an error. It's one setting for the whole `[registers]` section (a device doesn't mix conventions internally), using the industry-standard four-letter names for a value's bytes A (most significant) through D (least significant):
+`mem-layout` describes how a device lays a multi-register value's bytes across the wire — real devices vary, and getting this wrong silently produces the wrong number rather than an error. It's one setting for the whole `[machines.registers]` section (a device doesn't mix conventions internally), using the industry-standard four-letter names for a value's bytes A (most significant) through D (least significant):
 
 | `mem-layout` | Byte order on the wire | Also known as |
 | ------------- | ----------------------- | -------------- |
@@ -321,95 +333,110 @@ Each entry's actual Modbus address is `base_address + offset` — `Tank_Temperat
 Coils use the same `base_address` + `offset` shape, but have no `data_type` or `access` (a coil is always exactly 1 bit and always read/write):
 
 ```toml
-[coils]
+[machines.coils]
 base_address = 0
 
-[[coils.entries]]
+[[machines.coils.entries]]
 name = "Motor_Running"
 offset = 1
 ```
 
-Both `[registers]` and `[coils]` are optional — a device with only one kind doesn't need to declare an empty section for the other.
+Both `[machines.registers]` and `[machines.coils]` are optional — a machine with only one kind doesn't need to declare an empty section for the other.
 
-A complete example with a mix of types and access rights:
+A complete example, two machines sharing one link, with a mix of types and access rights:
 
 ```toml
-[registers]
+[[machines]]
+name = "PumpA"
+unit_id = 1
+
+[machines.registers]
 base_address = 40000
 mem-layout = "abcd"
 
-[[registers.entries]]
+[[machines.registers.entries]]
 name = "Tank_Temperature"
 offset = 1
 data_type = "u16"
 access = "read_only"
 
-[[registers.entries]]
+[[machines.registers.entries]]
 name = "Flow_Rate"
 offset = 2
 data_type = "f32"
 access = "read_only"
 
-[[registers.entries]]
+[[machines.registers.entries]]
 name = "Stop_Process"
 offset = 4
 data_type = "u16"
 access = "read_write"
 
-[[registers.entries]]
+[[machines.registers.entries]]
 name = "Setpoint"
 offset = 5
 data_type = "u16"
 access = "read_write"
 
-[coils]
+[machines.coils]
 base_address = 0
 
-[[coils.entries]]
+[[machines.coils.entries]]
 name = "Motor_Running"
 offset = 1
 
-[[coils.entries]]
+[[machines.coils.entries]]
 name = "Alarm_Reset"
 offset = 2
+
+[[machines]]
+name = "PumpB"
+unit_id = 2
+
+[machines.coils]
+base_address = 0
+
+[[machines.coils.entries]]
+name = "Motor_Running"
+offset = 1
 ```
 
 Discrete inputs (FC 0x02) mirror coils — same `base_address`/`offset`/`name` shape, always exactly 1 bit — but are always read-only, since no Modbus function code ever lets a master write one:
 
 ```toml
-[discrete-inputs]
+[machines.discrete-inputs]
 base_address = 10000
 
-[[discrete-inputs.entries]]
+[[machines.discrete-inputs.entries]]
 name = "Door_Open_Sensor"
 offset = 1
 ```
 
-Input registers (FC 0x04) mirror `[registers]` minus `access` (always read-only) — they still need their own `mem-layout`, since a value can span multiple registers exactly like holding registers:
+Input registers (FC 0x04) mirror `[machines.registers]` minus `access` (always read-only) — they still need their own `mem-layout`, since a value can span multiple registers exactly like holding registers:
 
 ```toml
-[input-registers]
+[machines.input-registers]
 base_address = 30000
 mem-layout = "abcd"
 
-[[input-registers.entries]]
+[[machines.input-registers.entries]]
 name = "Flow_Rate"
 offset = 1
 data_type = "f32"
 ```
 
-All four sections (`[registers]`, `[coils]`, `[discrete-inputs]`, `[input-registers]`) are independently optional — a device only declares the ones it actually has.
+All four sections (`[machines.registers]`, `[machines.coils]`, `[machines.discrete-inputs]`, `[machines.input-registers]`) are independently optional per machine — a machine only declares the ones it actually has.
 
 File records (FC 0x14/0x15) are a different shape from every other section: no `base_address`/`offset` and no `name` — `file_number`/`record_number` *are* the address, and the FUSE path itself (`file-records/<file_number>/<record_number>`) is the identifier. `record_length` is in 16-bit words, matching the wire field's own unit:
 
 ```toml
-[[file-records]]
+[[machines.file-records]]
 file_number = 20
 record_number = 5
 record_length = 9
 ```
 
-`[[file-records]]` is a flat, independently-optional array — no wrapping section. See the function code table above for how content is exposed (raw hex, no field decoding).
+`[[machines.file-records]]` is a flat, independently-optional array per machine — no wrapping section. See the function code table above for how content is exposed (raw hex, no field decoding).
 
 ## FUSE directory permissions
 
@@ -426,6 +453,8 @@ mode = 0o444
 ```
 
 Both binaries mount with the kernel's `default_permissions` option, so these values are enforced by the kernel itself, not just displayed by `ls -l` — the usual Unix rules apply, including that a directory needs its own execute bit to be enterable at all. A directory meant to stay "read-only but still browsable" needs e.g. `0o555`, not `0o444` — `0o444` alone makes everything inside it completely unreachable, even to its own owner.
+
+One `fuse-permissions.toml` applies identically to *every* machine's own subtree — there's no per-machine override, `[transactions]` above means "every machine's `transactions/` directory", not one specific machine's.
 
 `client-trust/` (server-only, see [Connecting over TLS](#connecting-over-tls)) cannot be configured here at all — a `[client-trust]` section anywhere in this file is a hard parse error at startup, not a silently-ignored setting. It is always mode `0700`, owned by the server process's own real user, regardless of `fuse-permissions.toml`.
 
@@ -468,6 +497,7 @@ This project is under active development. As of now:
 - FC 43 (device identification) only supports "Extended" access serving custom private objects (the mechanism used for description discovery above) — the standard VendorName/ProductCode/etc. objects and Basic/Regular/Individual access aren't implemented yet.
 - RTU serial parameters beyond baud rate (data bits, parity, stop bits) aren't configurable yet; fixed defaults (8 data bits, no parity, 1 stop bit) are used.
 - `tls+tcp://`'s admin socket path, TLS identity directories, `approved-clients.toml`'s own path, and DoS-hardening limits (handshake timeout, connection caps — see [Connecting over TLS](#connecting-over-tls)) are all fixed constants, not yet configurable via a CLI flag. Protection against a flood from many different source addresses is explicitly out of scope for the application layer itself. RTU's serial link remains a separate, unauthenticated threat model that TLS does nothing to address.
+- `client` always mounts **every** machine in its device description — there's no way yet to mount only a subset (e.g. a `--machines PumpA,PumpB` allowlist), though this is a planned follow-up.
 
 ## Development
 
