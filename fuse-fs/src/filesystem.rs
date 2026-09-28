@@ -33,9 +33,34 @@ pub enum WriteMode {
     Direct,
 }
 
+// The true filesystem root, shared by every machine's parent-directory
+// pointer and by the outer `InfusedFilesystem`'s own root-level handling —
+// unlike `HOLDING_REGISTERS_INO`/`FIRST_REGISTER_INO` below, this stays a
+// real fixed constant in production code (not just a test convenience)
+// because there is only ever one true root, regardless of how many
+// machines are mounted under it.
 const ROOT_INO: INodeNo = INodeNo(1);
+// `HOLDING_REGISTERS_INO` used to be a fixed constant back when there was
+// only ever one machine (so its own root was always `ROOT_INO`/
+// `INodeNo(1)`). Now that `MachineFs::dir_ino` is derived from a per-machine
+// `base`, production code computes this per instance
+// (`MachineFs::holding_registers_ino`) instead — this name survives only as
+// a test-only convenience alias, valid because every test fixture below
+// constructs its `MachineFs` with `base = 1`, making it numerically
+// identical to the real field.
+#[cfg(test)]
 const HOLDING_REGISTERS_INO: INodeNo = INodeNo(2);
-const FIRST_REGISTER_INO: u64 = 3;
+
+// Every machine's own inode range starts at `FIRST_MACHINE_INO + index *
+// MACHINE_INO_STRIDE` (see `InfusedFilesystem::new`), comfortably above the
+// outer struct's own small, fixed root-level inode set (`ROOT_INO` plus
+// `client-trust/`'s handful of chained inodes) so the two spaces can never
+// collide. The stride itself is astronomically larger than any realistic
+// amount of dynamic `transactions/` growth a single machine could ever
+// accumulate at runtime, so `MachineFs::owns_ino`'s containment check needs
+// no real bounds checking to stay collision-free.
+const FIRST_MACHINE_INO: u64 = 1 << 32;
+const MACHINE_INO_STRIDE: u64 = 1 << 40;
 
 // The sentinel name that triggers a transaction commit (see CLAUDE.md's
 // "TRANSACTION_END confirmation semantics"). Not a register name, so it's
@@ -117,10 +142,24 @@ struct TransactionFsState {
 /// only ever updated by whoever owns the receiving end of
 /// `transaction_sender`, once the real write is confirmed or fails (see
 /// CLAUDE.md's "TRANSACTION_END confirmation semantics").
-pub struct InfusedFilesystem {
+// One machine's own FUSE subtree (`holding-registers/`, `coils/`,
+// `transactions/`, `report/`, ... — everything except `client-trust/`, which
+// is server-only, root-level, and lives on the outer `InfusedFilesystem`
+// instead, unaffected by there being multiple machines — see CLAUDE.md's
+// "Planned: multi-machine device description & FUSE layout"). Every inode
+// this struct hands out is computed relative to `base`, so several
+// `MachineFs` instances can coexist under one real inode space without
+// collision — see `InfusedFilesystem`'s `MACHINE_INO_STRIDE`.
+struct MachineFs {
+    // This machine's own top-level directory inode (what `ROOT_INO` used to
+    // mean back when there was only ever one machine) — `base` itself,
+    // wrapped.
+    dir_ino: INodeNo,
+    name: String,
     registers: Vec<RegisterDescription>,
     name_to_ino: HashMap<String, INodeNo>,
     store: Arc<Mutex<RegisterStore>>,
+    holding_registers_ino: INodeNo,
     coils: Vec<CoilDescription>,
     coil_name_to_ino: HashMap<String, INodeNo>,
     coil_store: Arc<Mutex<CoilStore>>,
@@ -139,18 +178,12 @@ pub struct InfusedFilesystem {
     input_registers_ino: INodeNo,
     transactions_ino: INodeNo,
     transactions: Mutex<TransactionFsState>,
-    transaction_sender: mpsc::Sender<HashMap<String, StagedValue>>,
+    // Tagged with this machine's own `name` on every send — see
+    // `commit_transaction`/`release` — since the outer `InfusedFilesystem`
+    // shares one channel across every machine's consumer hand-off.
+    transaction_sender: mpsc::Sender<(String, HashMap<String, StagedValue>)>,
     report_ino: INodeNo,
     report: Arc<Mutex<WriteReport>>,
-    // Only `Some` on the server — see `ClientTrustState`'s own doc comment
-    // for why this is the one asymmetric piece of state in this struct.
-    client_trust: Option<Arc<Mutex<ClientTrustState>>>,
-    client_trust_ino: INodeNo,
-    client_trust_approved_ino: INodeNo,
-    connection_attempts_ino: INodeNo,
-    approved_log_ino: INodeNo,
-    pending_log_ino: INodeNo,
-    rejected_log_ino: INodeNo,
     // Client-only (see CLAUDE.md's "FC 0x11 (Report Server ID)" section) —
     // the server answers real FC11 requests with its own device
     // description's `server_id` directly in `server::handler`, but never
@@ -191,10 +224,11 @@ pub struct InfusedFilesystem {
     write_mode: WriteMode,
 }
 
-impl InfusedFilesystem {
+impl MachineFs {
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn new(
+        base: u64,
+        name: String,
         registers: Vec<RegisterDescription>,
         coils: Vec<CoilDescription>,
         discrete_inputs: Vec<DiscreteInputDescription>,
@@ -205,24 +239,26 @@ impl InfusedFilesystem {
         discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
         input_register_store: Arc<Mutex<InputRegisterStore>>,
         file_record_store: Arc<Mutex<FileRecordStore>>,
-        transaction_sender: mpsc::Sender<HashMap<String, StagedValue>>,
+        transaction_sender: mpsc::Sender<(String, HashMap<String, StagedValue>)>,
         report: Arc<Mutex<WriteReport>>,
-        client_trust: Option<Arc<Mutex<ClientTrustState>>>,
         permissions: FusePermissions,
         write_mode: WriteMode,
         server_id: Option<String>,
     ) -> Self {
+        let dir_ino = INodeNo(base);
+        let holding_registers_ino = INodeNo(base + 1);
+        let first_register_ino = holding_registers_ino.0 + 1;
         let name_to_ino = registers
             .iter()
             .enumerate()
             .map(|(index, register)| {
                 (
                     register.name.clone(),
-                    INodeNo(FIRST_REGISTER_INO + index as u64),
+                    INodeNo(first_register_ino + index as u64),
                 )
             })
             .collect();
-        let coils_ino = INodeNo(FIRST_REGISTER_INO + registers.len() as u64);
+        let coils_ino = INodeNo(first_register_ino + registers.len() as u64);
         let first_coil_ino = coils_ino.0 + 1;
         let coil_name_to_ino = coils
             .iter()
@@ -269,26 +305,17 @@ impl InfusedFilesystem {
             next_ino: after_report_ino,
             ..Default::default()
         });
-        // client-trust/'s two fixed directory inodes sit right after every
-        // other fixed inode this filesystem hands out — computed the same
-        // way regardless of whether `client_trust` is `Some` (client-side
-        // `None` just never exposes them), so the numbering stays
-        // deterministic and independent of which fields happen to be used.
-        let client_trust_ino = INodeNo(after_report_ino);
-        let client_trust_approved_ino = INodeNo(client_trust_ino.0 + 1);
-        // connection_attempts/'s directory + its three fixed log files sit
-        // right after approved/ — fixed like report_ino/coils_ino (always
-        // exactly three files), unlike approved/'s dynamic per-fingerprint
-        // entries, so no next_ino calibration needed for these.
-        let connection_attempts_ino = INodeNo(client_trust_approved_ino.0 + 1);
-        let approved_log_ino = INodeNo(connection_attempts_ino.0 + 1);
-        let pending_log_ino = INodeNo(approved_log_ino.0 + 1);
-        let rejected_log_ino = INodeNo(pending_log_ino.0 + 1);
-        // Always computed, same "always allocate the inode, only
-        // conditionally expose the name" precedent as client_trust_ino —
-        // keeps every fixed inode's number independent of which optional
-        // features happen to be in use.
-        let server_id_ino = INodeNo(rejected_log_ino.0 + 1);
+        // `server_id_ino` sits right after every other fixed inode this
+        // machine hands out. It used to chain after `client-trust/`'s own
+        // fixed inodes here, back when both lived in the same struct —
+        // client-trust/ is now the outer `InfusedFilesystem`'s concern
+        // entirely (root-level, server-only, unaffected by multi-machine —
+        // see CLAUDE.md), so this machine's own fixed-inode chain ends with
+        // server_id/file_records instead. Still always computed regardless
+        // of whether `server_id` is actually `Some` — same "always
+        // allocate, conditionally expose" precedent this project already
+        // uses elsewhere.
+        let server_id_ino = INodeNo(after_report_ino);
         // file-records/ needs two nesting levels: one inode for the
         // file-records/ root, then one per *unique* file_number (in
         // first-seen order — `unique_file_numbers`), then one per
@@ -310,24 +337,13 @@ impl InfusedFilesystem {
                 (file_number, INodeNo(first_file_number_ino + index as u64))
             })
             .collect();
-        let first_file_record_ino = first_file_number_ino + unique_file_numbers.len() as u64;
-        // Unlike server_id_ino (mutually exclusive with client_trust in
-        // practice — server_id is client-only, client_trust is
-        // server-only), file-records/ genuinely coexists with client_trust
-        // on the server, so client_trust's own dynamic `approved/`
-        // allocator must start strictly after every fixed inode this
-        // filesystem hands out, file-records included — not just after
-        // rejected_log_ino/server_id_ino like before file-records existed.
-        if let Some(client_trust) = &client_trust {
-            client_trust
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .set_next_ino(first_file_record_ino + file_records.len() as u64);
-        }
         Self {
+            dir_ino,
+            name,
             registers,
             name_to_ino,
             store,
+            holding_registers_ino,
             coils,
             coil_name_to_ino,
             coil_store,
@@ -345,13 +361,6 @@ impl InfusedFilesystem {
             transaction_sender,
             report_ino,
             report,
-            client_trust,
-            client_trust_ino,
-            client_trust_approved_ino,
-            connection_attempts_ino,
-            approved_log_ino,
-            pending_log_ino,
-            rejected_log_ino,
             permissions,
             write_mode,
             server_id,
@@ -406,35 +415,6 @@ impl InfusedFilesystem {
         self.report.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    // `None` on the client (see `ClientTrustState`'s doc comment) — callers
-    // must handle that case themselves; there is no sensible "empty lock"
-    // to hand back.
-    fn client_trust_lock(&self) -> Option<MutexGuard<'_, ClientTrustState>> {
-        self.client_trust
-            .as_ref()
-            .map(|client_trust| client_trust.lock().unwrap_or_else(PoisonError::into_inner))
-    }
-
-    // Dispatches one of the three fixed connection_attempts/*.log inodes to
-    // its ring buffer's current content. Any other ino (including when
-    // client_trust is None) returns empty — callers are expected to have
-    // already confirmed `ino` is one of the three via their own match, same
-    // convention as every other *_content helper in this file.
-    fn connection_attempts_log_content(&self, ino: INodeNo) -> String {
-        let Some(state) = self.client_trust_lock() else {
-            return String::new();
-        };
-        if ino == self.approved_log_ino {
-            state.approved_log_content()
-        } else if ino == self.pending_log_ino {
-            state.pending_log_content()
-        } else if ino == self.rejected_log_ino {
-            state.rejected_log_content()
-        } else {
-            String::new()
-        }
-    }
-
     // Callers are expected to have already confirmed `server_id.is_some()`,
     // same convention as `connection_attempts_log_content` — this just
     // formats what's there.
@@ -452,8 +432,16 @@ impl InfusedFilesystem {
         self.report_ino.0 + 1
     }
 
+    // holding-registers/'s file inodes sit right after the fixed
+    // holding-registers/ directory inode itself — same pattern as
+    // `first_coil_ino`, just special-cased as the first data type in the
+    // chain (right after `dir_ino`/`holding_registers_ino` themselves).
+    fn first_register_ino(&self) -> u64 {
+        self.holding_registers_ino.0 + 1
+    }
+
     fn register_by_ino(&self, ino: INodeNo) -> Option<&RegisterDescription> {
-        let index = ino.0.checked_sub(FIRST_REGISTER_INO)?;
+        let index = ino.0.checked_sub(self.first_register_ino())?;
         self.registers.get(index as usize)
     }
 
@@ -582,13 +570,13 @@ impl InfusedFilesystem {
 
     // The `fuse-permissions.toml` permissions that apply to `ino`, if it
     // belongs to one of the 4 configurable subtrees (their own directory
-    // inode, or any file inside it) — `None` for `root`/`client-trust/*`,
-    // which `directory_attr`/`file_attr` fall back to their pre-T2 default
-    // for (client-trust/'s own root directory gets its T3 hardcoded
-    // override instead — see `client_trust_root_attr_override` — since
-    // that subtree can never appear in this schema at all).
+    // inode, or any file inside it) — `None` for this machine's own root
+    // (`directory_attr` falls back to its pre-T2 default for that).
+    // `client-trust/` never appears here at all — it's the outer
+    // `InfusedFilesystem`'s own root-level concern now, entirely outside
+    // any `MachineFs`'s inode range.
     fn permissions_for(&self, ino: INodeNo) -> Option<DirectoryPermissions> {
-        if ino == HOLDING_REGISTERS_INO || self.register_by_ino(ino).is_some() {
+        if ino == self.holding_registers_ino || self.register_by_ino(ino).is_some() {
             Some(self.permissions.holding_registers)
         } else if ino == self.coils_ino || self.coil_by_ino(ino).is_some() {
             Some(self.permissions.coils)
@@ -602,25 +590,6 @@ impl InfusedFilesystem {
             || self.report_file_record_by_ino(ino).is_some()
         {
             Some(self.permissions.report)
-        } else {
-            None
-        }
-    }
-
-    // `client-trust/`'s own root directory attrs, hardcoded to maximum
-    // restriction regardless of `fuse-permissions.toml` (CLAUDE.md: that
-    // subtree "cannot appear in this file's schema at all"). Gating just
-    // this one top directory at `0o700`/the server's own real UID+GID is
-    // sufficient to lock the whole subtree down — nothing nested beneath
-    // it (`approved/`, `connection_attempts/`, ...) is reachable by any
-    // other uid regardless of its own reported mode/owner, since traversal
-    // is blocked here first; those nested entries keep their pre-T3
-    // attrs unchanged. `None` for every other ino, including client-trust's
-    // own nested directories/files.
-    fn client_trust_root_attr_override(&self, ino: INodeNo) -> Option<(u16, u32, u32)> {
-        if self.client_trust.is_some() && ino == self.client_trust_ino {
-            let (uid, gid) = crate::permissions::real_uid_and_gid();
-            Some((0o700, uid, gid))
         } else {
             None
         }
@@ -686,12 +655,18 @@ impl InfusedFilesystem {
     // (the client) — the server writes directly into `holding-registers/`/
     // `coils/` instead (see `direct_writable_by_ino`), so it has no use for
     // a staging directory at all. `transactions_ino` itself is still always
-    // computed the same way regardless of mode (same precedent as
-    // `client_trust_ino`, which is always computed but only exposed when
-    // `client_trust.is_some()`), so this is the single place that decides
-    // whether it's ever actually reachable.
+    // computed the same way regardless of mode (same "always allocate,
+    // conditionally expose" precedent as `server_id_ino`), so this is the
+    // single place that decides whether it's ever actually reachable.
     fn transactions_enabled(&self) -> bool {
         self.write_mode == WriteMode::Staged
+    }
+
+    // Whether `ino` falls within this machine's own inode range — used by
+    // the outer `InfusedFilesystem` to route a request to the right
+    // `MachineFs` (or discover that none owns it).
+    fn owns_ino(&self, ino: INodeNo) -> bool {
+        ino.0 >= self.dir_ino.0 && ino.0 < self.dir_ino.0 + MACHINE_INO_STRIDE
     }
 
     fn register_by_name(&self, name: &str) -> Option<&RegisterDescription> {
@@ -772,7 +747,7 @@ impl InfusedFilesystem {
         drop(state);
 
         if !drained.is_empty() {
-            let _ = self.transaction_sender.send(drained);
+            let _ = self.transaction_sender.send((self.name.clone(), drained));
         }
     }
 
@@ -921,9 +896,8 @@ impl InfusedFilesystem {
     // `ino`'s owner/group: the configured `fuse-permissions.toml` value if
     // `ino` belongs to one of the 4 configurable subtrees, otherwise the
     // pre-T2 fallback (whichever uid/gid is making this particular
-    // request) — covers `root` and every `client-trust/*` ino except its
-    // own root directory (handled separately in `directory_attr`, see
-    // `client_trust_root_attr_override`).
+    // request) — covers this machine's own root and every other
+    // unconfigured ino.
     fn owner_for(&self, ino: INodeNo, req: &Request) -> (u32, u32) {
         match self.permissions_for(ino) {
             Some(permissions) => (permissions.uid, permissions.gid),
@@ -932,68 +906,75 @@ impl InfusedFilesystem {
     }
 
     fn directory_attr(&self, ino: INodeNo, req: &Request) -> FileAttr {
-        let now = SystemTime::now();
-        let (mode, uid, gid) = match self.client_trust_root_attr_override(ino) {
-            Some((mode, uid, gid)) => (mode, uid, gid),
-            None => {
-                let mode = self
-                    .permissions_for(ino)
-                    .map(|permissions| permissions.mode)
-                    .unwrap_or(0o755);
-                let (uid, gid) = self.owner_for(ino, req);
-                (mode, uid, gid)
-            }
-        };
-        FileAttr {
-            ino,
-            size: 0,
-            blocks: 0,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
-            kind: FileType::Directory,
-            perm: mode,
-            nlink: 2,
-            uid,
-            gid,
-            rdev: 0,
-            blksize: 512,
-            flags: 0,
-        }
+        let mode = self
+            .permissions_for(ino)
+            .map(|permissions| permissions.mode)
+            .unwrap_or(0o755);
+        let (uid, gid) = self.owner_for(ino, req);
+        build_directory_attr(ino, mode, uid, gid)
     }
 
     fn file_attr(&self, ino: INodeNo, size: u64, perm: u16, req: &Request) -> FileAttr {
-        let now = SystemTime::now();
         let (uid, gid) = self.owner_for(ino, req);
-        FileAttr {
-            ino,
-            size,
-            blocks: 0,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
-            kind: FileType::RegularFile,
-            perm,
-            nlink: 1,
-            uid,
-            gid,
-            rdev: 0,
-            blksize: 512,
-            flags: 0,
-        }
+        build_file_attr(ino, size, perm, uid, gid)
     }
 }
 
-impl Filesystem for InfusedFilesystem {
+// Shared by `MachineFs::directory_attr`/`file_attr` and the outer
+// `InfusedFilesystem`'s own root-level/client-trust attrs (root and
+// client-trust/'s directories are never subject to `fuse-permissions.toml`
+// — see CLAUDE.md — so the outer struct computes `mode`/`uid`/`gid` itself
+// rather than going through a `MachineFs`'s `permissions_for`).
+fn build_directory_attr(ino: INodeNo, mode: u16, uid: u32, gid: u32) -> FileAttr {
+    let now = SystemTime::now();
+    FileAttr {
+        ino,
+        size: 0,
+        blocks: 0,
+        atime: now,
+        mtime: now,
+        ctime: now,
+        crtime: now,
+        kind: FileType::Directory,
+        perm: mode,
+        nlink: 2,
+        uid,
+        gid,
+        rdev: 0,
+        blksize: 512,
+        flags: 0,
+    }
+}
+
+fn build_file_attr(ino: INodeNo, size: u64, perm: u16, uid: u32, gid: u32) -> FileAttr {
+    let now = SystemTime::now();
+    FileAttr {
+        ino,
+        size,
+        blocks: 0,
+        atime: now,
+        mtime: now,
+        ctime: now,
+        crtime: now,
+        kind: FileType::RegularFile,
+        perm,
+        nlink: 1,
+        uid,
+        gid,
+        rdev: 0,
+        blksize: 512,
+        flags: 0,
+    }
+}
+
+impl MachineFs {
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        if parent == ROOT_INO {
+        if parent == self.dir_ino {
             match name.to_str() {
                 Some("holding-registers") => {
                     reply.entry(
                         &ATTR_TTL,
-                        &self.directory_attr(HOLDING_REGISTERS_INO, req),
+                        &self.directory_attr(self.holding_registers_ino, req),
                         Generation(0),
                     );
                 }
@@ -1039,17 +1020,6 @@ impl Filesystem for InfusedFilesystem {
                         Generation(0),
                     );
                 }
-                // Only exists on the server (`client_trust.is_some()`) —
-                // on the client this falls through to the same ENOENT as
-                // any other unknown name, so the directory genuinely
-                // doesn't exist there, not just "exists but empty".
-                Some("client-trust") if self.client_trust.is_some() => {
-                    reply.entry(
-                        &ATTR_TTL,
-                        &self.directory_attr(self.client_trust_ino, req),
-                        Generation(0),
-                    );
-                }
                 // Only exists when the effective device description (local
                 // or FC43-fetched) configured a `server-id` — absent means
                 // this file genuinely doesn't exist, same "exists vs.
@@ -1067,76 +1037,7 @@ impl Filesystem for InfusedFilesystem {
             return;
         }
 
-        if parent == self.client_trust_ino && self.client_trust.is_some() {
-            match name.to_str() {
-                Some("approved") => {
-                    reply.entry(
-                        &ATTR_TTL,
-                        &self.directory_attr(self.client_trust_approved_ino, req),
-                        Generation(0),
-                    );
-                }
-                Some("connection_attempts") => {
-                    reply.entry(
-                        &ATTR_TTL,
-                        &self.directory_attr(self.connection_attempts_ino, req),
-                        Generation(0),
-                    );
-                }
-                _ => reply.error(Errno::ENOENT),
-            }
-            return;
-        }
-
-        if parent == self.connection_attempts_ino && self.client_trust.is_some() {
-            let log_ino = match name.to_str() {
-                Some("approved.log") => Some(self.approved_log_ino),
-                Some("pending.log") => Some(self.pending_log_ino),
-                Some("rejected.log") => Some(self.rejected_log_ino),
-                _ => None,
-            };
-            match log_ino {
-                Some(ino) => {
-                    let content = self.connection_attempts_log_content(ino);
-                    reply.entry(
-                        &ATTR_TTL,
-                        &self.file_attr(ino, content.len() as u64, 0o444, req),
-                        Generation(0),
-                    );
-                }
-                None => reply.error(Errno::ENOENT),
-            }
-            return;
-        }
-
-        if parent == self.client_trust_approved_ino {
-            let Some(name) = name.to_str() else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-            let ino = self
-                .client_trust_lock()
-                .and_then(|state| state.ino_by_fingerprint(name));
-            match ino {
-                Some(ino) => {
-                    // The file's content is just its own name again (the
-                    // fingerprint) — matches CLAUDE.md's "read-only mirror
-                    // of the currently approved fingerprint set": presence
-                    // in the directory listing already *is* the meaningful
-                    // information, the content is there so `cat` alone
-                    // (without `ls`) also shows something recognizable.
-                    reply.entry(
-                        &ATTR_TTL,
-                        &self.file_attr(ino, name.len() as u64 + 1, 0o444, req),
-                        Generation(0),
-                    );
-                }
-                None => reply.error(Errno::ENOENT),
-            }
-            return;
-        }
-
-        if parent == HOLDING_REGISTERS_INO {
+        if parent == self.holding_registers_ino {
             let register = name
                 .to_str()
                 .and_then(|name| self.name_to_ino.get(name))
@@ -1342,8 +1243,8 @@ impl Filesystem for InfusedFilesystem {
     }
 
     fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        if ino == ROOT_INO
-            || ino == HOLDING_REGISTERS_INO
+        if ino == self.dir_ino
+            || ino == self.holding_registers_ino
             || ino == self.coils_ino
             || ino == self.discrete_inputs_ino
             || ino == self.input_registers_ino
@@ -1351,41 +1252,13 @@ impl Filesystem for InfusedFilesystem {
             || self.file_number_by_ino(ino).is_some()
             || (ino == self.transactions_ino && self.transactions_enabled())
             || ino == self.report_ino
-            || (ino == self.client_trust_ino && self.client_trust.is_some())
-            || (ino == self.client_trust_approved_ino && self.client_trust.is_some())
-            || (ino == self.connection_attempts_ino && self.client_trust.is_some())
         {
             reply.attr(&ATTR_TTL, &self.directory_attr(ino, req));
             return;
         }
 
-        if self.client_trust.is_some()
-            && (ino == self.approved_log_ino
-                || ino == self.pending_log_ino
-                || ino == self.rejected_log_ino)
-        {
-            let content = self.connection_attempts_log_content(ino);
-            reply.attr(
-                &ATTR_TTL,
-                &self.file_attr(ino, content.len() as u64, 0o444, req),
-            );
-            return;
-        }
-
         if self.server_id.is_some() && ino == self.server_id_ino {
             let content = self.server_id_content();
-            reply.attr(
-                &ATTR_TTL,
-                &self.file_attr(ino, content.len() as u64, 0o444, req),
-            );
-            return;
-        }
-
-        if let Some(fingerprint) = self
-            .client_trust_lock()
-            .and_then(|state| state.fingerprint_by_ino(ino).map(str::to_string))
-        {
-            let content = format!("{fingerprint}\n");
             reply.attr(
                 &ATTR_TTL,
                 &self.file_attr(ino, content.len() as u64, 0o444, req),
@@ -1504,6 +1377,7 @@ impl Filesystem for InfusedFilesystem {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
         req: &Request,
@@ -1580,6 +1454,7 @@ impl Filesystem for InfusedFilesystem {
         reply.error(Errno::ENOENT);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read(
         &self,
         _req: &Request,
@@ -1617,17 +1492,6 @@ impl Filesystem for InfusedFilesystem {
             // `if let` body) deadlocks. `transaction_name_by_ino` already
             // resolves to an owned `String` for exactly this reason.
             self.transaction_content(&name)
-        } else if let Some(fingerprint) = self
-            .client_trust_lock()
-            .and_then(|state| state.fingerprint_by_ino(ino).map(str::to_string))
-        {
-            format!("{fingerprint}\n")
-        } else if self.client_trust.is_some()
-            && (ino == self.approved_log_ino
-                || ino == self.pending_log_ino
-                || ino == self.rejected_log_ino)
-        {
-            self.connection_attempts_log_content(ino)
         } else if self.server_id.is_some() && ino == self.server_id_ino {
             self.server_id_content()
         } else {
@@ -1653,12 +1517,17 @@ impl Filesystem for InfusedFilesystem {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let entries: Vec<(INodeNo, FileType, String)> = if ino == ROOT_INO {
+        let entries: Vec<(INodeNo, FileType, String)> = if ino == self.dir_ino {
             vec![
-                (ROOT_INO, FileType::Directory, ".".to_string()),
+                (self.dir_ino, FileType::Directory, ".".to_string()),
+                // ".." is the true filesystem root here, not `self.dir_ino`
+                // — this branch lists the contents of *this machine's own*
+                // directory, whose parent is the real root every machine
+                // is mounted directly under (see the outer
+                // `InfusedFilesystem`).
                 (ROOT_INO, FileType::Directory, "..".to_string()),
                 (
-                    HOLDING_REGISTERS_INO,
+                    self.holding_registers_ino,
                     FileType::Directory,
                     "holding-registers".to_string(),
                 ),
@@ -1686,75 +1555,20 @@ impl Filesystem for InfusedFilesystem {
                 FileType::Directory,
                 "transactions".to_string(),
             )))
-            .chain(self.client_trust.is_some().then_some((
-                self.client_trust_ino,
-                FileType::Directory,
-                "client-trust".to_string(),
-            )))
             .chain(self.server_id.is_some().then_some((
                 self.server_id_ino,
                 FileType::RegularFile,
                 "server-id".to_string(),
             )))
             .collect()
-        } else if ino == self.client_trust_ino && self.client_trust.is_some() {
-            vec![
-                (self.client_trust_ino, FileType::Directory, ".".to_string()),
-                (ROOT_INO, FileType::Directory, "..".to_string()),
+        } else if ino == self.holding_registers_ino {
+            let mut entries = vec![
                 (
-                    self.client_trust_approved_ino,
-                    FileType::Directory,
-                    "approved".to_string(),
-                ),
-                (
-                    self.connection_attempts_ino,
-                    FileType::Directory,
-                    "connection_attempts".to_string(),
-                ),
-            ]
-        } else if ino == self.connection_attempts_ino && self.client_trust.is_some() {
-            vec![
-                (
-                    self.connection_attempts_ino,
+                    self.holding_registers_ino,
                     FileType::Directory,
                     ".".to_string(),
                 ),
-                (self.client_trust_ino, FileType::Directory, "..".to_string()),
-                (
-                    self.approved_log_ino,
-                    FileType::RegularFile,
-                    "approved.log".to_string(),
-                ),
-                (
-                    self.pending_log_ino,
-                    FileType::RegularFile,
-                    "pending.log".to_string(),
-                ),
-                (
-                    self.rejected_log_ino,
-                    FileType::RegularFile,
-                    "rejected.log".to_string(),
-                ),
-            ]
-        } else if ino == self.client_trust_approved_ino {
-            let mut entries = vec![
-                (
-                    self.client_trust_approved_ino,
-                    FileType::Directory,
-                    ".".to_string(),
-                ),
-                (self.client_trust_ino, FileType::Directory, "..".to_string()),
-            ];
-            if let Some(state) = self.client_trust_lock() {
-                for (fingerprint, ino) in state.approved_entries() {
-                    entries.push((ino, FileType::RegularFile, fingerprint.to_string()));
-                }
-            }
-            entries
-        } else if ino == HOLDING_REGISTERS_INO {
-            let mut entries = vec![
-                (HOLDING_REGISTERS_INO, FileType::Directory, ".".to_string()),
-                (ROOT_INO, FileType::Directory, "..".to_string()),
+                (self.dir_ino, FileType::Directory, "..".to_string()),
             ];
             for register in &self.registers {
                 let register_ino = self.name_to_ino[&register.name];
@@ -1764,7 +1578,7 @@ impl Filesystem for InfusedFilesystem {
         } else if ino == self.coils_ino {
             let mut entries = vec![
                 (self.coils_ino, FileType::Directory, ".".to_string()),
-                (ROOT_INO, FileType::Directory, "..".to_string()),
+                (self.dir_ino, FileType::Directory, "..".to_string()),
             ];
             for coil in &self.coils {
                 let coil_ino = self.coil_name_to_ino[&coil.name];
@@ -1778,7 +1592,7 @@ impl Filesystem for InfusedFilesystem {
                     FileType::Directory,
                     ".".to_string(),
                 ),
-                (ROOT_INO, FileType::Directory, "..".to_string()),
+                (self.dir_ino, FileType::Directory, "..".to_string()),
             ];
             for discrete_input in &self.discrete_inputs {
                 let discrete_input_ino = self.discrete_input_name_to_ino[&discrete_input.name];
@@ -1796,7 +1610,7 @@ impl Filesystem for InfusedFilesystem {
                     FileType::Directory,
                     ".".to_string(),
                 ),
-                (ROOT_INO, FileType::Directory, "..".to_string()),
+                (self.dir_ino, FileType::Directory, "..".to_string()),
             ];
             for input_register in &self.input_registers {
                 let input_register_ino = self.input_register_name_to_ino[&input_register.name];
@@ -1810,7 +1624,7 @@ impl Filesystem for InfusedFilesystem {
         } else if ino == self.file_records_ino {
             let mut entries = vec![
                 (self.file_records_ino, FileType::Directory, ".".to_string()),
-                (ROOT_INO, FileType::Directory, "..".to_string()),
+                (self.dir_ino, FileType::Directory, "..".to_string()),
             ];
             for (index, &file_number) in self.unique_file_numbers.iter().enumerate() {
                 let file_number_ino = INodeNo(self.first_file_number_ino() + index as u64);
@@ -1841,7 +1655,7 @@ impl Filesystem for InfusedFilesystem {
         } else if ino == self.transactions_ino && self.transactions_enabled() {
             let mut entries = vec![
                 (self.transactions_ino, FileType::Directory, ".".to_string()),
-                (ROOT_INO, FileType::Directory, "..".to_string()),
+                (self.dir_ino, FileType::Directory, "..".to_string()),
             ];
             let state = self.transactions_lock();
             for (name, &ino) in &state.name_to_ino {
@@ -1851,7 +1665,7 @@ impl Filesystem for InfusedFilesystem {
         } else if ino == self.report_ino {
             let mut entries = vec![
                 (self.report_ino, FileType::Directory, ".".to_string()),
-                (ROOT_INO, FileType::Directory, "..".to_string()),
+                (self.dir_ino, FileType::Directory, "..".to_string()),
             ];
             for (index, register) in self.registers.iter().enumerate() {
                 let register_ino = INodeNo(self.first_report_ino() + index as u64);
@@ -1890,6 +1704,7 @@ impl Filesystem for InfusedFilesystem {
         reply.ok();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create(
         &self,
         req: &Request,
@@ -1967,6 +1782,7 @@ impl Filesystem for InfusedFilesystem {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write(
         &self,
         _req: &Request,
@@ -2004,6 +1820,7 @@ impl Filesystem for InfusedFilesystem {
     // present. A value that fails to parse is silently dropped rather than
     // staged — surfacing that failure back through the filesystem is the
     // open question in CLAUDE.md's Milestone H3, not solved here.
+    #[allow(clippy::too_many_arguments)]
     fn release(
         &self,
         _req: &Request,
@@ -2100,7 +1917,9 @@ impl Filesystem for InfusedFilesystem {
             };
             drop(state);
             if let Some((name, value)) = direct {
-                let _ = self.transaction_sender.send(HashMap::from([(name, value)]));
+                let _ = self
+                    .transaction_sender
+                    .send((self.name.clone(), HashMap::from([(name, value)])));
             }
             reply.ok();
             return;
@@ -2132,34 +1951,620 @@ impl Filesystem for InfusedFilesystem {
     }
 }
 
+// Bundles one machine's construction parameters for
+// `InfusedFilesystem::new` — named fields instead of yet more positional
+// arguments piled onto an already-`#[allow(clippy::too_many_arguments)]`
+// constructor (see `MachineFs::new`).
+pub struct MachineConfig {
+    pub name: String,
+    pub registers: Vec<RegisterDescription>,
+    pub coils: Vec<CoilDescription>,
+    pub discrete_inputs: Vec<DiscreteInputDescription>,
+    pub input_registers: Vec<InputRegisterDescription>,
+    pub file_records: Vec<FileRecordDescription>,
+    pub store: Arc<Mutex<RegisterStore>>,
+    pub coil_store: Arc<Mutex<CoilStore>>,
+    pub discrete_input_store: Arc<Mutex<DiscreteInputStore>>,
+    pub input_register_store: Arc<Mutex<InputRegisterStore>>,
+    pub file_record_store: Arc<Mutex<FileRecordStore>>,
+    pub report: Arc<Mutex<WriteReport>>,
+    pub permissions: FusePermissions,
+    pub server_id: Option<String>,
+}
+
+/// The real, mounted FUSE root: one top-level directory per configured
+/// machine (each a `MachineFs`, entirely unaware of the others — see
+/// `MACHINE_INO_STRIDE`), plus `client-trust/` — server-only, root-level,
+/// and unaffected by there being multiple machines (see CLAUDE.md's
+/// "Planned: multi-machine device description & FUSE layout": client-trust/
+/// "stays exactly where it is at the filesystem root"). Every trait method
+/// either handles the small set of genuine root-level/client-trust cases
+/// itself, or resolves which machine owns the `ino`/`parent` in question and
+/// delegates straight through to that `MachineFs`'s like-named inherent
+/// method.
+pub struct InfusedFilesystem {
+    machines: Vec<MachineFs>,
+    name_to_index: HashMap<String, usize>,
+    // Only `Some` on the server — see `ClientTrustState`'s own doc comment
+    // for why this is the one asymmetric piece of state in this struct.
+    client_trust: Option<Arc<Mutex<ClientTrustState>>>,
+    client_trust_ino: INodeNo,
+    client_trust_approved_ino: INodeNo,
+    connection_attempts_ino: INodeNo,
+    approved_log_ino: INodeNo,
+    pending_log_ino: INodeNo,
+    rejected_log_ino: INodeNo,
+}
+
+impl InfusedFilesystem {
+    pub fn new(
+        machines: Vec<MachineConfig>,
+        transaction_sender: mpsc::Sender<(String, HashMap<String, StagedValue>)>,
+        write_mode: WriteMode,
+        client_trust: Option<Arc<Mutex<ClientTrustState>>>,
+    ) -> Self {
+        let machines: Vec<MachineFs> = machines
+            .into_iter()
+            .enumerate()
+            .map(|(index, config)| {
+                let base = FIRST_MACHINE_INO + index as u64 * MACHINE_INO_STRIDE;
+                MachineFs::new(
+                    base,
+                    config.name,
+                    config.registers,
+                    config.coils,
+                    config.discrete_inputs,
+                    config.input_registers,
+                    config.file_records,
+                    config.store,
+                    config.coil_store,
+                    config.discrete_input_store,
+                    config.input_register_store,
+                    config.file_record_store,
+                    transaction_sender.clone(),
+                    config.report,
+                    config.permissions,
+                    write_mode,
+                    config.server_id,
+                )
+            })
+            .collect();
+        let name_to_index = machines
+            .iter()
+            .enumerate()
+            .map(|(index, machine)| (machine.name.clone(), index))
+            .collect();
+        // client-trust/'s fixed inodes sit right after the true root —
+        // small, independent numbers, nowhere near `FIRST_MACHINE_INO`, so
+        // no calibration against any machine's own inode range is ever
+        // needed (unlike the pre-multi-machine design, where client-trust
+        // and file-records shared one struct's inode space).
+        let client_trust_ino = INodeNo(ROOT_INO.0 + 1);
+        let client_trust_approved_ino = INodeNo(client_trust_ino.0 + 1);
+        let connection_attempts_ino = INodeNo(client_trust_approved_ino.0 + 1);
+        let approved_log_ino = INodeNo(connection_attempts_ino.0 + 1);
+        let pending_log_ino = INodeNo(approved_log_ino.0 + 1);
+        let rejected_log_ino = INodeNo(pending_log_ino.0 + 1);
+        if let Some(client_trust) = &client_trust {
+            client_trust
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .set_next_ino(rejected_log_ino.0 + 1);
+        }
+        Self {
+            machines,
+            name_to_index,
+            client_trust,
+            client_trust_ino,
+            client_trust_approved_ino,
+            connection_attempts_ino,
+            approved_log_ino,
+            pending_log_ino,
+            rejected_log_ino,
+        }
+    }
+
+    fn client_trust_lock(&self) -> Option<MutexGuard<'_, ClientTrustState>> {
+        self.client_trust
+            .as_ref()
+            .map(|client_trust| client_trust.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    // Mirrors `MachineFs::connection_attempts_log_content` (removed from
+    // there when client-trust/ moved out to this outer struct).
+    fn connection_attempts_log_content(&self, ino: INodeNo) -> String {
+        let Some(state) = self.client_trust_lock() else {
+            return String::new();
+        };
+        if ino == self.approved_log_ino {
+            state.approved_log_content()
+        } else if ino == self.pending_log_ino {
+            state.pending_log_content()
+        } else if ino == self.rejected_log_ino {
+            state.rejected_log_content()
+        } else {
+            String::new()
+        }
+    }
+
+    // `client-trust/`'s own root directory attrs, hardcoded to maximum
+    // restriction regardless of `fuse-permissions.toml` (CLAUDE.md: that
+    // subtree "cannot appear in this file's schema at all"). Gating just
+    // this one top directory at `0o700`/the server's own real UID+GID is
+    // sufficient to lock the whole subtree down — nothing nested beneath it
+    // (`approved/`, `connection_attempts/`, ...) is reachable by any other
+    // uid regardless of its own reported mode/owner, since traversal is
+    // blocked here first. `None` for every other ino, including
+    // client-trust's own nested directories/files.
+    fn client_trust_root_attr_override(&self, ino: INodeNo) -> Option<(u16, u32, u32)> {
+        if self.client_trust.is_some() && ino == self.client_trust_ino {
+            let (uid, gid) = crate::permissions::real_uid_and_gid();
+            Some((0o700, uid, gid))
+        } else {
+            None
+        }
+    }
+
+    fn machine_by_name(&self, name: &str) -> Option<&MachineFs> {
+        self.name_to_index
+            .get(name)
+            .map(|&index| &self.machines[index])
+    }
+
+    fn machine_owning_ino(&self, ino: INodeNo) -> Option<&MachineFs> {
+        self.machines.iter().find(|machine| machine.owns_ino(ino))
+    }
+}
+
+impl Filesystem for InfusedFilesystem {
+    fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        if parent == ROOT_INO {
+            if let Some(machine) = name.to_str().and_then(|name| self.machine_by_name(name)) {
+                reply.entry(
+                    &ATTR_TTL,
+                    &machine.directory_attr(machine.dir_ino, req),
+                    Generation(0),
+                );
+                return;
+            }
+            // Only exists on the server (`client_trust.is_some()`) — on the
+            // client this falls through to the same ENOENT as any other
+            // unknown name, so the directory genuinely doesn't exist there,
+            // not just "exists but empty".
+            if name.to_str() == Some("client-trust")
+                && let Some((mode, uid, gid)) =
+                    self.client_trust_root_attr_override(self.client_trust_ino)
+            {
+                reply.entry(
+                    &ATTR_TTL,
+                    &build_directory_attr(self.client_trust_ino, mode, uid, gid),
+                    Generation(0),
+                );
+                return;
+            }
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        if parent == self.client_trust_ino && self.client_trust.is_some() {
+            match name.to_str() {
+                Some("approved") => {
+                    reply.entry(
+                        &ATTR_TTL,
+                        &build_directory_attr(
+                            self.client_trust_approved_ino,
+                            0o755,
+                            req.uid(),
+                            req.gid(),
+                        ),
+                        Generation(0),
+                    );
+                }
+                Some("connection_attempts") => {
+                    reply.entry(
+                        &ATTR_TTL,
+                        &build_directory_attr(
+                            self.connection_attempts_ino,
+                            0o755,
+                            req.uid(),
+                            req.gid(),
+                        ),
+                        Generation(0),
+                    );
+                }
+                _ => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
+        if parent == self.connection_attempts_ino && self.client_trust.is_some() {
+            let log_ino = match name.to_str() {
+                Some("approved.log") => Some(self.approved_log_ino),
+                Some("pending.log") => Some(self.pending_log_ino),
+                Some("rejected.log") => Some(self.rejected_log_ino),
+                _ => None,
+            };
+            match log_ino {
+                Some(ino) => {
+                    let content = self.connection_attempts_log_content(ino);
+                    reply.entry(
+                        &ATTR_TTL,
+                        &build_file_attr(ino, content.len() as u64, 0o444, req.uid(), req.gid()),
+                        Generation(0),
+                    );
+                }
+                None => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
+        if parent == self.client_trust_approved_ino {
+            let Some(name) = name.to_str() else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            let ino = self
+                .client_trust_lock()
+                .and_then(|state| state.ino_by_fingerprint(name));
+            match ino {
+                Some(ino) => {
+                    // The file's content is just its own name again (the
+                    // fingerprint) — matches CLAUDE.md's "read-only mirror
+                    // of the currently approved fingerprint set": presence
+                    // in the directory listing already *is* the meaningful
+                    // information, the content is there so `cat` alone
+                    // (without `ls`) also shows something recognizable.
+                    reply.entry(
+                        &ATTR_TTL,
+                        &build_file_attr(ino, name.len() as u64 + 1, 0o444, req.uid(), req.gid()),
+                        Generation(0),
+                    );
+                }
+                None => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
+        match self.machine_owning_ino(parent) {
+            Some(machine) => machine.lookup(req, parent, name, reply),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        if ino == ROOT_INO {
+            reply.attr(
+                &ATTR_TTL,
+                &build_directory_attr(ROOT_INO, 0o755, req.uid(), req.gid()),
+            );
+            return;
+        }
+
+        if let Some((mode, uid, gid)) = self.client_trust_root_attr_override(ino) {
+            reply.attr(&ATTR_TTL, &build_directory_attr(ino, mode, uid, gid));
+            return;
+        }
+
+        if self.client_trust.is_some()
+            && (ino == self.client_trust_approved_ino || ino == self.connection_attempts_ino)
+        {
+            reply.attr(
+                &ATTR_TTL,
+                &build_directory_attr(ino, 0o755, req.uid(), req.gid()),
+            );
+            return;
+        }
+
+        if self.client_trust.is_some()
+            && (ino == self.approved_log_ino
+                || ino == self.pending_log_ino
+                || ino == self.rejected_log_ino)
+        {
+            let content = self.connection_attempts_log_content(ino);
+            reply.attr(
+                &ATTR_TTL,
+                &build_file_attr(ino, content.len() as u64, 0o444, req.uid(), req.gid()),
+            );
+            return;
+        }
+
+        if let Some(fingerprint) = self
+            .client_trust_lock()
+            .and_then(|state| state.fingerprint_by_ino(ino).map(str::to_string))
+        {
+            let content = format!("{fingerprint}\n");
+            reply.attr(
+                &ATTR_TTL,
+                &build_file_attr(ino, content.len() as u64, 0o444, req.uid(), req.gid()),
+            );
+            return;
+        }
+
+        match self.machine_owning_ino(ino) {
+            Some(machine) => machine.getattr(req, ino, fh, reply),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<SystemTime>,
+        fh: Option<FileHandle>,
+        crtime: Option<SystemTime>,
+        chgtime: Option<SystemTime>,
+        bkuptime: Option<SystemTime>,
+        flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        match self.machine_owning_ino(ino) {
+            Some(machine) => machine.setattr(
+                req, ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime, bkuptime,
+                flags, reply,
+            ),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn read(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        size: u32,
+        flags: OpenFlags,
+        lock_owner: Option<LockOwner>,
+        reply: ReplyData,
+    ) {
+        if let Some(fingerprint) = self
+            .client_trust_lock()
+            .and_then(|state| state.fingerprint_by_ino(ino).map(str::to_string))
+        {
+            let content = format!("{fingerprint}\n");
+            let bytes = content.as_bytes();
+            let offset = offset as usize;
+            if offset >= bytes.len() {
+                reply.data(&[]);
+            } else {
+                let end = (offset + size as usize).min(bytes.len());
+                reply.data(&bytes[offset..end]);
+            }
+            return;
+        }
+
+        if self.client_trust.is_some()
+            && (ino == self.approved_log_ino
+                || ino == self.pending_log_ino
+                || ino == self.rejected_log_ino)
+        {
+            let content = self.connection_attempts_log_content(ino);
+            let bytes = content.as_bytes();
+            let offset = offset as usize;
+            if offset >= bytes.len() {
+                reply.data(&[]);
+            } else {
+                let end = (offset + size as usize).min(bytes.len());
+                reply.data(&bytes[offset..end]);
+            }
+            return;
+        }
+
+        match self.machine_owning_ino(ino) {
+            Some(machine) => machine.read(req, ino, fh, offset, size, flags, lock_owner, reply),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn readdir(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
+        let entries: Vec<(INodeNo, FileType, String)> = if ino == ROOT_INO {
+            let mut entries = vec![
+                (ROOT_INO, FileType::Directory, ".".to_string()),
+                (ROOT_INO, FileType::Directory, "..".to_string()),
+            ];
+            for machine in &self.machines {
+                entries.push((machine.dir_ino, FileType::Directory, machine.name.clone()));
+            }
+            if self.client_trust.is_some() {
+                entries.push((
+                    self.client_trust_ino,
+                    FileType::Directory,
+                    "client-trust".to_string(),
+                ));
+            }
+            entries
+        } else if ino == self.client_trust_ino && self.client_trust.is_some() {
+            vec![
+                (self.client_trust_ino, FileType::Directory, ".".to_string()),
+                (ROOT_INO, FileType::Directory, "..".to_string()),
+                (
+                    self.client_trust_approved_ino,
+                    FileType::Directory,
+                    "approved".to_string(),
+                ),
+                (
+                    self.connection_attempts_ino,
+                    FileType::Directory,
+                    "connection_attempts".to_string(),
+                ),
+            ]
+        } else if ino == self.connection_attempts_ino && self.client_trust.is_some() {
+            vec![
+                (
+                    self.connection_attempts_ino,
+                    FileType::Directory,
+                    ".".to_string(),
+                ),
+                (self.client_trust_ino, FileType::Directory, "..".to_string()),
+                (
+                    self.approved_log_ino,
+                    FileType::RegularFile,
+                    "approved.log".to_string(),
+                ),
+                (
+                    self.pending_log_ino,
+                    FileType::RegularFile,
+                    "pending.log".to_string(),
+                ),
+                (
+                    self.rejected_log_ino,
+                    FileType::RegularFile,
+                    "rejected.log".to_string(),
+                ),
+            ]
+        } else if ino == self.client_trust_approved_ino && self.client_trust.is_some() {
+            let mut entries = vec![
+                (
+                    self.client_trust_approved_ino,
+                    FileType::Directory,
+                    ".".to_string(),
+                ),
+                (self.client_trust_ino, FileType::Directory, "..".to_string()),
+            ];
+            if let Some(state) = self.client_trust_lock() {
+                for (fingerprint, ino) in state.approved_entries() {
+                    entries.push((ino, FileType::RegularFile, fingerprint.to_string()));
+                }
+            }
+            entries
+        } else {
+            match self.machine_owning_ino(ino) {
+                Some(machine) => {
+                    machine.readdir(req, ino, fh, offset, reply);
+                    return;
+                }
+                None => {
+                    reply.error(Errno::ENOTDIR);
+                    return;
+                }
+            }
+        };
+
+        for (index, (entry_ino, kind, name)) in
+            entries.into_iter().enumerate().skip(offset as usize)
+        {
+            let next_offset = (index + 1) as u64;
+            if reply.add(entry_ino, next_offset, kind, name) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+
+    fn create(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        match self.machine_owning_ino(parent) {
+            Some(machine) => machine.create(req, parent, name, mode, umask, flags, reply),
+            None => reply.error(Errno::EPERM),
+        }
+    }
+
+    fn write(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        write_flags: fuser::WriteFlags,
+        flags: OpenFlags,
+        lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        match self.machine_owning_ino(ino) {
+            Some(machine) => machine.write(
+                req,
+                ino,
+                fh,
+                offset,
+                data,
+                write_flags,
+                flags,
+                lock_owner,
+                reply,
+            ),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn release(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        flags: OpenFlags,
+        lock_owner: Option<LockOwner>,
+        flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        // Original single-machine `release` never errors — every fallen-
+        // through case just replies `ok()`. Preserved here: an ino that no
+        // machine owns is never a real target, so there is nothing to do
+        // beyond acknowledging the close.
+        match self.machine_owning_ino(ino) {
+            Some(machine) => machine.release(req, ino, fh, flags, lock_owner, flush, reply),
+            None => reply.ok(),
+        }
+    }
+
+    fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.machine_owning_ino(parent) {
+            Some(machine) => machine.unlink(req, parent, name, reply),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::WriteStatus;
     use protocol::device_description::AccessRight;
 
-    fn test_filesystem() -> (
-        InfusedFilesystem,
-        mpsc::Receiver<HashMap<String, StagedValue>>,
-    ) {
+    // Every fixture below constructs its lone `MachineFs` with `base = 1`
+    // (so `dir_ino` == `INodeNo(1)`, exactly matching the pre-multi-machine
+    // `ROOT_INO`) — this is what makes the test-only `ROOT_INO`/
+    // `HOLDING_REGISTERS_INO`/`FIRST_REGISTER_INO` aliases near the top of
+    // this file numerically valid.
+    const TEST_MACHINE_NAME: &str = "TestMachine";
+
+    type TestFixture = (
+        MachineFs,
+        mpsc::Receiver<(String, HashMap<String, StagedValue>)>,
+    );
+
+    fn test_filesystem() -> TestFixture {
         test_filesystem_with_permissions(FusePermissions::default())
     }
 
-    fn test_filesystem_with_permissions(
-        permissions: FusePermissions,
-    ) -> (
-        InfusedFilesystem,
-        mpsc::Receiver<HashMap<String, StagedValue>>,
-    ) {
+    fn test_filesystem_with_permissions(permissions: FusePermissions) -> TestFixture {
         test_filesystem_with_permissions_and_write_mode(permissions, WriteMode::Staged)
     }
 
-    fn test_filesystem_with_server_id(
-        server_id: Option<String>,
-    ) -> (
-        InfusedFilesystem,
-        mpsc::Receiver<HashMap<String, StagedValue>>,
-    ) {
+    fn test_filesystem_with_server_id(server_id: Option<String>) -> TestFixture {
         test_filesystem_with_permissions_write_mode_and_server_id(
             FusePermissions::default(),
             WriteMode::Staged,
@@ -2170,10 +2575,7 @@ mod tests {
     fn test_filesystem_with_permissions_and_write_mode(
         permissions: FusePermissions,
         write_mode: WriteMode,
-    ) -> (
-        InfusedFilesystem,
-        mpsc::Receiver<HashMap<String, StagedValue>>,
-    ) {
+    ) -> TestFixture {
         test_filesystem_with_permissions_write_mode_and_server_id(permissions, write_mode, None)
     }
 
@@ -2181,10 +2583,7 @@ mod tests {
         permissions: FusePermissions,
         write_mode: WriteMode,
         server_id: Option<String>,
-    ) -> (
-        InfusedFilesystem,
-        mpsc::Receiver<HashMap<String, StagedValue>>,
-    ) {
+    ) -> TestFixture {
         let registers = vec![RegisterDescription {
             name: "Stop_Process".to_string(),
             address: 40001,
@@ -2202,7 +2601,9 @@ mod tests {
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, receiver) = mpsc::channel();
         (
-            InfusedFilesystem::new(
+            MachineFs::new(
+                1,
+                TEST_MACHINE_NAME.to_string(),
                 registers,
                 coils,
                 Vec::new(),
@@ -2215,7 +2616,6 @@ mod tests {
                 Arc::new(Mutex::new(FileRecordStore::new())),
                 sender,
                 report,
-                None,
                 permissions,
                 write_mode,
                 server_id,
@@ -2228,12 +2628,7 @@ mod tests {
     // but with `Stop_Process` declared `read_only` — dedicated fixture
     // rather than adding a second register to the shared one, since other
     // tests may assume exactly one register exists.
-    fn test_filesystem_with_read_only_register(
-        write_mode: WriteMode,
-    ) -> (
-        InfusedFilesystem,
-        mpsc::Receiver<HashMap<String, StagedValue>>,
-    ) {
+    fn test_filesystem_with_read_only_register(write_mode: WriteMode) -> TestFixture {
         let registers = vec![RegisterDescription {
             name: "Stop_Process".to_string(),
             address: 40001,
@@ -2247,7 +2642,9 @@ mod tests {
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, receiver) = mpsc::channel();
         (
-            InfusedFilesystem::new(
+            MachineFs::new(
+                1,
+                TEST_MACHINE_NAME.to_string(),
                 registers,
                 Vec::new(),
                 Vec::new(),
@@ -2260,7 +2657,6 @@ mod tests {
                 Arc::new(Mutex::new(FileRecordStore::new())),
                 sender,
                 report,
-                None,
                 FusePermissions::default(),
                 write_mode,
                 None,
@@ -2272,12 +2668,7 @@ mod tests {
     // Two file numbers (20 has two records, 30 has one) so tests can check
     // both the file_number-grouping level and the record level of
     // file-records/'s two-level nesting.
-    fn test_filesystem_with_file_records(
-        write_mode: WriteMode,
-    ) -> (
-        InfusedFilesystem,
-        mpsc::Receiver<HashMap<String, StagedValue>>,
-    ) {
+    fn test_filesystem_with_file_records(write_mode: WriteMode) -> TestFixture {
         let file_records = vec![
             FileRecordDescription {
                 file_number: 20,
@@ -2303,7 +2694,9 @@ mod tests {
         let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, receiver) = mpsc::channel();
         (
-            InfusedFilesystem::new(
+            MachineFs::new(
+                1,
+                TEST_MACHINE_NAME.to_string(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -2316,7 +2709,6 @@ mod tests {
                 file_record_store,
                 sender,
                 report,
-                None,
                 FusePermissions::default(),
                 write_mode,
                 None,
@@ -2325,32 +2717,13 @@ mod tests {
         )
     }
 
+    // client-trust/ is the outer `InfusedFilesystem`'s own concern now, not
+    // `MachineFs`'s — this fixture constructs the outer struct directly,
+    // with zero machines (nothing under test here needs one).
     fn test_filesystem_with_client_trust() -> InfusedFilesystem {
-        let store = Arc::new(Mutex::new(RegisterStore::new()));
-        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
-        let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
-        let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
-        let report = Arc::new(Mutex::new(WriteReport::new()));
         let (sender, _receiver) = mpsc::channel();
         let client_trust = Arc::new(Mutex::new(ClientTrustState::new()));
-        InfusedFilesystem::new(
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            store,
-            coil_store,
-            discrete_input_store,
-            input_register_store,
-            Arc::new(Mutex::new(FileRecordStore::new())),
-            sender,
-            report,
-            Some(client_trust),
-            FusePermissions::default(),
-            WriteMode::Direct,
-            None,
-        )
+        InfusedFilesystem::new(Vec::new(), sender, WriteMode::Direct, Some(client_trust))
     }
 
     // Distinct mode/uid/gid per directory so a test asserting on one
@@ -2589,20 +2962,6 @@ mod tests {
     }
 
     #[test]
-    fn permissions_for_returns_none_for_client_trust_inodes() {
-        let filesystem = test_filesystem_with_client_trust();
-
-        assert_eq!(
-            filesystem.permissions_for(filesystem.client_trust_ino),
-            None
-        );
-        assert_eq!(
-            filesystem.permissions_for(filesystem.client_trust_approved_ino),
-            None
-        );
-    }
-
-    #[test]
     fn client_trust_root_attr_override_hardcodes_the_client_trust_root_directory() {
         let filesystem = test_filesystem_with_client_trust();
         let (real_uid, real_gid) = crate::permissions::real_uid_and_gid();
@@ -2639,7 +2998,8 @@ mod tests {
 
     #[test]
     fn client_trust_root_attr_override_is_none_when_client_trust_is_absent() {
-        let (filesystem, _receiver) = test_filesystem();
+        let (sender, _receiver) = mpsc::channel();
+        let filesystem = InfusedFilesystem::new(Vec::new(), sender, WriteMode::Staged, None);
         // On the client (client_trust: None), there is no client-trust/ at
         // all — even passing this instance's own client_trust_ino value
         // must never trigger the override, since the directory it would
@@ -2669,7 +3029,8 @@ mod tests {
 
         filesystem.commit_transaction();
 
-        let received = receiver.try_recv().unwrap();
+        let (machine_name, received) = receiver.try_recv().unwrap();
+        assert_eq!(machine_name, TEST_MACHINE_NAME);
         assert_eq!(
             received.get("Stop_Process"),
             Some(&StagedValue::Register(RegisterValue::U16(1)))
@@ -2836,19 +3197,19 @@ mod tests {
     #[test]
     fn parse_register_value_accepts_decimal_for_every_unsigned_type() {
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::U8, "255"),
+            MachineFs::parse_register_value(DataType::U8, "255"),
             Some(RegisterValue::U8(255))
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::U16, "65535"),
+            MachineFs::parse_register_value(DataType::U16, "65535"),
             Some(RegisterValue::U16(65535))
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::U32, "4000000000"),
+            MachineFs::parse_register_value(DataType::U32, "4000000000"),
             Some(RegisterValue::U32(4_000_000_000))
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::U64, "18000000000000000000"),
+            MachineFs::parse_register_value(DataType::U64, "18000000000000000000"),
             Some(RegisterValue::U64(18_000_000_000_000_000_000))
         );
     }
@@ -2856,19 +3217,19 @@ mod tests {
     #[test]
     fn parse_register_value_accepts_hex_for_every_unsigned_type() {
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::U8, "0xFF"),
+            MachineFs::parse_register_value(DataType::U8, "0xFF"),
             Some(RegisterValue::U8(255))
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::U16, "0xBEEF"),
+            MachineFs::parse_register_value(DataType::U16, "0xBEEF"),
             Some(RegisterValue::U16(0xBEEF))
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::U32, "0xDEADBEEF"),
+            MachineFs::parse_register_value(DataType::U32, "0xDEADBEEF"),
             Some(RegisterValue::U32(0xDEADBEEF))
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::U64, "0xFFFFFFFFFFFFFFFF"),
+            MachineFs::parse_register_value(DataType::U64, "0xFFFFFFFFFFFFFFFF"),
             Some(RegisterValue::U64(u64::MAX))
         );
     }
@@ -2876,19 +3237,19 @@ mod tests {
     #[test]
     fn parse_register_value_accepts_decimal_for_every_signed_type() {
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::I8, "-128"),
+            MachineFs::parse_register_value(DataType::I8, "-128"),
             Some(RegisterValue::I8(-128))
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::I16, "-32768"),
+            MachineFs::parse_register_value(DataType::I16, "-32768"),
             Some(RegisterValue::I16(-32768))
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::I32, "-2000000000"),
+            MachineFs::parse_register_value(DataType::I32, "-2000000000"),
             Some(RegisterValue::I32(-2_000_000_000))
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::I64, "-9000000000000000000"),
+            MachineFs::parse_register_value(DataType::I64, "-9000000000000000000"),
             Some(RegisterValue::I64(-9_000_000_000_000_000_000))
         );
     }
@@ -2896,11 +3257,11 @@ mod tests {
     #[test]
     fn parse_register_value_accepts_decimal_for_both_float_types() {
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::F32, "3.5"),
+            MachineFs::parse_register_value(DataType::F32, "3.5"),
             Some(RegisterValue::F32(3.5))
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::F64, "3.5"),
+            MachineFs::parse_register_value(DataType::F64, "3.5"),
             Some(RegisterValue::F64(3.5))
         );
     }
@@ -2908,11 +3269,11 @@ mod tests {
     #[test]
     fn parse_register_value_accepts_u24_within_range_decimal_and_hex() {
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::U24, "16777215"),
+            MachineFs::parse_register_value(DataType::U24, "16777215"),
             Some(RegisterValue::U24(0x00FF_FFFF))
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::U24, "0xFFFFFF"),
+            MachineFs::parse_register_value(DataType::U24, "0xFFFFFF"),
             Some(RegisterValue::U24(0x00FF_FFFF))
         );
     }
@@ -2920,7 +3281,7 @@ mod tests {
     #[test]
     fn parse_register_value_rejects_u24_above_the_24_bit_range() {
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::U24, "16777216"),
+            MachineFs::parse_register_value(DataType::U24, "16777216"),
             None
         );
     }
@@ -2928,11 +3289,11 @@ mod tests {
     #[test]
     fn parse_register_value_accepts_i24_within_range() {
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::I24, "-8388608"),
+            MachineFs::parse_register_value(DataType::I24, "-8388608"),
             Some(RegisterValue::I24(-8_388_608))
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::I24, "8388607"),
+            MachineFs::parse_register_value(DataType::I24, "8388607"),
             Some(RegisterValue::I24(8_388_607))
         );
     }
@@ -2940,11 +3301,11 @@ mod tests {
     #[test]
     fn parse_register_value_rejects_i24_outside_the_24_bit_range() {
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::I24, "8388608"),
+            MachineFs::parse_register_value(DataType::I24, "8388608"),
             None
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::I24, "-8388609"),
+            MachineFs::parse_register_value(DataType::I24, "-8388609"),
             None
         );
     }
@@ -2952,7 +3313,7 @@ mod tests {
     #[test]
     fn parse_register_value_trims_whitespace() {
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::U16, " 42\n"),
+            MachineFs::parse_register_value(DataType::U16, " 42\n"),
             Some(RegisterValue::U16(42))
         );
     }
@@ -2960,15 +3321,15 @@ mod tests {
     #[test]
     fn parse_register_value_rejects_garbage() {
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::U16, "not a number"),
+            MachineFs::parse_register_value(DataType::U16, "not a number"),
             None
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::I32, "not a number"),
+            MachineFs::parse_register_value(DataType::I32, "not a number"),
             None
         );
         assert_eq!(
-            InfusedFilesystem::parse_register_value(DataType::F64, "not a number"),
+            MachineFs::parse_register_value(DataType::F64, "not a number"),
             None
         );
     }
@@ -2976,7 +3337,7 @@ mod tests {
     #[test]
     fn parse_masked_register_value_accepts_hex_masks() {
         assert_eq!(
-            InfusedFilesystem::parse_masked_register_value("MASK 0x00F2 0x0025"),
+            MachineFs::parse_masked_register_value("MASK 0x00F2 0x0025"),
             Some((0x00F2, 0x0025))
         );
     }
@@ -2984,7 +3345,7 @@ mod tests {
     #[test]
     fn parse_masked_register_value_accepts_decimal_masks() {
         assert_eq!(
-            InfusedFilesystem::parse_masked_register_value("MASK 242 37"),
+            MachineFs::parse_masked_register_value("MASK 242 37"),
             Some((242, 37))
         );
     }
@@ -2992,7 +3353,7 @@ mod tests {
     #[test]
     fn parse_masked_register_value_is_case_insensitive_and_trims_whitespace() {
         assert_eq!(
-            InfusedFilesystem::parse_masked_register_value("  mask 0x00F2 0x0025  \n"),
+            MachineFs::parse_masked_register_value("  mask 0x00F2 0x0025  \n"),
             Some((0x00F2, 0x0025))
         );
     }
@@ -3000,19 +3361,16 @@ mod tests {
     #[test]
     fn parse_masked_register_value_rejects_missing_keyword() {
         assert_eq!(
-            InfusedFilesystem::parse_masked_register_value("0x00F2 0x0025"),
+            MachineFs::parse_masked_register_value("0x00F2 0x0025"),
             None
         );
     }
 
     #[test]
     fn parse_masked_register_value_rejects_wrong_token_count() {
+        assert_eq!(MachineFs::parse_masked_register_value("MASK 0x00F2"), None);
         assert_eq!(
-            InfusedFilesystem::parse_masked_register_value("MASK 0x00F2"),
-            None
-        );
-        assert_eq!(
-            InfusedFilesystem::parse_masked_register_value("MASK 0x00F2 0x0025 0x0000"),
+            MachineFs::parse_masked_register_value("MASK 0x00F2 0x0025 0x0000"),
             None
         );
     }
@@ -3020,42 +3378,33 @@ mod tests {
     #[test]
     fn parse_masked_register_value_rejects_garbage_masks() {
         assert_eq!(
-            InfusedFilesystem::parse_masked_register_value("MASK not-a-mask 0x0025"),
+            MachineFs::parse_masked_register_value("MASK not-a-mask 0x0025"),
             None
         );
     }
 
     #[test]
     fn parse_coil_value_accepts_zero_and_one() {
-        assert_eq!(
-            InfusedFilesystem::parse_coil_value("0"),
-            Some(CoilValue(false))
-        );
-        assert_eq!(
-            InfusedFilesystem::parse_coil_value("1"),
-            Some(CoilValue(true))
-        );
+        assert_eq!(MachineFs::parse_coil_value("0"), Some(CoilValue(false)));
+        assert_eq!(MachineFs::parse_coil_value("1"), Some(CoilValue(true)));
     }
 
     #[test]
     fn parse_coil_value_trims_whitespace() {
-        assert_eq!(
-            InfusedFilesystem::parse_coil_value(" 1\n"),
-            Some(CoilValue(true))
-        );
+        assert_eq!(MachineFs::parse_coil_value(" 1\n"), Some(CoilValue(true)));
     }
 
     #[test]
     fn parse_coil_value_rejects_anything_else() {
-        assert_eq!(InfusedFilesystem::parse_coil_value("true"), None);
-        assert_eq!(InfusedFilesystem::parse_coil_value("2"), None);
-        assert_eq!(InfusedFilesystem::parse_coil_value(""), None);
+        assert_eq!(MachineFs::parse_coil_value("true"), None);
+        assert_eq!(MachineFs::parse_coil_value("2"), None);
+        assert_eq!(MachineFs::parse_coil_value(""), None);
     }
 
     #[test]
     fn parse_file_record_value_accepts_space_separated_hex() {
         assert_eq!(
-            InfusedFilesystem::parse_file_record_value("0D FE 00 20"),
+            MachineFs::parse_file_record_value("0D FE 00 20"),
             Some(vec![0x0D, 0xFE, 0x00, 0x20])
         );
     }
@@ -3063,7 +3412,7 @@ mod tests {
     #[test]
     fn parse_file_record_value_accepts_contiguous_hex() {
         assert_eq!(
-            InfusedFilesystem::parse_file_record_value("0dfe0020"),
+            MachineFs::parse_file_record_value("0dfe0020"),
             Some(vec![0x0D, 0xFE, 0x00, 0x20])
         );
     }
@@ -3071,52 +3420,46 @@ mod tests {
     #[test]
     fn parse_file_record_value_trims_surrounding_whitespace() {
         assert_eq!(
-            InfusedFilesystem::parse_file_record_value("\n  AB CD  \n"),
+            MachineFs::parse_file_record_value("\n  AB CD  \n"),
             Some(vec![0xAB, 0xCD])
         );
     }
 
     #[test]
     fn parse_file_record_value_rejects_odd_length() {
-        assert_eq!(InfusedFilesystem::parse_file_record_value("ABC"), None);
+        assert_eq!(MachineFs::parse_file_record_value("ABC"), None);
     }
 
     #[test]
     fn parse_file_record_value_rejects_non_hex_characters() {
-        assert_eq!(InfusedFilesystem::parse_file_record_value("ZZ"), None);
+        assert_eq!(MachineFs::parse_file_record_value("ZZ"), None);
     }
 
     #[test]
     fn parse_file_record_value_rejects_empty_input() {
-        assert_eq!(InfusedFilesystem::parse_file_record_value(""), None);
-        assert_eq!(InfusedFilesystem::parse_file_record_value("   "), None);
+        assert_eq!(MachineFs::parse_file_record_value(""), None);
+        assert_eq!(MachineFs::parse_file_record_value("   "), None);
     }
 
     #[test]
     fn parse_file_record_name_accepts_a_colon_separated_pair() {
-        assert_eq!(
-            InfusedFilesystem::parse_file_record_name("4:1"),
-            Some((4, 1))
-        );
+        assert_eq!(MachineFs::parse_file_record_name("4:1"), Some((4, 1)));
     }
 
     #[test]
     fn parse_file_record_name_rejects_a_missing_colon() {
-        assert_eq!(InfusedFilesystem::parse_file_record_name("41"), None);
+        assert_eq!(MachineFs::parse_file_record_name("41"), None);
     }
 
     #[test]
     fn parse_file_record_name_rejects_non_numeric_parts() {
-        assert_eq!(InfusedFilesystem::parse_file_record_name("a:1"), None);
-        assert_eq!(InfusedFilesystem::parse_file_record_name("4:b"), None);
+        assert_eq!(MachineFs::parse_file_record_name("a:1"), None);
+        assert_eq!(MachineFs::parse_file_record_name("4:b"), None);
     }
 
     #[test]
     fn file_record_report_name_is_colon_separated() {
-        assert_eq!(
-            InfusedFilesystem::file_record_report_name(4, 1),
-            "4:1".to_string()
-        );
+        assert_eq!(MachineFs::file_record_report_name(4, 1), "4:1".to_string());
     }
 
     #[test]
@@ -3263,7 +3606,8 @@ mod tests {
 
     #[test]
     fn client_trust_is_none_when_not_constructed_with_it() {
-        let (filesystem, _receiver) = test_filesystem();
+        let (sender, _receiver) = mpsc::channel();
+        let filesystem = InfusedFilesystem::new(Vec::new(), sender, WriteMode::Staged, None);
         assert!(filesystem.client_trust_lock().is_none());
     }
 
@@ -3273,15 +3617,23 @@ mod tests {
         assert!(filesystem.client_trust_lock().is_some());
     }
 
+    // `report_ino`/`server_id_ino`-relative calibration no longer applies
+    // here at all — client-trust/'s fixed inodes now live entirely on the
+    // outer `InfusedFilesystem`, in a small, independent range that never
+    // needs calibrating against any `MachineFs`'s own (astronomically
+    // larger, `FIRST_MACHINE_INO`-based) inode range in the first place.
+    // What's still worth asserting: client-trust/'s own fixed inodes stay
+    // distinct from each other, its dynamic per-fingerprint range starts
+    // strictly after them, and the whole thing never strays into machine
+    // territory.
     #[test]
     fn client_trust_inodes_are_calibrated_past_every_fixed_inode() {
         let filesystem = test_filesystem_with_client_trust();
-        assert_ne!(filesystem.client_trust_ino, filesystem.report_ino);
-        assert_ne!(filesystem.client_trust_approved_ino, filesystem.report_ino);
         assert_ne!(
             filesystem.client_trust_ino,
             filesystem.client_trust_approved_ino
         );
+        assert!(filesystem.rejected_log_ino.0 < FIRST_MACHINE_INO);
 
         // The dynamic per-fingerprint inode range must start strictly
         // after both fixed client-trust/ directory inodes, same reasoning
@@ -3291,20 +3643,6 @@ mod tests {
             .unwrap()
             .insert_approved("aa:bb");
         assert!(ino.0 > filesystem.client_trust_approved_ino.0);
-    }
-
-    #[test]
-    fn server_id_ino_is_calibrated_past_every_fixed_inode() {
-        let filesystem = test_filesystem_with_client_trust();
-        assert_ne!(filesystem.server_id_ino, filesystem.client_trust_ino);
-        assert_ne!(
-            filesystem.server_id_ino,
-            filesystem.client_trust_approved_ino
-        );
-        assert_ne!(filesystem.server_id_ino, filesystem.connection_attempts_ino);
-        assert_ne!(filesystem.server_id_ino, filesystem.approved_log_ino);
-        assert_ne!(filesystem.server_id_ino, filesystem.pending_log_ino);
-        assert_ne!(filesystem.server_id_ino, filesystem.rejected_log_ino);
     }
 
     #[test]
@@ -3374,12 +3712,135 @@ mod tests {
 
     #[test]
     fn connection_attempts_log_content_is_empty_without_client_trust() {
-        let (filesystem, _receiver) = test_filesystem();
+        let (sender, _receiver) = mpsc::channel();
+        let filesystem = InfusedFilesystem::new(Vec::new(), sender, WriteMode::Staged, None);
         // Any ino at all — there's no client_trust, so every one of these
         // should behave the same (empty), not panic on an absent lock.
         assert_eq!(
             filesystem.connection_attempts_log_content(INodeNo(9999)),
             ""
+        );
+    }
+
+    // --- Outer `InfusedFilesystem` multi-machine routing ---
+    //
+    // These don't drive `lookup`/`getattr`/`readdir` directly (no
+    // `fuser::Request`/`Reply*` test harness exists in this file — every
+    // other test here exercises the same underlying logic through plain
+    // inherent helper methods instead, consistent with this project's
+    // "unit tests per function, interaction-level behavior via the
+    // project's own fuzzer" testing strategy). They check the same thing
+    // those trait methods actually rely on for correct routing: each
+    // machine's `MachineConfig` produces a distinct, correctly-offset
+    // `MachineFs`, `machine_by_name`/`machine_owning_ino` resolve
+    // correctly, and an ino belonging to one machine is never mistaken for
+    // another's.
+
+    fn machine_config(name: &str, register_name: &str) -> MachineConfig {
+        MachineConfig {
+            name: name.to_string(),
+            registers: vec![RegisterDescription {
+                name: register_name.to_string(),
+                address: 40001,
+                data_type: DataType::U16,
+                access: AccessRight::ReadWrite,
+            }],
+            coils: Vec::new(),
+            discrete_inputs: Vec::new(),
+            input_registers: Vec::new(),
+            file_records: Vec::new(),
+            store: Arc::new(Mutex::new(RegisterStore::new())),
+            coil_store: Arc::new(Mutex::new(CoilStore::new())),
+            discrete_input_store: Arc::new(Mutex::new(DiscreteInputStore::new())),
+            input_register_store: Arc::new(Mutex::new(InputRegisterStore::new())),
+            file_record_store: Arc::new(Mutex::new(FileRecordStore::new())),
+            report: Arc::new(Mutex::new(WriteReport::new())),
+            permissions: FusePermissions::default(),
+            server_id: None,
+        }
+    }
+
+    fn test_two_machine_filesystem() -> InfusedFilesystem {
+        let (sender, _receiver) = mpsc::channel();
+        InfusedFilesystem::new(
+            vec![
+                machine_config("PumpA", "Stop_Process"),
+                machine_config("PumpB", "Flow_Rate"),
+            ],
+            sender,
+            WriteMode::Staged,
+            None,
+        )
+    }
+
+    #[test]
+    fn each_machine_gets_a_distinct_stride_based_inode_range() {
+        let filesystem = test_two_machine_filesystem();
+        assert_eq!(filesystem.machines[0].dir_ino.0, FIRST_MACHINE_INO);
+        assert_eq!(
+            filesystem.machines[1].dir_ino.0,
+            FIRST_MACHINE_INO + MACHINE_INO_STRIDE
+        );
+    }
+
+    #[test]
+    fn machine_by_name_resolves_every_configured_machine_and_nothing_else() {
+        let filesystem = test_two_machine_filesystem();
+        assert_eq!(
+            filesystem.machine_by_name("PumpA").map(|m| m.name.as_str()),
+            Some("PumpA")
+        );
+        assert_eq!(
+            filesystem.machine_by_name("PumpB").map(|m| m.name.as_str()),
+            Some("PumpB")
+        );
+        assert!(filesystem.machine_by_name("PumpC").is_none());
+    }
+
+    #[test]
+    fn machine_owning_ino_never_resolves_an_ino_from_a_different_machine() {
+        let filesystem = test_two_machine_filesystem();
+        let pump_a = filesystem.machine_by_name("PumpA").unwrap();
+        let pump_a_register_ino = *pump_a.name_to_ino.get("Stop_Process").unwrap();
+
+        assert_eq!(
+            filesystem
+                .machine_owning_ino(pump_a_register_ino)
+                .map(|m| m.name.as_str()),
+            Some("PumpA")
+        );
+        // PumpB must never claim an inode that belongs to PumpA's range.
+        let pump_b = filesystem.machine_by_name("PumpB").unwrap();
+        assert!(!pump_b.owns_ino(pump_a_register_ino));
+        // And PumpA genuinely has no "Flow_Rate" register of its own.
+        assert!(pump_a.register_by_name("Flow_Rate").is_none());
+    }
+
+    #[test]
+    fn machine_owning_ino_returns_none_for_the_true_root_and_client_trust_range() {
+        let filesystem = test_two_machine_filesystem();
+        assert!(filesystem.machine_owning_ino(ROOT_INO).is_none());
+    }
+
+    #[test]
+    fn client_trust_is_still_reachable_at_root_alongside_machines() {
+        let (sender, _receiver) = mpsc::channel();
+        let client_trust = Arc::new(Mutex::new(ClientTrustState::new()));
+        let filesystem = InfusedFilesystem::new(
+            vec![machine_config("PumpA", "Stop_Process")],
+            sender,
+            WriteMode::Staged,
+            Some(client_trust),
+        );
+
+        assert!(filesystem.client_trust_lock().is_some());
+        // client-trust/'s fixed inodes stay in the outer struct's own small
+        // range, never colliding with the machine's much larger one.
+        assert!(filesystem.client_trust_ino.0 < FIRST_MACHINE_INO);
+        assert!(
+            filesystem
+                .machine_owning_ino(filesystem.client_trust_ino)
+                .is_none()
         );
     }
 }
