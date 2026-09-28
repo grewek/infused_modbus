@@ -134,11 +134,17 @@ pub async fn confirm_write_multiple(
     unit_id: u8,
     timeout: Duration,
 ) -> WriteStatus {
-    let pdu = WriteMultipleRegistersRequest {
+    let pdu = match (WriteMultipleRegistersRequest {
         starting_address,
         register_values: values.to_vec(),
-    }
-    .encode();
+    })
+    .encode()
+    {
+        Ok(pdu) => pdu,
+        Err(error) => {
+            return WriteStatus::Failed(format!("failed to build write request: {error:?}"));
+        }
+    };
     match connection.request(unit_id, pdu, timeout).await {
         Ok(response_pdu) => interpret_write_response(&response_pdu),
         Err(error) => WriteStatus::Failed(format!("write failed: {error}")),

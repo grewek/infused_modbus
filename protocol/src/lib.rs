@@ -27,6 +27,18 @@ pub enum DecodeError {
     InvalidFileRecordSubResponseLength { length: u8 },
 }
 
+// Unlike `DecodeError`, essentially unused so far — every other `encode()` in
+// this crate is infallible by construction (it's building wire bytes from an
+// already-valid Rust value). `WriteMultipleRegistersRequest::encode` is the
+// first exception: `register_values.len()` isn't bounded by the type system,
+// so an over-long vec has to be rejected explicitly rather than silently
+// truncated by the `as u16`/`as u8` casts the wire format's own quantity/
+// byte-count fields need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodeError {
+    TooManyRegisters { count: usize, max: usize },
+}
+
 pub(crate) fn read_u16_be(bytes: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
 }

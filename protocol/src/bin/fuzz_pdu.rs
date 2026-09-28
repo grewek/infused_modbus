@@ -16,9 +16,13 @@ const ROUND_TRIP_FUZZ_ITERATIONS: usize = 5_000;
 const MAX_FUZZ_BUFFER_LEN: usize = 300;
 
 // Modbus spec limits, not just overflow avoidance: real devices reject requests
-// asking for more registers than this, and WriteMultipleRegistersRequest::encode
-// does not (yet) validate its input against this limit, so the fuzzer stays
-// inside it rather than exercising that known gap.
+// asking for more registers than this. WriteMultipleRegistersRequest::encode
+// enforces its own limit now (see the dedicated over-limit loop in
+// fuzz_round_trips below), but ReadHoldingRegistersRequest has no equivalent
+// check (it only ever carries a `quantity` field, never a value vec, so
+// there's nothing for encode to validate the length of) — the fuzzer stays
+// inside this limit for that one so round-trip decoding isn't exercising an
+// address range no real request would.
 const MAX_READ_HOLDING_REGISTERS_COUNT: usize = 125;
 const MAX_WRITE_MULTIPLE_REGISTERS_COUNT: usize = 123;
 
@@ -197,16 +201,44 @@ fn fuzz_round_trips(rng: &mut Xorshift64) {
             starting_address: rng.next_u16(),
             register_values: rng.next_u16_vec(register_count),
         };
-        let decoded =
-            WriteMultipleRegistersRequest::decode(&request.encode()).unwrap_or_else(|error| {
-                panic!("WriteMultipleRegistersRequest failed to decode: {error:?}")
-            });
+        let encoded = request.encode().unwrap_or_else(|error| {
+            panic!("WriteMultipleRegistersRequest failed to encode: {error:?}")
+        });
+        let decoded = WriteMultipleRegistersRequest::decode(&encoded).unwrap_or_else(|error| {
+            panic!("WriteMultipleRegistersRequest failed to decode: {error:?}")
+        });
         assert_eq!(
             request, decoded,
             "WriteMultipleRegistersRequest round trip mismatch"
         );
     }
     println!("WriteMultipleRegistersRequest: {ROUND_TRIP_FUZZ_ITERATIONS} round trips ok");
+
+    // The known-gap check this fuzzer used to just avoid (see
+    // MAX_WRITE_MULTIPLE_REGISTERS_COUNT's own comment) — now that
+    // WriteMultipleRegistersRequest::encode validates its input, exercise the
+    // rejection path itself: any length past the spec limit must come back as
+    // an error, never a silently-truncated/wrapped PDU.
+    for _ in 0..ROUND_TRIP_FUZZ_ITERATIONS {
+        let register_count =
+            MAX_WRITE_MULTIPLE_REGISTERS_COUNT + 1 + rng.next_usize_below(MAX_FUZZ_BUFFER_LEN);
+        let request = WriteMultipleRegistersRequest {
+            starting_address: rng.next_u16(),
+            register_values: rng.next_u16_vec(register_count),
+        };
+        match request.encode() {
+            Err(protocol::EncodeError::TooManyRegisters { count, max }) => {
+                assert_eq!(count, register_count);
+                assert_eq!(max, MAX_WRITE_MULTIPLE_REGISTERS_COUNT);
+            }
+            other => panic!(
+                "WriteMultipleRegistersRequest with {register_count} registers should have been rejected, got {other:?}"
+            ),
+        }
+    }
+    println!(
+        "WriteMultipleRegistersRequest: {ROUND_TRIP_FUZZ_ITERATIONS} over-limit encodes correctly rejected"
+    );
 
     for _ in 0..ROUND_TRIP_FUZZ_ITERATIONS {
         let response = WriteMultipleRegistersResponse {

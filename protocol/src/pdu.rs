@@ -1,4 +1,4 @@
-use crate::{DecodeError, read_u16_be};
+use crate::{DecodeError, EncodeError, read_u16_be};
 
 pub const FUNCTION_CODE_READ_COILS: u8 = 0x01;
 pub const FUNCTION_CODE_READ_DISCRETE_INPUTS: u8 = 0x02;
@@ -1101,8 +1101,25 @@ impl WriteMultipleCoilsResponse {
     }
 }
 
+// The spec's own limit on how many registers one Write Multiple Registers
+// (0x10) request may carry — same value `client::transaction_consumer`'s
+// write-batching already caps itself at, but enforced here too since that's
+// an application-level choice, not something the wire format itself
+// guarantees against a caller that bypasses it. Also the real reason this
+// needs enforcing at all: `quantity` is a wire `u16` and `byte_count` a wire
+// `u8` (`register_values.len() * 2`), so a `register_values` longer than
+// this would silently truncate through the `as u16`/`as u8` casts below
+// instead of failing loudly.
+const MAX_WRITE_MULTIPLE_REGISTERS_COUNT: usize = 123;
+
 impl WriteMultipleRegistersRequest {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
+        if self.register_values.len() > MAX_WRITE_MULTIPLE_REGISTERS_COUNT {
+            return Err(EncodeError::TooManyRegisters {
+                count: self.register_values.len(),
+                max: MAX_WRITE_MULTIPLE_REGISTERS_COUNT,
+            });
+        }
         let mut buffer =
             Vec::with_capacity(WRITE_MULTIPLE_REQUEST_HEADER_LEN + self.register_values.len() * 2);
         buffer.push(FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS);
@@ -1113,7 +1130,7 @@ impl WriteMultipleRegistersRequest {
         for value in &self.register_values {
             buffer.extend_from_slice(&value.to_be_bytes());
         }
-        buffer
+        Ok(buffer)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
@@ -2576,7 +2593,7 @@ mod tests {
             starting_address: 0x0001,
             register_values: vec![0x000A, 0x0102],
         };
-        let encoded = request.encode();
+        let encoded = request.encode().unwrap();
         let decoded = WriteMultipleRegistersRequest::decode(&encoded).unwrap();
         assert_eq!(request, decoded);
     }
@@ -2588,9 +2605,33 @@ mod tests {
             register_values: vec![0x000A, 0x0102],
         };
         assert_eq!(
-            request.encode(),
+            request.encode().unwrap(),
             vec![0x10, 0x00, 0x01, 0x00, 0x02, 0x04, 0x00, 0x0A, 0x01, 0x02]
         );
+    }
+
+    #[test]
+    fn write_multiple_registers_request_encode_rejects_more_than_123_registers() {
+        let request = WriteMultipleRegistersRequest {
+            starting_address: 0x0001,
+            register_values: vec![0; 124],
+        };
+        assert_eq!(
+            request.encode(),
+            Err(EncodeError::TooManyRegisters {
+                count: 124,
+                max: 123
+            })
+        );
+    }
+
+    #[test]
+    fn write_multiple_registers_request_encode_accepts_exactly_123_registers() {
+        let request = WriteMultipleRegistersRequest {
+            starting_address: 0x0001,
+            register_values: vec![0; 123],
+        };
+        assert!(request.encode().is_ok());
     }
 
     #[test]

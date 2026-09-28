@@ -1688,7 +1688,8 @@ mod tests {
             starting_address: 40010,
             register_values: vec![11, 22],
         }
-        .encode();
+        .encode()
+        .unwrap();
 
         let response = test_handle_request(
             &request,
@@ -1737,7 +1738,8 @@ mod tests {
             starting_address: 40020,
             register_values: words,
         }
-        .encode();
+        .encode()
+        .unwrap();
 
         let response = test_handle_request(
             &request,
@@ -1783,7 +1785,8 @@ mod tests {
             starting_address: 40001,
             register_values: vec![1, 2],
         }
-        .encode();
+        .encode()
+        .unwrap();
 
         let response = test_handle_request(
             &request,
