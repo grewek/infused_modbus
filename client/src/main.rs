@@ -52,14 +52,12 @@
 use client::connection::Connection;
 use client::device_identification::fetch_device_description;
 use client::polling::run_polling_loop;
-use client::transaction_consumer::run_transaction_consumer;
+use client::transaction_consumer::{MachineTransactionConfig, run_transaction_consumer};
 use fuse_fs::filesystem::{InfusedFilesystem, WriteMode};
-use fuse_fs::{
-    CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore, WriteReport,
-};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::DeviceDescription;
-use std::sync::{Arc, Mutex, mpsc};
+use std::collections::HashMap;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -219,112 +217,146 @@ fn main() {
         });
     let description = DeviceDescription::parse(&toml_source)
         .unwrap_or_else(|error| panic!("failed to parse device description: {error}"));
-    let registers = description.registers;
-    let coils = description.coils;
-    // Not yet fed by polling (see CLAUDE.md's "read-only Modbus data
-    // types" section) — the discrete-inputs/input-registers directories
-    // exist and show the right file names, just with empty content until
-    // that wiring lands.
-    let discrete_inputs = description.discrete_inputs;
-    let input_registers = description.input_registers;
-    let file_records = description.file_records;
-    let mem_layout = description.mem_layout;
-    let input_register_mem_layout = description.input_register_mem_layout;
-    let server_id = description.server_id;
 
-    // Shared, not owned outright: the polling loop and the transaction
+    // Shared, not owned outright: the polling loop(s) and the transaction
     // consumer both need to talk to the device over this same connection,
     // and a generic Modbus device/gateway can't be assumed to accept more
     // than one concurrent connection (true for TCP gateways, and doubly
-    // true for RTU — one physical serial link, full stop).
+    // true for RTU — one physical serial link, full stop). One connection
+    // is shared by every configured machine too — see CLAUDE.md's
+    // multi-machine design: a single CLI-supplied connection string, each
+    // machine dispatching via its own `unit_id` on that shared link.
     let connection = Arc::new(AsyncMutex::new(connection));
 
-    let store = Arc::new(Mutex::new(RegisterStore::new()));
-    let coil_store = Arc::new(Mutex::new(CoilStore::new()));
-    let discrete_input_store = Arc::new(Mutex::new(DiscreteInputStore::new()));
-    let input_register_store = Arc::new(Mutex::new(InputRegisterStore::new()));
-    let file_record_store = Arc::new(Mutex::new(FileRecordStore::new()));
-    let report = Arc::new(Mutex::new(WriteReport::new()));
+    // One fresh set of stores per configured machine — see
+    // fuse_fs::build_machine_stores.
+    let machine_stores = fuse_fs::build_machine_stores(&description.machines);
+
     let (transaction_sender, transaction_receiver) = mpsc::channel();
+
+    // One consumer thread services every machine's writes, reading a
+    // single shared channel tagged with the originating machine's name
+    // (see fuse-fs's multi-machine `InfusedFilesystem` — the same
+    // "TRANSACTION_END confirmation semantics" apply per machine).
+    let machine_transaction_configs: HashMap<String, MachineTransactionConfig> = description
+        .machines
+        .iter()
+        .map(|machine| {
+            let stores = &machine_stores[&machine.name];
+            (
+                machine.name.clone(),
+                MachineTransactionConfig {
+                    registers: machine.registers.clone(),
+                    coils: machine.coils.clone(),
+                    file_records: machine.file_records.clone(),
+                    report: Arc::clone(&stores.report),
+                    mem_layout: machine.mem_layout,
+                    unit_id: machine.unit_id,
+                },
+            )
+        })
+        .collect();
 
     let handle = runtime.handle().clone();
     let consumer_connection = Arc::clone(&connection);
-    let consumer_registers = registers.clone();
-    let consumer_coils = coils.clone();
-    let consumer_file_records = file_records.clone();
-    let consumer_report = Arc::clone(&report);
     std::thread::spawn(move || {
         run_transaction_consumer(
             &handle,
             &consumer_connection,
-            &consumer_registers,
-            &consumer_coils,
-            &consumer_file_records,
-            &consumer_report,
-            mem_layout,
+            &machine_transaction_configs,
             transaction_receiver,
-            unit_id,
             WRITE_TIMEOUT,
         );
     });
 
-    let polling_connection = Arc::clone(&connection);
-    let polling_store = Arc::clone(&store);
-    let polling_registers = registers.clone();
-    let polling_coils = coils.clone();
-    let polling_coil_store = Arc::clone(&coil_store);
-    let polling_discrete_inputs = discrete_inputs.clone();
-    let polling_discrete_input_store = Arc::clone(&discrete_input_store);
-    let polling_input_registers = input_registers.clone();
-    let polling_input_register_store = Arc::clone(&input_register_store);
-    let polling_file_records = file_records.clone();
-    let polling_file_record_store = Arc::clone(&file_record_store);
-    runtime.spawn(async move {
-        run_polling_loop(
-            polling_connection,
-            &polling_registers,
-            polling_store,
-            &polling_coils,
-            polling_coil_store,
-            &polling_discrete_inputs,
-            polling_discrete_input_store,
-            &polling_input_registers,
-            polling_input_register_store,
-            &polling_file_records,
-            polling_file_record_store,
-            mem_layout,
-            input_register_mem_layout,
-            unit_id,
-            poll_interval,
-            POLL_TIMEOUT,
-        )
-        .await;
-    });
+    // One polling task per machine — `run_polling_loop` is already fully
+    // parameterized per-machine (its own unit_id/descriptions/stores), so
+    // multi-machine polling is just spawning it once per configured
+    // machine, all sharing the one connection.
+    for machine in &description.machines {
+        let stores = &machine_stores[&machine.name];
+        let polling_connection = Arc::clone(&connection);
+        let polling_registers = machine.registers.clone();
+        let polling_store = Arc::clone(&stores.registers);
+        let polling_coils = machine.coils.clone();
+        let polling_coil_store = Arc::clone(&stores.coils);
+        let polling_discrete_inputs = machine.discrete_inputs.clone();
+        let polling_discrete_input_store = Arc::clone(&stores.discrete_inputs);
+        let polling_input_registers = machine.input_registers.clone();
+        let polling_input_register_store = Arc::clone(&stores.input_registers);
+        let polling_file_records = machine.file_records.clone();
+        let polling_file_record_store = Arc::clone(&stores.file_records);
+        let mem_layout = machine.mem_layout;
+        let input_register_mem_layout = machine.input_register_mem_layout;
+        let machine_unit_id = machine.unit_id;
+        runtime.spawn(async move {
+            run_polling_loop(
+                polling_connection,
+                &polling_registers,
+                polling_store,
+                &polling_coils,
+                polling_coil_store,
+                &polling_discrete_inputs,
+                polling_discrete_input_store,
+                &polling_input_registers,
+                polling_input_register_store,
+                &polling_file_records,
+                polling_file_record_store,
+                mem_layout,
+                input_register_mem_layout,
+                machine_unit_id,
+                poll_interval,
+                POLL_TIMEOUT,
+            )
+            .await;
+        });
+    }
 
     std::fs::create_dir_all(&mountpoint).ok();
+    let machine_names: Vec<&str> = description
+        .machines
+        .iter()
+        .map(|machine| machine.name.as_str())
+        .collect();
     println!(
-        "Mounting infused_modbus at {mountpoint}, connected via {connection_string} (unit {unit_id})"
+        "Mounting infused_modbus at {mountpoint}, connected via {connection_string} — machines: {}",
+        machine_names.join(", ")
     );
 
+    let mut machine_stores = machine_stores;
+    let machines_for_fs: Vec<fuse_fs::filesystem::MachineConfig> = description
+        .machines
+        .into_iter()
+        .map(|machine| {
+            let stores = machine_stores
+                .remove(&machine.name)
+                .expect("machine_stores was built from the same machine list");
+            fuse_fs::filesystem::MachineConfig {
+                name: machine.name,
+                registers: machine.registers,
+                coils: machine.coils,
+                discrete_inputs: machine.discrete_inputs,
+                input_registers: machine.input_registers,
+                file_records: machine.file_records,
+                store: stores.registers,
+                coil_store: stores.coils,
+                discrete_input_store: stores.discrete_inputs,
+                input_register_store: stores.input_registers,
+                file_record_store: stores.file_records,
+                report: stores.report,
+                permissions: fuse_permissions,
+                server_id: machine.server_id,
+            }
+        })
+        .collect();
+
     let filesystem = InfusedFilesystem::new(
-        registers,
-        coils,
-        discrete_inputs,
-        input_registers,
-        file_records,
-        store,
-        coil_store,
-        discrete_input_store,
-        input_register_store,
-        file_record_store,
+        machines_for_fs,
         transaction_sender,
-        report,
+        WriteMode::Staged,
         // client-trust/ only exists on the server — see CLAUDE.md's TLS
         // design and fuse_fs::client_trust::ClientTrustState.
         None,
-        fuse_permissions,
-        WriteMode::Staged,
-        server_id,
     );
     // spawn_mount (not the blocking mount()) so Ctrl+C/SIGTERM below can
     // unmount cleanly instead of just killing the process and leaving a

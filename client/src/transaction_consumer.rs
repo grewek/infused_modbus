@@ -106,116 +106,74 @@ fn build_coil_write_batches(entries: Vec<(CoilDescription, bool)>) -> Vec<CoilWr
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// One machine's write-path config: the registers/coils/file_records to
+/// validate staged writes against, its own report sink, its own wire
+/// mem_layout, and which unit_id on the shared link it answers to. The
+/// outer `InfusedFilesystem`'s `transaction_sender` is shared by every
+/// machine (see fuse-fs step 3), so `run_transaction_consumer` needs one of
+/// these per configured machine name to know how to process a drained
+/// transaction tagged with that name.
+pub struct MachineTransactionConfig {
+    pub registers: Vec<RegisterDescription>,
+    pub coils: Vec<CoilDescription>,
+    pub file_records: Vec<FileRecordDescription>,
+    pub report: Arc<Mutex<WriteReport>>,
+    pub mem_layout: MemLayout,
+    pub unit_id: u8,
+}
+
 pub fn run_transaction_consumer(
     handle: &Handle,
     connection: &Arc<AsyncMutex<Connection>>,
-    registers: &[RegisterDescription],
-    coils: &[CoilDescription],
-    file_records: &[FileRecordDescription],
-    report: &Arc<Mutex<WriteReport>>,
-    mem_layout: MemLayout,
-    transaction_receiver: mpsc::Receiver<HashMap<String, StagedValue>>,
-    unit_id: u8,
+    machines: &HashMap<String, MachineTransactionConfig>,
+    transaction_receiver: mpsc::Receiver<(String, HashMap<String, StagedValue>)>,
     timeout: Duration,
 ) {
-    for transaction in transaction_receiver {
-        let mut register_entries: Vec<(RegisterDescription, RegisterValue)> = Vec::new();
-        let mut coil_entries: Vec<(CoilDescription, bool)> = Vec::new();
-        let mut masked_register_entries: Vec<(RegisterDescription, u16, u16)> = Vec::new();
-        let mut file_record_entries: Vec<(String, u16, u16, Vec<u8>)> = Vec::new();
+    for (machine_name, transaction) in transaction_receiver {
+        let Some(config) = machines.get(&machine_name) else {
+            eprintln!("received a transaction for unknown machine {machine_name:?}, dropping it");
+            continue;
+        };
+        process_transaction(handle, connection, config, transaction, timeout);
+    }
+}
 
-        // Resolve every staged name against the known registers/coils
-        // first, reporting anything unknown or mismatched immediately —
-        // only what's left gets batched below. A type mismatch shouldn't
-        // actually happen (fuse_fs always stages a value parsed against
-        // the register's own declared type), but is worth checking rather
-        // than assuming.
-        for (name, value) in transaction {
-            match value {
-                StagedValue::Register(value) => {
-                    match registers.iter().find(|register| register.name == name) {
-                        Some(register) if register.data_type == value.data_type() => {
-                            register_entries.push((register.clone(), value));
-                        }
-                        Some(register) => {
-                            let reason = format!(
-                                "register {name}: expected a {:?} value but got a {:?} one",
-                                register.data_type,
-                                value.data_type()
-                            );
-                            report
-                                .lock()
-                                .unwrap()
-                                .set(name, WriteStatus::Failed(reason));
-                        }
-                        None => {
-                            let reason = format!("unknown register: {name}");
-                            report
-                                .lock()
-                                .unwrap()
-                                .set(name, WriteStatus::Failed(reason));
-                        }
+fn process_transaction(
+    handle: &Handle,
+    connection: &Arc<AsyncMutex<Connection>>,
+    config: &MachineTransactionConfig,
+    transaction: HashMap<String, StagedValue>,
+    timeout: Duration,
+) {
+    let registers = &config.registers;
+    let coils = &config.coils;
+    let file_records = &config.file_records;
+    let report = &config.report;
+    let mem_layout = config.mem_layout;
+    let unit_id = config.unit_id;
+    let mut register_entries: Vec<(RegisterDescription, RegisterValue)> = Vec::new();
+    let mut coil_entries: Vec<(CoilDescription, bool)> = Vec::new();
+    let mut masked_register_entries: Vec<(RegisterDescription, u16, u16)> = Vec::new();
+    let mut file_record_entries: Vec<(String, u16, u16, Vec<u8>)> = Vec::new();
+
+    // Resolve every staged name against the known registers/coils
+    // first, reporting anything unknown or mismatched immediately —
+    // only what's left gets batched below. A type mismatch shouldn't
+    // actually happen (fuse_fs always stages a value parsed against
+    // the register's own declared type), but is worth checking rather
+    // than assuming.
+    for (name, value) in transaction {
+        match value {
+            StagedValue::Register(value) => {
+                match registers.iter().find(|register| register.name == name) {
+                    Some(register) if register.data_type == value.data_type() => {
+                        register_entries.push((register.clone(), value));
                     }
-                }
-                StagedValue::Coil(value) => match coils.iter().find(|coil| coil.name == name) {
-                    Some(coil) => coil_entries.push((coil.clone(), value.0)),
-                    None => {
-                        let reason = format!("unknown coil: {name}");
-                        report
-                            .lock()
-                            .unwrap()
-                            .set(name, WriteStatus::Failed(reason));
-                    }
-                },
-                // Never actually produced on the client — fuse-fs only
-                // constructs these from its server-only direct-write path
-                // (WriteMode::Direct), and the client always runs
-                // WriteMode::Staged. Handled defensively rather than
-                // assumed unreachable: no Modbus function code lets a
-                // master write either kind at all, so there's nothing to
-                // even attempt.
-                StagedValue::DiscreteInput(_) => {
-                    let reason = format!("discrete input {name}: never writable via Modbus");
-                    report
-                        .lock()
-                        .unwrap()
-                        .set(name, WriteStatus::Failed(reason));
-                }
-                StagedValue::InputRegister(_) => {
-                    let reason = format!("input register {name}: never writable via Modbus");
-                    report
-                        .lock()
-                        .unwrap()
-                        .set(name, WriteStatus::Failed(reason));
-                }
-                // Unlike DiscreteInput/InputRegister above, this one *is*
-                // real on the client — FC 0x15 (Write File Record) is the
-                // whole point of exposing file records here at all (a
-                // technician pushing data into a real device's file/record
-                // slot), unlike FC17 where the client already had every
-                // equivalent tool. Resolved against the known
-                // `file_records` the same way registers/coils are above;
-                // sent individually below (`file_record_entries`), never
-                // batched — same reasoning as `masked_register_entries`,
-                // Modbus has no "write multiple file records" function
-                // code.
-                StagedValue::FileRecord {
-                    file_number,
-                    record_number,
-                    value,
-                } => match file_records.iter().find(|description| {
-                    description.file_number == file_number
-                        && description.record_number == record_number
-                }) {
-                    Some(description) if value.len() == description.record_length as usize * 2 => {
-                        file_record_entries.push((name, file_number, record_number, value));
-                    }
-                    Some(description) => {
+                    Some(register) => {
                         let reason = format!(
-                            "file record {file_number}:{record_number}: expected {} bytes but got {}",
-                            description.record_length as usize * 2,
-                            value.len()
+                            "register {name}: expected a {:?} value but got a {:?} one",
+                            register.data_type,
+                            value.data_type()
                         );
                         report
                             .lock()
@@ -223,162 +181,232 @@ pub fn run_transaction_consumer(
                             .set(name, WriteStatus::Failed(reason));
                     }
                     None => {
-                        let reason = format!("unknown file record: {file_number}:{record_number}");
+                        let reason = format!("unknown register: {name}");
                         report
                             .lock()
                             .unwrap()
                             .set(name, WriteStatus::Failed(reason));
                     }
-                },
-                // Collected separately from register_entries, not batched:
-                // Mask Write Register (FC 0x16) has no "multiple" variant,
-                // so each masked write always goes out as its own request
-                // (see confirm_mask_write's doc comment).
-                StagedValue::MaskedRegister { and_mask, or_mask } => {
-                    match registers.iter().find(|register| register.name == name) {
-                        Some(register) if register.data_type.register_count() == 1 => {
-                            masked_register_entries.push((register.clone(), and_mask, or_mask));
-                        }
-                        Some(register) => {
-                            let reason = format!(
-                                "register {name}: {:?} needs {} registers, Mask Write Register can only target a single register",
-                                register.data_type,
-                                register.data_type.register_count()
-                            );
-                            report
-                                .lock()
-                                .unwrap()
-                                .set(name, WriteStatus::Failed(reason));
-                        }
-                        None => {
-                            let reason = format!("unknown register: {name}");
-                            report
-                                .lock()
-                                .unwrap()
-                                .set(name, WriteStatus::Failed(reason));
-                        }
+                }
+            }
+            StagedValue::Coil(value) => match coils.iter().find(|coil| coil.name == name) {
+                Some(coil) => coil_entries.push((coil.clone(), value.0)),
+                None => {
+                    let reason = format!("unknown coil: {name}");
+                    report
+                        .lock()
+                        .unwrap()
+                        .set(name, WriteStatus::Failed(reason));
+                }
+            },
+            // Never actually produced on the client — fuse-fs only
+            // constructs these from its server-only direct-write path
+            // (WriteMode::Direct), and the client always runs
+            // WriteMode::Staged. Handled defensively rather than
+            // assumed unreachable: no Modbus function code lets a
+            // master write either kind at all, so there's nothing to
+            // even attempt.
+            StagedValue::DiscreteInput(_) => {
+                let reason = format!("discrete input {name}: never writable via Modbus");
+                report
+                    .lock()
+                    .unwrap()
+                    .set(name, WriteStatus::Failed(reason));
+            }
+            StagedValue::InputRegister(_) => {
+                let reason = format!("input register {name}: never writable via Modbus");
+                report
+                    .lock()
+                    .unwrap()
+                    .set(name, WriteStatus::Failed(reason));
+            }
+            // Unlike DiscreteInput/InputRegister above, this one *is*
+            // real on the client — FC 0x15 (Write File Record) is the
+            // whole point of exposing file records here at all (a
+            // technician pushing data into a real device's file/record
+            // slot), unlike FC17 where the client already had every
+            // equivalent tool. Resolved against the known
+            // `file_records` the same way registers/coils are above;
+            // sent individually below (`file_record_entries`), never
+            // batched — same reasoning as `masked_register_entries`,
+            // Modbus has no "write multiple file records" function
+            // code.
+            StagedValue::FileRecord {
+                file_number,
+                record_number,
+                value,
+            } => match file_records.iter().find(|description| {
+                description.file_number == file_number && description.record_number == record_number
+            }) {
+                Some(description) if value.len() == description.record_length as usize * 2 => {
+                    file_record_entries.push((name, file_number, record_number, value));
+                }
+                Some(description) => {
+                    let reason = format!(
+                        "file record {file_number}:{record_number}: expected {} bytes but got {}",
+                        description.record_length as usize * 2,
+                        value.len()
+                    );
+                    report
+                        .lock()
+                        .unwrap()
+                        .set(name, WriteStatus::Failed(reason));
+                }
+                None => {
+                    let reason = format!("unknown file record: {file_number}:{record_number}");
+                    report
+                        .lock()
+                        .unwrap()
+                        .set(name, WriteStatus::Failed(reason));
+                }
+            },
+            // Collected separately from register_entries, not batched:
+            // Mask Write Register (FC 0x16) has no "multiple" variant,
+            // so each masked write always goes out as its own request
+            // (see confirm_mask_write's doc comment).
+            StagedValue::MaskedRegister { and_mask, or_mask } => {
+                match registers.iter().find(|register| register.name == name) {
+                    Some(register) if register.data_type.register_count() == 1 => {
+                        masked_register_entries.push((register.clone(), and_mask, or_mask));
+                    }
+                    Some(register) => {
+                        let reason = format!(
+                            "register {name}: {:?} needs {} registers, Mask Write Register can only target a single register",
+                            register.data_type,
+                            register.data_type.register_count()
+                        );
+                        report
+                            .lock()
+                            .unwrap()
+                            .set(name, WriteStatus::Failed(reason));
+                    }
+                    None => {
+                        let reason = format!("unknown register: {name}");
+                        report
+                            .lock()
+                            .unwrap()
+                            .set(name, WriteStatus::Failed(reason));
                     }
                 }
             }
         }
+    }
 
-        for batch in build_register_write_batches(register_entries) {
-            // A batch that's exactly one wire word wide is always a
-            // single one-register-wide value (U8/I8/U16/I16) — anything
-            // wider, or more than one register batched together, has to
-            // go through Write Multiple Registers instead (see the module
-            // doc comment).
-            let status = if batch.quantity() == 1 {
-                let (register, value) = &batch.items[0];
-                handle.block_on(async {
-                    let mut connection = connection.lock().await;
-                    confirm_write(
-                        &mut connection,
-                        register,
-                        *value,
-                        mem_layout,
-                        unit_id,
-                        timeout,
-                    )
-                    .await
-                })
-            } else {
-                let values: Vec<u16> = batch
-                    .items
-                    .iter()
-                    .flat_map(|(_, value)| register_value_to_words(*value, mem_layout))
-                    .collect();
-                handle.block_on(async {
-                    let mut connection = connection.lock().await;
-                    confirm_write_multiple(
-                        &mut connection,
-                        batch.starting_address,
-                        &values,
-                        unit_id,
-                        timeout,
-                    )
-                    .await
-                })
-            };
-
-            for (register, _value) in &batch.items {
-                report
-                    .lock()
-                    .unwrap()
-                    .set(register.name.clone(), status.clone());
-            }
-        }
-
-        for batch in build_coil_write_batches(coil_entries) {
-            let status = if let [(coil, value)] = batch.items.as_slice() {
-                handle.block_on(async {
-                    let mut connection = connection.lock().await;
-                    confirm_coil_write(&mut connection, coil, CoilValue(*value), unit_id, timeout)
-                        .await
-                })
-            } else {
-                let values: Vec<bool> = batch.items.iter().map(|(_, value)| *value).collect();
-                handle.block_on(async {
-                    let mut connection = connection.lock().await;
-                    confirm_coil_write_multiple(
-                        &mut connection,
-                        batch.starting_address,
-                        &values,
-                        unit_id,
-                        timeout,
-                    )
-                    .await
-                })
-            };
-
-            for (coil, _value) in &batch.items {
-                report
-                    .lock()
-                    .unwrap()
-                    .set(coil.name.clone(), status.clone());
-            }
-        }
-
-        for (register, and_mask, or_mask) in masked_register_entries {
-            let status = handle.block_on(async {
+    for batch in build_register_write_batches(register_entries) {
+        // A batch that's exactly one wire word wide is always a
+        // single one-register-wide value (U8/I8/U16/I16) — anything
+        // wider, or more than one register batched together, has to
+        // go through Write Multiple Registers instead (see the module
+        // doc comment).
+        let status = if batch.quantity() == 1 {
+            let (register, value) = &batch.items[0];
+            handle.block_on(async {
                 let mut connection = connection.lock().await;
-                confirm_mask_write(
+                confirm_write(
                     &mut connection,
-                    &register,
-                    and_mask,
-                    or_mask,
+                    register,
+                    *value,
+                    mem_layout,
                     unit_id,
                     timeout,
                 )
                 .await
-            });
-            report.lock().unwrap().set(register.name.clone(), status);
-        }
-
-        // Deliberately does not touch a local FileRecordStore on success,
-        // same "single writer" discipline already established for
-        // registers/coils (see this module's own doc comment): only
-        // `client::polling::poll_file_records_once` ever writes the
-        // client's mirror, so `file-records/<file>/<record>` can lag up to
-        // one poll interval behind `report/<name>` showing `OK` — a
-        // confirmed write landing here and a poll response already in
-        // flight would otherwise be able to race the same way H2 already
-        // ruled out for registers/coils.
-        for (name, file_number, record_number, value) in file_record_entries {
-            let status = handle.block_on(async {
+            })
+        } else {
+            let values: Vec<u16> = batch
+                .items
+                .iter()
+                .flat_map(|(_, value)| register_value_to_words(*value, mem_layout))
+                .collect();
+            handle.block_on(async {
                 let mut connection = connection.lock().await;
-                confirm_file_record_write(
+                confirm_write_multiple(
                     &mut connection,
-                    file_number,
-                    record_number,
-                    value,
+                    batch.starting_address,
+                    &values,
                     unit_id,
                     timeout,
                 )
                 .await
-            });
-            report.lock().unwrap().set(name, status);
+            })
+        };
+
+        for (register, _value) in &batch.items {
+            report
+                .lock()
+                .unwrap()
+                .set(register.name.clone(), status.clone());
         }
+    }
+
+    for batch in build_coil_write_batches(coil_entries) {
+        let status = if let [(coil, value)] = batch.items.as_slice() {
+            handle.block_on(async {
+                let mut connection = connection.lock().await;
+                confirm_coil_write(&mut connection, coil, CoilValue(*value), unit_id, timeout).await
+            })
+        } else {
+            let values: Vec<bool> = batch.items.iter().map(|(_, value)| *value).collect();
+            handle.block_on(async {
+                let mut connection = connection.lock().await;
+                confirm_coil_write_multiple(
+                    &mut connection,
+                    batch.starting_address,
+                    &values,
+                    unit_id,
+                    timeout,
+                )
+                .await
+            })
+        };
+
+        for (coil, _value) in &batch.items {
+            report
+                .lock()
+                .unwrap()
+                .set(coil.name.clone(), status.clone());
+        }
+    }
+
+    for (register, and_mask, or_mask) in masked_register_entries {
+        let status = handle.block_on(async {
+            let mut connection = connection.lock().await;
+            confirm_mask_write(
+                &mut connection,
+                &register,
+                and_mask,
+                or_mask,
+                unit_id,
+                timeout,
+            )
+            .await
+        });
+        report.lock().unwrap().set(register.name.clone(), status);
+    }
+
+    // Deliberately does not touch a local FileRecordStore on success,
+    // same "single writer" discipline already established for
+    // registers/coils (see this module's own doc comment): only
+    // `client::polling::poll_file_records_once` ever writes the
+    // client's mirror, so `file-records/<file>/<record>` can lag up to
+    // one poll interval behind `report/<name>` showing `OK` — a
+    // confirmed write landing here and a poll response already in
+    // flight would otherwise be able to race the same way H2 already
+    // ruled out for registers/coils.
+    for (name, file_number, record_number, value) in file_record_entries {
+        let status = handle.block_on(async {
+            let mut connection = connection.lock().await;
+            confirm_file_record_write(
+                &mut connection,
+                file_number,
+                record_number,
+                value,
+                unit_id,
+                timeout,
+            )
+            .await
+        });
+        report.lock().unwrap().set(name, status);
     }
 }
 
@@ -387,6 +415,34 @@ mod tests {
     use super::*;
     use fuse_fs::{CoilValue, RegisterValue};
     use protocol::device_description::{AccessRight, DataType};
+
+    const TEST_MACHINE_NAME: &str = "TestMachine";
+
+    // Wraps one machine's config the way `client::main` would build it for
+    // a real (possibly multi-machine) deployment — every test here only
+    // ever configures one machine, `TEST_MACHINE_NAME`, matching the
+    // `(TEST_MACHINE_NAME, transaction)` tag each test sends through the
+    // channel.
+    fn test_machines(
+        registers: Vec<RegisterDescription>,
+        coils: Vec<CoilDescription>,
+        file_records: Vec<FileRecordDescription>,
+        report: Arc<Mutex<WriteReport>>,
+    ) -> HashMap<String, MachineTransactionConfig> {
+        let mut machines = HashMap::new();
+        machines.insert(
+            TEST_MACHINE_NAME.to_string(),
+            MachineTransactionConfig {
+                registers,
+                coils,
+                file_records,
+                report,
+                mem_layout: MemLayout::Abcd,
+                unit_id: 0x01,
+            },
+        );
+        machines
+    }
 
     fn u16_register() -> RegisterDescription {
         RegisterDescription {
@@ -464,17 +520,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &[],
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -484,7 +536,9 @@ mod tests {
             "Stop_Process".to_string(),
             StagedValue::Register(RegisterValue::U16(1)),
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         // Dropping the sender closes the channel, so the consumer's
         // `for transaction in transaction_receiver` loop ends once drained.
         drop(transaction_sender);
@@ -532,17 +586,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &[],
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -552,7 +602,9 @@ mod tests {
             "Stop_Process".to_string(),
             StagedValue::Register(RegisterValue::U16(1)),
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         device_task.await.unwrap();
@@ -575,17 +627,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &[],
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -595,7 +643,9 @@ mod tests {
             "Unknown_Register".to_string(),
             StagedValue::Register(RegisterValue::U16(1)),
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         consumer_thread.join().unwrap();
@@ -637,17 +687,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &[],
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -657,7 +703,9 @@ mod tests {
             "Motor_Running".to_string(),
             StagedValue::Coil(CoilValue(true)),
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         device_task.await.unwrap();
@@ -708,17 +756,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &[],
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -732,7 +776,9 @@ mod tests {
             "Setpoint".to_string(),
             StagedValue::Register(RegisterValue::U16(2)),
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         device_task.await.unwrap();
@@ -782,17 +828,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &[],
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -806,7 +848,9 @@ mod tests {
             "Setpoint".to_string(),
             StagedValue::Register(RegisterValue::U16(2)),
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         device_task.await.unwrap();
@@ -858,17 +902,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &[],
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -882,7 +922,9 @@ mod tests {
             "Alarm_Reset".to_string(),
             StagedValue::Coil(CoilValue(false)),
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         device_task.await.unwrap();
@@ -932,17 +974,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &[],
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -956,7 +994,9 @@ mod tests {
             "Alarm_Reset".to_string(),
             StagedValue::Coil(CoilValue(false)),
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         device_task.await.unwrap();
@@ -1012,17 +1052,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &[],
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -1032,7 +1068,9 @@ mod tests {
             "Flow_Rate".to_string(),
             StagedValue::Register(RegisterValue::F32(3.5)),
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         device_task.await.unwrap();
@@ -1059,17 +1097,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &[],
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -1079,7 +1113,9 @@ mod tests {
             "Stop_Process".to_string(),
             StagedValue::Register(RegisterValue::F32(3.5)),
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         consumer_thread.join().unwrap();
@@ -1124,17 +1160,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &[],
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -1147,7 +1179,9 @@ mod tests {
                 or_mask: 0x0025,
             },
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         device_task.await.unwrap();
@@ -1174,17 +1208,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &[],
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -1197,7 +1227,9 @@ mod tests {
                 or_mask: 0x0025,
             },
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         consumer_thread.join().unwrap();
@@ -1223,17 +1255,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &[],
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -1246,7 +1274,9 @@ mod tests {
                 or_mask: 0x0025,
             },
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         consumer_thread.join().unwrap();
@@ -1301,17 +1331,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, file_records, consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &file_records,
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -1325,7 +1351,9 @@ mod tests {
                 value: vec![0x0D, 0xFE, 0x00, 0x20],
             },
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         device_task.await.unwrap();
@@ -1346,17 +1374,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, file_records, consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &file_records,
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -1370,7 +1394,9 @@ mod tests {
                 value: vec![0x00, 0x00, 0x00, 0x00],
             },
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         consumer_thread.join().unwrap();
@@ -1397,17 +1423,13 @@ mod tests {
         let handle = Handle::current();
         let connection = Arc::new(AsyncMutex::new(connection));
         let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, file_records, consumer_report);
         let consumer_thread = std::thread::spawn(move || {
             run_transaction_consumer(
                 &handle,
                 &connection,
-                &registers,
-                &coils,
-                &file_records,
-                &consumer_report,
-                MemLayout::Abcd,
+                &machines,
                 transaction_receiver,
-                0x01,
                 Duration::from_secs(1),
             );
         });
@@ -1421,7 +1443,9 @@ mod tests {
                 value: vec![0x00, 0x00],
             },
         );
-        transaction_sender.send(transaction).unwrap();
+        transaction_sender
+            .send((TEST_MACHINE_NAME.to_string(), transaction))
+            .unwrap();
         drop(transaction_sender);
 
         consumer_thread.join().unwrap();
@@ -1431,6 +1455,50 @@ mod tests {
             Some(WriteStatus::Failed(_))
         ));
 
+        drop(device);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transaction_for_an_unknown_machine_is_dropped_without_affecting_a_real_machine() {
+        let (connection, device) = connected_pair().await;
+        let (transaction_sender, transaction_receiver) = mpsc::channel();
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let registers = vec![u16_register()];
+        let coils: Vec<CoilDescription> = vec![];
+
+        let handle = Handle::current();
+        let connection = Arc::new(AsyncMutex::new(connection));
+        let consumer_report = Arc::clone(&report);
+        let machines = test_machines(registers, coils, vec![], consumer_report);
+        let consumer_thread = std::thread::spawn(move || {
+            run_transaction_consumer(
+                &handle,
+                &connection,
+                &machines,
+                transaction_receiver,
+                Duration::from_secs(1),
+            );
+        });
+
+        let mut transaction = HashMap::new();
+        transaction.insert(
+            "Stop_Process".to_string(),
+            StagedValue::Register(RegisterValue::U16(1)),
+        );
+        // Tagged with a machine name that isn't in `machines` — this must
+        // be dropped (logged, not panicked on) rather than misrouted to
+        // the one real configured machine, `TEST_MACHINE_NAME`.
+        transaction_sender
+            .send(("GhostMachine".to_string(), transaction))
+            .unwrap();
+        drop(transaction_sender);
+
+        consumer_thread.join().unwrap();
+
+        assert_eq!(report.lock().unwrap().get("Stop_Process"), None);
+
+        // Nothing was ever sent to the "device" — dropping it without a
+        // pending read (which would panic on EOF) confirms that.
         drop(device);
     }
 }
