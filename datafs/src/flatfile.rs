@@ -81,10 +81,18 @@ fn render_named_files(
 ) -> io::Result<()> {
     for name in names {
         let content = content_for(&name);
-        if last_rendered.get(&name) == Some(&content) {
+        let path = directory.join(&name);
+        // Content matching the cache is only really "unchanged" if the file
+        // is still there — FlatfileDirectWriteWatcher deletes stray files
+        // out from under a renderer (an unknown target, or a read-only
+        // register's rejected write) without telling it, so the cache alone
+        // can't be trusted; a real bug caught by manual end-to-end testing,
+        // not by the unit tests, which never modeled a second writer to the
+        // same directory.
+        if last_rendered.get(&name) == Some(&content) && path.exists() {
             continue;
         }
-        atomic_write(&directory.join(&name), &content)?;
+        atomic_write(&path, &content)?;
         last_rendered.insert(name, content);
     }
     Ok(())
@@ -349,13 +357,16 @@ impl FlatfileFileRecordRenderer {
                 description.record_length,
             );
             let key = (description.file_number, description.record_number);
-            if last_rendered.get(&key) == Some(&content) {
-                continue;
-            }
             let path = self
                 .directory
                 .join(description.file_number.to_string())
                 .join(description.record_number.to_string());
+            // See render_named_files's own comment: a matching cache entry
+            // doesn't mean the file is still there — FlatfileDirectWriteWatcher
+            // can delete an unknown file record out from under this renderer.
+            if last_rendered.get(&key) == Some(&content) && path.exists() {
+                continue;
+            }
             atomic_write(&path, &content)?;
             last_rendered.insert(key, content);
         }
@@ -1374,6 +1385,43 @@ mod tests {
         assert_eq!(modified_at_first, modified_at_second);
     }
 
+    // Regression test for a real bug caught by manual end-to-end testing,
+    // not the unit tests above: FlatfileDirectWriteWatcher deletes a stray
+    // file (e.g. a read-only register's rejected direct write) without
+    // telling the renderer, so a naive "cache says unchanged" check would
+    // leave the file permanently missing until the store's own value
+    // actually changed to something new.
+    #[test]
+    fn render_once_recreates_a_file_deleted_out_from_under_it() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("holding-registers");
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let renderer = FlatfileRegisterRenderer::new(
+            directory.clone(),
+            vec![a_register("Tank_Temperature")],
+            store.clone(),
+        );
+        renderer.initialize().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set("Tank_Temperature", RegisterValue::U16(42));
+        renderer.render_once().unwrap();
+
+        // Simulates FlatfileDirectWriteWatcher deleting the file directly,
+        // bypassing the renderer entirely.
+        fs::remove_file(directory.join("Tank_Temperature")).unwrap();
+
+        // Same value as before — a naive cache-only check would wrongly
+        // consider this a no-op and never recreate the file.
+        renderer.render_once().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(directory.join("Tank_Temperature")).unwrap(),
+            "42\n"
+        );
+    }
+
     #[test]
     fn render_once_leaves_no_leftover_tmp_file() {
         let temporary_directory = tempfile::tempdir().unwrap();
@@ -1541,6 +1589,36 @@ mod tests {
             .lock()
             .unwrap()
             .set(4, 1, vec![0x0D, 0xFE, 0x00, 0x20]);
+        renderer.render_once().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(directory.join("4").join("1")).unwrap(),
+            "0D FE 00 20\n"
+        );
+    }
+
+    // Same regression coverage as
+    // render_once_recreates_a_file_deleted_out_from_under_it, for the
+    // file-record renderer's own separate (non-render_named_files) loop.
+    #[test]
+    fn file_record_renderer_recreates_a_file_deleted_out_from_under_it() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("file-records");
+        let store = Arc::new(Mutex::new(FileRecordStore::new()));
+        let renderer = FlatfileFileRecordRenderer::new(
+            directory.clone(),
+            vec![a_file_record(4, 1, 2)],
+            store.clone(),
+        );
+        renderer.initialize().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set(4, 1, vec![0x0D, 0xFE, 0x00, 0x20]);
+        renderer.render_once().unwrap();
+
+        fs::remove_file(directory.join("4").join("1")).unwrap();
+
         renderer.render_once().unwrap();
 
         assert_eq!(
