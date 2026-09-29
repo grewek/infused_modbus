@@ -19,7 +19,12 @@ and [`CLAUDE.md`](../CLAUDE.md) for the design behind any of this.
   purely to demonstrate the format (locks `transactions/` down to its
   owner). Leave off `--fuse-permissions` entirely to skip this.
 
-Run from the repository root.
+Run from the repository root. Both commands below default to
+`--data-representation-layer files` — the same commands work identically
+with `--data-representation-layer fuse` appended, mounting a real FUSE
+filesystem instead of writing plain files; see [Directory
+permissions](../README.md#directory-permissions) and `CLAUDE.md`'s
+"Pluggable data-representation layer" section for the difference.
 
 ## 1. Start the server
 
@@ -29,7 +34,7 @@ cargo run -p server -- /tmp/infused-modbus-server examples/device-description.to
 ```
 
 ```
-Mounting infused_modbus server at /tmp/infused-modbus-server, serving via tcp://127.0.0.1:15020 — machines: PumpA, PumpB
+Mounting infused_modbus server (Files) at /tmp/infused-modbus-server, serving via tcp://127.0.0.1:15020 — machines: PumpA, PumpB
 ```
 
 ## 2. Start the client, in another terminal
@@ -60,8 +65,14 @@ echo 1 > /tmp/infused-modbus-server/PumpA/coils/Motor_Running
 cat /tmp/infused-modbus-client/PumpA/holding-registers/Setpoint
 
 # Tank_Temperature is declared read_only — a real device would be the only
-# thing that ever sets it, so even the server itself refuses a direct write:
-echo 72 > /tmp/infused-modbus-server/PumpA/holding-registers/Tank_Temperature   # Permission denied
+# thing that ever sets it, so even the server itself refuses a direct write.
+# Under --data-representation-layer fuse the kernel rejects the write
+# outright (echo itself fails with "Permission denied"); under files (the
+# default here) a real filesystem has no such hook, so echo succeeds but
+# the rejected value is discarded and the file goes back to empty within
+# a couple hundred milliseconds — same end state, briefer window either way:
+echo 72 > /tmp/infused-modbus-server/PumpA/holding-registers/Tank_Temperature
+sleep 1
 cat /tmp/infused-modbus-server/PumpA/holding-registers/Tank_Temperature        # empty — nothing has set it
 
 # Stage and commit a write from the client — this actually round-trips
@@ -84,7 +95,7 @@ ls /tmp/infused-modbus-client/PumpC                          # No such file or d
 
 ## 4. Shut down
 
-Ctrl+C (or `SIGTERM`) either process — both unmount cleanly on their own.
+Ctrl+C (or `SIGTERM`) either process — both clean up after themselves (unmounting, or removing the `files` root directory) on their own.
 
 ## Trying it over RTU or TLS instead
 

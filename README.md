@@ -34,14 +34,15 @@ Nothing here shipped without a human decision behind it, but essentially all of 
 - **Every register data type is read and written over the wire**, including ones spanning more than one 16-bit Modbus register (`u32`, `f64`, ...) — see [Device description TOML format](#device-description-toml-format) for the full type list and how `mem-layout` controls their byte order.
 - **A `transactions/<name>` file can stage a Mask Write Register instead of a plain value**, atomically setting/clearing specific bits in a real device's register without needing to know its current contents first — client-only, see [Interacting with the filesystem](#interacting-with-the-filesystem).
 - **Client TLS certificates require server-side approval.** Over `tls+tcp://`, the server requires every connecting client to present a certificate, and only ones an operator has explicitly approved are allowed through — via a local admin channel kept separate from the FUSE mount itself, not through the filesystem. Approvals are persisted to disk, bounded by an optional `--max-clients` limit, and revoking one immediately disconnects it if it's already connected, not just future attempts. See [Connecting over TLS](#connecting-over-tls).
-- **FUSE directory permissions are configurable.** An optional `fuse-permissions.toml` sets `mode`/`uid`/`gid` per top-level directory, enforced by the kernel rather than just displayed — see [FUSE directory permissions](#fuse-directory-permissions).
+- **Directory permissions are configurable.** An optional `fuse-permissions.toml` sets `mode`/`uid`/`gid` per top-level directory, enforced by the kernel (`fuse` layer) or via real `chmod`/`chown` (`files` layer) rather than just displayed — see [Directory permissions](#directory-permissions).
+- **Two interchangeable data-representation layers.** `--data-representation-layer files` (the default) exposes the exact same directory tree as plain files on disk, kept current via `inotify` and atomic `rename()` — no FUSE driver involved at all. `--data-representation-layer fuse` mounts it as a synthetic FUSE filesystem instead, this project's original mechanism. Every path/command in this README works identically under either — see `CLAUDE.md`'s "Pluggable data-representation layer" section for the full design rationale.
 - **`client` reconnects automatically if the connection breaks.** A dedicated background task notices (via the polling loop, which runs continuously regardless of write activity) and redials with exponential backoff (1s, 2s, 4s, ... capped at 30s), retrying forever — no manual restart needed after a server restart, network blip, or unplugged serial adapter. Polling keeps logging failed attempts in the meantime rather than blocking; writes staged while disconnected simply report `FAILED` via `report/<name>` until the connection heals.
 - **One device description can describe several machines sharing one link.** A TOML file's `[[machines]]` array describes multiple devices — e.g. several PLCs on one RTU multi-drop bus, or several TCP targets — each dispatched by its own Modbus Unit ID and mounted under its own top-level FUSE directory (`/PumpA/holding-registers/`, `/PumpB/holding-registers/`, ...). `client` mounts every machine in its device description by default; `server` answers each machine's own Unit ID and stays silent for any Unit ID it wasn't told about, matching how a real unaddressed device on an RTU bus behaves. See [Device description TOML format](#device-description-toml-format).
 
 ## Client vs. server
 
 - **`client`** acts as a Modbus master against a connected device. It polls the device to keep `holding-registers/`/`discrete-inputs/`/`input-registers/` fresh, and turns `transactions/` commits into Modbus writes, updating the local mirror only once the device confirms them.
-- **`server`** acts as a Modbus slave that external Modbus masters query and write against. Its own in-memory state is what's being served: an external write applies immediately and is reflected into `holding-registers/`/`coils/`/`discrete-inputs/`/`input-registers/`, and a direct local write to any of those same files is visible to external masters on their very next read — no `transactions/` staging on the server at all (see [Design overview](#design-overview)). `server`'s mount also has a `client-trust/` directory that `client`'s never has — see [Connecting over TLS](#connecting-over-tls).
+- **`server`** acts as a Modbus slave that external Modbus masters query and write against. Its own in-memory state is what's being served: an external write applies immediately and is reflected into `holding-registers/`/`coils/`/`discrete-inputs/`/`input-registers/`, and a direct local write to any of those same files is visible to external masters on their very next read — no `transactions/` staging on the server at all (see [Design overview](#design-overview)). `server`'s root also has a `client-trust/` directory that `client`'s never has — see [Connecting over TLS](#connecting-over-tls).
 
 This has been tested against this project's own client/server implementations and against virtual serial ports, not against third-party PLC or SCADA hardware or software — whether it interoperates with a specific real-world device or system has not been verified.
 
@@ -99,12 +100,12 @@ Want to skip straight to running something real? [`examples/`](examples/) has a 
 cargo build --workspace
 ```
 
-Requires Linux (FUSE is a Linux-specific dependency) and a FUSE-capable kernel/userspace (`libfuse`).
+Requires Linux (both `libfuse`, for the `fuse` representation layer, and `inotify`, for the `files` one, are Linux-specific).
 
 ### Run the server
 
 ```sh
-cargo run -p server -- <mountpoint> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>] [--server-options <server-options.toml>]
+cargo run -p server -- <root> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>] [--server-options <server-options.toml>] [--data-representation-layer fuse|files]
 ```
 
 `<connection>` is one of:
@@ -113,7 +114,9 @@ cargo run -p server -- <mountpoint> <device-description.toml> <connection> [--fu
 - `rtu://<serial-path>:<baud-rate>` — e.g. `rtu:///dev/ttyUSB0:9600`
 - `tls+tcp://<bind-address:port>` — see [Connecting over TLS](#connecting-over-tls) below.
 
-`--fuse-permissions` is optional — see [FUSE directory permissions](#fuse-directory-permissions). `--max-clients` is also optional (`tls+tcp://` only) and bounds how many client certificates can be approved at once — without it, there is no limit.
+`--data-representation-layer` picks how `<root>` exposes the data: `files` (the **default**) writes real files under `<root>`, kept current via `inotify` and atomic `rename()` — no FUSE mount at all; `fuse` mounts `<root>` as a synthetic FUSE filesystem, this project's original mechanism. Both present the identical directory shape described in [Interacting with the filesystem](#interacting-with-the-filesystem) below — pick whichever fits your deployment, see `CLAUDE.md`'s "Pluggable data-representation layer" section for the full design rationale.
+
+`--fuse-permissions` is optional — see [Directory permissions](#directory-permissions). `--max-clients` is also optional (`tls+tcp://` only) and bounds how many client certificates can be approved at once — without it, there is no limit.
 
 **`--server-options` controls which function codes this server will actually answer on the wire — and it's strict default-deny.** Without it (or with a present-but-empty file), *every* function code is disabled and every incoming request gets an `ILLEGAL_FUNCTION` exception, no matter how many function codes this project implements — `server` prints a loud startup warning if this ends up being the case, since "starts fine but answers nothing" is an easy flag to forget. Every function code this server can serve — including already-implemented ones like Read/Write Holding Registers — is attack surface exposed to any reachable Modbus master, so enabling one is an explicit technician choice, not an on-by-default assumption. Point it at a TOML file with a `[function-codes]` table, one boolean per function code, named after the operation:
 
@@ -142,10 +145,10 @@ cargo run -p server -- admin list
 ### Run the client
 
 ```sh
-cargo run -p client -- <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>]
+cargo run -p client -- <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files]
 ```
 
-`<connection>` uses the same `tcp://`/`rtu://`/`tls+tcp://` scheme as the server. `<device-description.toml>` is required as a fallback, but if the server it connects to supports FC 43 (see below), the client uses the server's own description instead. `--fuse-permissions` is optional — see [FUSE directory permissions](#fuse-directory-permissions). `client` mounts **every** machine described in the effective device description — see [Device description TOML format](#device-description-toml-format) — each under its own top-level directory.
+`<connection>` uses the same `tcp://`/`rtu://`/`tls+tcp://` scheme as the server. `<device-description.toml>` is required as a fallback, but if the server it connects to supports FC 43 (see below), the client uses the server's own description instead. `--data-representation-layer` (default `files`) and `--fuse-permissions` (see [Directory permissions](#directory-permissions)) work identically to the server's own flags of the same name. `client` mounts/writes **every** machine described in the effective device description — see [Device description TOML format](#device-description-toml-format) — each under its own top-level directory.
 
 `[unit-id]` is **only** used to address the initial FC 43 device-identification handshake — it's how the client asks *some* device on the link to introduce itself before it knows which Unit IDs are valid at all. Once the (possibly multi-machine) device description is known, each machine dispatches its own actual register/coil/etc. traffic via its own TOML-declared `unit_id`, not this CLI one. Defaults to `1` if omitted.
 
@@ -158,7 +161,7 @@ cargo run -p client -- /tmp/modbus-client device.toml tcp://127.0.0.1:502 1 1000
 
 ### Connecting over TLS
 
-`tls+tcp://` encrypts the Modbus TCP connection and authenticates both sides — but without a certificate authority: there's no CA to set up, no certificates to buy or issue. Instead, both `client` and `server` generate their own self-signed identity automatically the first time they run (persisted next to wherever the process was started: `server-tls-identity/` and `client-tls-identity/` respectively), and trust is based purely on comparing the raw public-key **fingerprint** a peer presents — the same idea as an SSH host key, not a PKI certificate chain. Read `CLAUDE.md`'s "Planned: TLS transport security & client trust" section for the full design this is built from.
+`tls+tcp://` encrypts the Modbus TCP connection and authenticates both sides — but without a certificate authority: there's no CA to set up, no certificates to buy or issue. Instead, both `client` and `server` generate their own self-signed identity automatically the first time they run (persisted next to wherever the process was started: `server-tls-identity/` and `client-tls-identity/` respectively), and trust is based purely on comparing the raw public-key **fingerprint** a peer presents — the same idea as an SSH host key, not a PKI certificate chain. Read `CLAUDE.md`'s "TLS transport security & client trust" section for the full design this is built from.
 
 **1. Start the server.** It generates its identity on first run and prints its fingerprint:
 
@@ -182,13 +185,13 @@ Without `--expect-server-fingerprint`, the client accepts **any** server certifi
 
 **3. The client also generates (and prints) its own identity** the first time it runs, and presents it to the server as part of a mutual TLS (mTLS) handshake — both sides authenticate to each other, not just the client authenticating the server. Until the client's fingerprint has been approved (next step), the server rejects the handshake — this first connection attempt is expected to fail.
 
-**4. Approve the client.** The server logs every connection attempt (approved, still-pending, or outright rejected) by fingerprint under its own mount, in `client-trust/connection_attempts/{approved,pending,rejected}.log`. An unapproved-but-otherwise-valid certificate lands in `pending.log` — read the fingerprint from there (or from the client's own startup output, which prints the same value), then approve it from another terminal:
+**4. Approve the client.** The server logs every connection attempt (approved, still-pending, or outright rejected) by fingerprint under its own root, in `client-trust/connection_attempts/{approved,pending,rejected}.log`. An unapproved-but-otherwise-valid certificate lands in `pending.log` — read the fingerprint from there (or from the client's own startup output, which prints the same value), then approve it from another terminal:
 
 ```sh
 cargo run -p server -- admin approve <client-fingerprint>
 ```
 
-This talks to a Unix domain socket the server always serves in the background, regardless of connection type (`server-admin.sock`, relative to wherever the server was started; mode `0600`, additionally checked against the server process's own UID via `SO_PEERCRED` — only the local user account actually running the server can approve/revoke/list). The currently approved set is also visible read-only under `client-trust/approved/` in the server's mount (one file per fingerprint).
+This talks to a Unix domain socket the server always serves in the background, regardless of connection type (`server-admin.sock`, relative to wherever the server was started; mode `0600`, additionally checked against the server process's own UID via `SO_PEERCRED` — only the local user account actually running the server can approve/revoke/list). The currently approved set is also visible read-only under `client-trust/approved/` at the server's root (one file per fingerprint).
 
 **5. Reconnect the client** with the same command as step 2 — the identical certificate now completes the mTLS handshake, and the client mounts and polls normally.
 
@@ -208,7 +211,7 @@ This disconnects any already-open connection using that fingerprint immediately,
 
 ### Interacting with the filesystem
 
-Every configured machine gets its own top-level directory, named after that machine's `name` in the device description (see [Device description TOML format](#device-description-toml-format)) — the examples below use `PumpA`. Everything past that first path segment works exactly the same regardless of how many machines are mounted.
+Every configured machine gets its own top-level directory, named after that machine's `name` in the device description (see [Device description TOML format](#device-description-toml-format)) — the examples below use `PumpA`. Everything past that first path segment works exactly the same regardless of how many machines are mounted, and regardless of which `--data-representation-layer` was chosen — `files` and `fuse` present the identical directory shape.
 
 Once mounted:
 
@@ -441,9 +444,9 @@ record_length = 9
 
 `[[machines.file-records]]` is a flat, independently-optional array per machine — no wrapping section. See the function code table above for how content is exposed (raw hex, no field decoding).
 
-## FUSE directory permissions
+## Directory permissions
 
-By default every top-level FUSE directory (`holding-registers/`, `transactions/`, `report/`, `coils/`) is mode `0755`, owned by whoever made a given filesystem request — the same behavior as before this option existed. An optional `fuse-permissions.toml`, passed to either binary via `--fuse-permissions <path>` (see [Getting started](#getting-started)), overrides `mode`/`uid`/`gid` per directory. Every field, and every directory section, is optional — only what actually needs restricting has to be spelled out:
+By default every top-level directory (`holding-registers/`, `transactions/`, `report/`, `coils/`) is mode `0755`, owned by whoever made a given filesystem request (`fuse` layer) or by the process's own real user (`files` layer) — the same behavior as before this option existed. An optional `fuse-permissions.toml`, passed to either binary via `--fuse-permissions <path>` (see [Getting started](#getting-started)) and applying identically regardless of which `--data-representation-layer` is active, overrides `mode`/`uid`/`gid` per directory. Every field, and every directory section, is optional — only what actually needs restricting has to be spelled out:
 
 ```toml
 [transactions]
@@ -455,11 +458,11 @@ gid = 1000
 mode = 0o444
 ```
 
-Both binaries mount with the kernel's `default_permissions` option, so these values are enforced by the kernel itself, not just displayed by `ls -l` — the usual Unix rules apply, including that a directory needs its own execute bit to be enterable at all. A directory meant to stay "read-only but still browsable" needs e.g. `0o555`, not `0o444` — `0o444` alone makes everything inside it completely unreachable, even to its own owner.
+Under `fuse`, both binaries mount with the kernel's `default_permissions` option, so these values are enforced by the kernel itself, not just displayed by `ls -l`. Under `files`, the same values are applied as real `chmod`/`chown` calls on the underlying directories — note that setting `uid`/`gid` to anything other than the server/client process's own real user requires the process to actually have `CAP_CHOWN` (root); an unprivileged process configuring a different owner will fail at startup with a permission error. Either way, the usual Unix rules apply, including that a directory needs its own execute bit to be enterable at all — a directory meant to stay "read-only but still browsable" needs e.g. `0o555`, not `0o444`, since `0o444` alone makes everything inside it completely unreachable, even to its own owner.
 
 One `fuse-permissions.toml` applies identically to *every* machine's own subtree — there's no per-machine override, `[transactions]` above means "every machine's `transactions/` directory", not one specific machine's.
 
-`client-trust/` (server-only, see [Connecting over TLS](#connecting-over-tls)) cannot be configured here at all — a `[client-trust]` section anywhere in this file is a hard parse error at startup, not a silently-ignored setting. It is always mode `0700`, owned by the server process's own real user, regardless of `fuse-permissions.toml`.
+`client-trust/` (server-only, see [Connecting over TLS](#connecting-over-tls)) cannot be configured here at all — a `[client-trust]` section anywhere in this file is a hard parse error at startup, not a silently-ignored setting. It is always mode `0700` (its files `0400`), owned by the server process's own real user, regardless of `fuse-permissions.toml` — enforced for real under both representation layers.
 
 ## server-options.toml
 
