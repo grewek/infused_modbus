@@ -9,9 +9,16 @@
 // either side.
 //
 // Usage:
-//   cargo run -p server -- <mountpoint> <device-description.toml> <connection>
+//   cargo run -p server -- <root> <device-description.toml> <connection> [--data-representation-layer fuse|files]
 //   cargo run -p server -- admin approve|revoke <fingerprint>
 //   cargo run -p server -- admin list
+//
+// --data-representation-layer picks how machines' data (and client-trust/)
+// is exposed: "files" (the default) writes real files under <root>, kept
+// current via atomic rename() and inotify-watched direct writes — no FUSE
+// driver. "fuse" mounts <root> as a synthetic FUSE filesystem, this
+// project's original mechanism. See CLAUDE.md's "Planned: pluggable
+// data-representation layer".
 //
 // <connection> is one of:
 //   tcp://<bind-address:port>          e.g. tcp://0.0.0.0:502
@@ -82,20 +89,56 @@ const APPROVED_CLIENTS_PATH: &str = "approved-clients.toml";
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: server <mountpoint> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>] [--server-options <server-options.toml>]\n\
+        "Usage: server <root> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>] [--server-options <server-options.toml>] [--data-representation-layer fuse|files]\n\
          <connection> is tcp://<bind-address:port>, tls+tcp://<bind-address:port>, or rtu://<serial-path>:<baud-rate>\n\
-         --fuse-permissions sets custom mode/uid/gid per top-level FUSE directory — \
+         --fuse-permissions sets custom mode/uid/gid per top-level directory — \
          without it, every directory keeps its historical hardcoded behavior.\n\
          --max-clients bounds how many TLS client fingerprints can be approved at once \
          (tls+tcp:// only) — without it, there is no limit.\n\
          --server-options explicitly enables function codes this server will answer — \
          without it (or with an empty file), every function code is disabled and every \
          request gets ILLEGAL_FUNCTION.\n\
+         --data-representation-layer picks fuse (a synthetic FUSE mount) or files \
+         (real files, the default) — see CLAUDE.md's \"Planned: pluggable data-representation layer\".\n\
          \n\
          Usage: server admin approve|revoke <fingerprint>\n\
          Usage: server admin list"
     );
     std::process::exit(1);
+}
+
+/// Pulls `--data-representation-layer <fuse|files>` out of `args` if
+/// present (order-independent, same shape as `--fuse-permissions`), leaving
+/// the rest of `args` untouched. Absent entirely, defaults to `Files` —
+/// same breaking-default stance as `client`'s own copy of this function
+/// (kept separate, not shared, matching this project's existing pattern of
+/// each binary owning its own CLI-extraction helpers rather than a shared
+/// module).
+fn extract_representation_layer(args: &mut Vec<String>) -> RepresentationLayer {
+    let Some(flag_index) = args
+        .iter()
+        .position(|arg| arg == "--data-representation-layer")
+    else {
+        return RepresentationLayer::Files;
+    };
+    if flag_index + 1 >= args.len() {
+        panic!("--data-representation-layer requires a value (fuse or files)");
+    }
+    args.remove(flag_index);
+    let value = args.remove(flag_index);
+    match value.as_str() {
+        "fuse" => RepresentationLayer::Fuse,
+        "files" => RepresentationLayer::Files,
+        other => {
+            panic!("invalid --data-representation-layer value {other:?}: expected fuse or files")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepresentationLayer {
+    Fuse,
+    Files,
 }
 
 /// Pulls `--fuse-permissions <path>` out of `args` if present
@@ -405,6 +448,7 @@ fn main() {
     let fuse_permissions = extract_fuse_permissions(&mut raw_args);
     let max_clients = extract_max_clients(&mut raw_args);
     let server_options = extract_server_options(&mut raw_args);
+    let representation_layer = extract_representation_layer(&mut raw_args);
     let mut args = raw_args.into_iter();
     let Some(first_argument) = args.next() else {
         usage();
@@ -427,7 +471,7 @@ fn main() {
              this server will answer ILLEGAL_FUNCTION to every request."
         );
     }
-    let mountpoint = first_argument;
+    let root = first_argument;
     let Some(device_description_path) = args.next() else {
         usage();
     };
@@ -581,72 +625,145 @@ fn main() {
         live_connections,
     );
 
-    std::fs::create_dir_all(&mountpoint).ok();
+    std::fs::create_dir_all(&root).ok();
     let machine_names: Vec<&str> = description
         .machines
         .iter()
         .map(|machine| machine.name.as_str())
         .collect();
     println!(
-        "Mounting infused_modbus server at {mountpoint}, serving via {connection_string} — machines: {}",
+        "Mounting infused_modbus server ({representation_layer:?}) at {root}, serving via {connection_string} — machines: {}",
         machine_names.join(", ")
     );
 
-    let machines_for_fs: Vec<MachineConfig> = description
-        .machines
-        .into_iter()
-        .map(|machine| {
-            let stores = machine_stores
-                .get(&machine.name)
-                .expect("machine_stores was built from the same machine list");
-            MachineConfig {
-                name: machine.name,
-                registers: machine.registers,
-                coils: machine.coils,
-                discrete_inputs: machine.discrete_inputs,
-                input_registers: machine.input_registers,
-                file_records: machine.file_records,
-                store: Arc::clone(&stores.registers),
-                coil_store: Arc::clone(&stores.coils),
-                discrete_input_store: Arc::clone(&stores.discrete_inputs),
-                input_register_store: Arc::clone(&stores.input_registers),
-                file_record_store: Arc::clone(&stores.file_records),
-                report: Arc::clone(&stores.report),
-                permissions: fuse_permissions,
-                // Deliberately not `machine.server_id` — the server never
-                // mirrors its own configured server-id into its FUSE tree,
-                // only answers real FC11 requests with it (already carried
-                // into `ServerMachineState.server_id` above). See CLAUDE.md's
-                // "FC 0x11 (Report Server ID)" section.
-                server_id: None,
+    match representation_layer {
+        RepresentationLayer::Fuse => {
+            let machines_for_fs: Vec<MachineConfig> = description
+                .machines
+                .into_iter()
+                .map(|machine| {
+                    let stores = machine_stores
+                        .get(&machine.name)
+                        .expect("machine_stores was built from the same machine list");
+                    MachineConfig {
+                        name: machine.name,
+                        registers: machine.registers,
+                        coils: machine.coils,
+                        discrete_inputs: machine.discrete_inputs,
+                        input_registers: machine.input_registers,
+                        file_records: machine.file_records,
+                        store: Arc::clone(&stores.registers),
+                        coil_store: Arc::clone(&stores.coils),
+                        discrete_input_store: Arc::clone(&stores.discrete_inputs),
+                        input_register_store: Arc::clone(&stores.input_registers),
+                        file_record_store: Arc::clone(&stores.file_records),
+                        report: Arc::clone(&stores.report),
+                        permissions: fuse_permissions,
+                        // Deliberately not `machine.server_id` — the server
+                        // never mirrors its own configured server-id into
+                        // its FUSE tree, only answers real FC11 requests
+                        // with it (already carried into
+                        // `ServerMachineState.server_id` above). See
+                        // CLAUDE.md's "FC 0x11 (Report Server ID)" section.
+                        server_id: None,
+                    }
+                })
+                .collect();
+
+            let filesystem = InfusedFilesystem::new(
+                machines_for_fs,
+                transaction_sender,
+                WriteMode::Direct,
+                Some(client_trust),
+            );
+            // default_permissions makes the kernel actually enforce what
+            // getattr reports (see datafs::permissions) instead of every
+            // request being allowed regardless of mode/uid/gid.
+            let mut mount_config = fuser::Config::default();
+            mount_config.mount_options = vec![fuser::MountOption::DefaultPermissions];
+            let session = fuser::spawn_mount(filesystem, &root, &mount_config)
+                .unwrap_or_else(|error| panic!("mount failed: {error}"));
+
+            wait_for_shutdown_signal(&runtime);
+
+            session
+                .umount_and_join()
+                .unwrap_or_else(|error| panic!("failed to unmount cleanly: {error}"));
+        }
+        RepresentationLayer::Files => {
+            let root_path = Path::new(&root);
+
+            let readers = datafs::flatfile::build_machine_readers(
+                root_path,
+                &description.machines,
+                &machine_stores,
+            );
+            for (name, reader) in &readers {
+                reader.initialize().unwrap_or_else(|error| {
+                    panic!("failed to initialize {name}'s data directory: {error}")
+                });
+                if let Err(error) = reader.apply_permissions(&fuse_permissions) {
+                    eprintln!("warning: failed to apply permissions for {name}: {error}");
+                }
             }
-        })
-        .collect();
 
-    let filesystem = InfusedFilesystem::new(
-        machines_for_fs,
-        transaction_sender,
-        WriteMode::Direct,
-        Some(client_trust),
-    );
-    // default_permissions makes the kernel actually enforce what getattr
-    // reports (see datafs::permissions) instead of every request being
-    // allowed regardless of mode/uid/gid.
-    let mut mount_config = fuser::Config::default();
-    mount_config.mount_options = vec![fuser::MountOption::DefaultPermissions];
-    let session = fuser::spawn_mount(filesystem, &mountpoint, &mount_config)
-        .unwrap_or_else(|error| panic!("mount failed: {error}"));
+            let client_trust_renderer = datafs::flatfile::FlatfileClientTrustRenderer::new(
+                root_path.join("client-trust"),
+                Arc::clone(&client_trust),
+            );
+            client_trust_renderer
+                .initialize()
+                .unwrap_or_else(|error| panic!("failed to initialize client-trust/: {error}"));
 
+            // One FlatfileDirectWriteWatcher per machine, each blocking its
+            // own dedicated thread on inotify — the server-side counterpart
+            // of the client's FlatfileTransactionWatcher (no staging/commit
+            // ritual here, see WriteMode::Direct's own reasoning above).
+            for machine in &description.machines {
+                let watcher = Arc::new(datafs::flatfile::build_machine_direct_write_watcher(
+                    root_path,
+                    machine,
+                    transaction_sender.clone(),
+                ));
+                std::thread::spawn(move || {
+                    if let Err(error) = watcher.run_forever() {
+                        eprintln!("direct-write watcher stopped: {error}");
+                    }
+                });
+            }
+
+            // No push-based change notification yet (see datafs::flatfile's
+            // own module doc comment) — a plain periodic re-render is the
+            // deliberately simple mechanism for now.
+            runtime.spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(200));
+                loop {
+                    interval.tick().await;
+                    for reader in readers.values() {
+                        let _ = reader.render_once();
+                    }
+                    let _ = client_trust_renderer.render_once();
+                }
+            });
+
+            wait_for_shutdown_signal(&runtime);
+
+            // Mirrors the FUSE branch's unmount-on-shutdown: a real
+            // directory doesn't disappear on its own the way a FUSE mount
+            // does, so this has to remove it explicitly.
+            std::fs::remove_dir_all(&root)
+                .unwrap_or_else(|error| eprintln!("warning: failed to clean up {root}: {error}"));
+        }
+    }
+}
+
+fn wait_for_shutdown_signal(runtime: &tokio::runtime::Runtime) {
     runtime.block_on(async {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to register SIGTERM handler");
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => println!("Received Ctrl+C, unmounting..."),
-            _ = sigterm.recv() => println!("Received SIGTERM, unmounting..."),
+            _ = tokio::signal::ctrl_c() => println!("Received Ctrl+C, shutting down..."),
+            _ = sigterm.recv() => println!("Received SIGTERM, shutting down..."),
         }
     });
-
-    session
-        .umount_and_join()
-        .unwrap_or_else(|error| panic!("failed to unmount cleanly: {error}"));
 }

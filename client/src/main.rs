@@ -14,13 +14,24 @@
 // otherwise fails.
 //
 // Usage:
-//   cargo run -p client -- <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>]
+//   cargo run -p client -- <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files]
+//
+// --data-representation-layer picks how the machines' data is exposed:
+// "files" (the default, see CLAUDE.md's "Planned: pluggable data-
+// representation layer") writes real files under <root>, updated via
+// atomic rename() and a background inotify watch on transactions/ — no
+// FUSE driver involved at all. "fuse" mounts <root> as a synthetic FUSE
+// filesystem, this project's original mechanism. Both present the exact
+// same directory shape at <root>.
 //
 // --fuse-permissions sets custom mode/uid/gid for holding-registers/,
-// transactions/, report/, and coils/ (see datafs::permissions), enforced
-// by the kernel via the `default_permissions` mount option. Without it,
-// every directory keeps its historical hardcoded behavior (mode 0o755,
-// owned by whichever uid/gid made a given FUSE request).
+// transactions/, report/, and coils/ (see datafs::permissions) — under
+// "fuse", enforced by the kernel via the `default_permissions` mount
+// option; under "files", applied as real chmod/chown on the underlying
+// directories (datafs::flatfile::apply_directory_permissions). Without
+// it, every directory keeps its historical hardcoded behavior (mode
+// 0o755, owned by whichever uid/gid made a given FUSE request, or the
+// process's own real uid/gid under "files").
 //
 // <connection> is one of:
 //   tcp://<address:port>                e.g. tcp://127.0.0.1:502
@@ -76,14 +87,49 @@ const DEVICE_DESCRIPTION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: client <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>]\n\
+        "Usage: client <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files]\n\
          <connection> is tcp://<address:port>, tls+tcp://<address:port>, or rtu://<serial-path>:<baud-rate>\n\
          --expect-server-fingerprint pins the server's TLS identity (tls+tcp:// only) — \
          without it, the server's identity is not verified at all (see CLAUDE.md's TLS design).\n\
-         --fuse-permissions sets custom mode/uid/gid per top-level FUSE directory — \
-         without it, every directory keeps its historical hardcoded behavior."
+         --fuse-permissions sets custom mode/uid/gid per top-level directory — \
+         without it, every directory keeps its historical hardcoded behavior.\n\
+         --data-representation-layer picks fuse (a synthetic FUSE mount) or files \
+         (real files, the default) — see CLAUDE.md's \"Planned: pluggable data-representation layer\"."
     );
     std::process::exit(1);
+}
+
+/// Pulls `--data-representation-layer <fuse|files>` out of `args` if
+/// present (order-independent, same shape as `--fuse-permissions`), leaving
+/// the rest of `args` untouched. Absent entirely, defaults to `Files` — a
+/// deliberate breaking change to this project's original all-FUSE default,
+/// same "explicit/simple over preserving existing behavior while nothing
+/// is deployed" stance as every other breaking default in this project.
+fn extract_representation_layer(args: &mut Vec<String>) -> RepresentationLayer {
+    let Some(flag_index) = args
+        .iter()
+        .position(|arg| arg == "--data-representation-layer")
+    else {
+        return RepresentationLayer::Files;
+    };
+    if flag_index + 1 >= args.len() {
+        panic!("--data-representation-layer requires a value (fuse or files)");
+    }
+    args.remove(flag_index);
+    let value = args.remove(flag_index);
+    match value.as_str() {
+        "fuse" => RepresentationLayer::Fuse,
+        "files" => RepresentationLayer::Files,
+        other => {
+            panic!("invalid --data-representation-layer value {other:?}: expected fuse or files")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepresentationLayer {
+    Fuse,
+    Files,
 }
 
 /// Pulls `--expect-server-fingerprint <value>` out of `args` if present
@@ -161,8 +207,9 @@ fn main() {
     let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
     let expected_server_fingerprint = extract_expected_server_fingerprint(&mut raw_args);
     let fuse_permissions = extract_fuse_permissions(&mut raw_args);
+    let representation_layer = extract_representation_layer(&mut raw_args);
     let mut args = raw_args.into_iter();
-    let Some(mountpoint) = args.next() else {
+    let Some(root) = args.next() else {
         usage();
     };
     let Some(device_description_path) = args.next() else {
@@ -332,72 +379,156 @@ fn main() {
         });
     }
 
-    std::fs::create_dir_all(&mountpoint).ok();
+    std::fs::create_dir_all(&root).ok();
     let machine_names: Vec<&str> = description
         .machines
         .iter()
         .map(|machine| machine.name.as_str())
         .collect();
     println!(
-        "Mounting infused_modbus at {mountpoint}, connected via {connection_string} — machines: {}",
+        "Mounting infused_modbus ({representation_layer:?}) at {root}, connected via {connection_string} — machines: {}",
         machine_names.join(", ")
     );
 
-    let mut machine_stores = machine_stores;
-    let machines_for_fs: Vec<datafs::filesystem::MachineConfig> = description
-        .machines
-        .into_iter()
-        .map(|machine| {
-            let stores = machine_stores
-                .remove(&machine.name)
-                .expect("machine_stores was built from the same machine list");
-            datafs::filesystem::MachineConfig {
-                name: machine.name,
-                registers: machine.registers,
-                coils: machine.coils,
-                discrete_inputs: machine.discrete_inputs,
-                input_registers: machine.input_registers,
-                file_records: machine.file_records,
-                store: stores.registers,
-                coil_store: stores.coils,
-                discrete_input_store: stores.discrete_inputs,
-                input_register_store: stores.input_registers,
-                file_record_store: stores.file_records,
-                report: stores.report,
-                permissions: fuse_permissions,
-                server_id: machine.server_id,
+    match representation_layer {
+        RepresentationLayer::Fuse => {
+            let mut machine_stores = machine_stores;
+            let machines_for_fs: Vec<datafs::filesystem::MachineConfig> = description
+                .machines
+                .into_iter()
+                .map(|machine| {
+                    let stores = machine_stores
+                        .remove(&machine.name)
+                        .expect("machine_stores was built from the same machine list");
+                    datafs::filesystem::MachineConfig {
+                        name: machine.name,
+                        registers: machine.registers,
+                        coils: machine.coils,
+                        discrete_inputs: machine.discrete_inputs,
+                        input_registers: machine.input_registers,
+                        file_records: machine.file_records,
+                        store: stores.registers,
+                        coil_store: stores.coils,
+                        discrete_input_store: stores.discrete_inputs,
+                        input_register_store: stores.input_registers,
+                        file_record_store: stores.file_records,
+                        report: stores.report,
+                        permissions: fuse_permissions,
+                        server_id: machine.server_id,
+                    }
+                })
+                .collect();
+
+            let filesystem = InfusedFilesystem::new(
+                machines_for_fs,
+                transaction_sender,
+                WriteMode::Staged,
+                // client-trust/ only exists on the server — see CLAUDE.md's
+                // TLS design and datafs::client_trust::ClientTrustState.
+                None,
+            );
+            // spawn_mount (not the blocking mount()) so Ctrl+C/SIGTERM below
+            // can unmount cleanly instead of just killing the process and
+            // leaving a stale mountpoint behind. default_permissions makes
+            // the kernel actually enforce what getattr reports (see
+            // datafs::permissions) instead of every request being allowed
+            // regardless of mode/uid/gid.
+            let mut mount_config = fuser::Config::default();
+            mount_config.mount_options = vec![fuser::MountOption::DefaultPermissions];
+            let session = fuser::spawn_mount(filesystem, &root, &mount_config)
+                .unwrap_or_else(|error| panic!("mount failed: {error}"));
+
+            wait_for_shutdown_signal(&runtime);
+
+            session
+                .umount_and_join()
+                .unwrap_or_else(|error| panic!("failed to unmount cleanly: {error}"));
+        }
+        RepresentationLayer::Files => {
+            let root_path = std::path::Path::new(&root);
+
+            let readers = datafs::flatfile::build_machine_readers(
+                root_path,
+                &description.machines,
+                &machine_stores,
+            );
+            for (name, reader) in &readers {
+                reader.initialize().unwrap_or_else(|error| {
+                    panic!("failed to initialize {name}'s data directory: {error}")
+                });
+                if let Err(error) = reader.apply_permissions(&fuse_permissions) {
+                    eprintln!("warning: failed to apply permissions for {name}: {error}");
+                }
             }
-        })
-        .collect();
+            for machine in &description.machines {
+                datafs::flatfile::write_machine_server_id_file(root_path, machine).unwrap_or_else(
+                    |error| panic!("failed to write {}'s server-id file: {error}", machine.name),
+                );
+            }
 
-    let filesystem = InfusedFilesystem::new(
-        machines_for_fs,
-        transaction_sender,
-        WriteMode::Staged,
-        // client-trust/ only exists on the server — see CLAUDE.md's TLS
-        // design and datafs::client_trust::ClientTrustState.
-        None,
-    );
-    // spawn_mount (not the blocking mount()) so Ctrl+C/SIGTERM below can
-    // unmount cleanly instead of just killing the process and leaving a
-    // stale mountpoint behind. default_permissions makes the kernel
-    // actually enforce what getattr reports (see datafs::permissions)
-    // instead of every request being allowed regardless of mode/uid/gid.
-    let mut mount_config = fuser::Config::default();
-    mount_config.mount_options = vec![fuser::MountOption::DefaultPermissions];
-    let session = fuser::spawn_mount(filesystem, &mountpoint, &mount_config)
-        .unwrap_or_else(|error| panic!("mount failed: {error}"));
+            // One FlatfileTransactionWatcher per machine, each blocking its
+            // own dedicated thread on inotify — mirrors how the FUSE branch
+            // above gets its write path for free from the mounted
+            // filesystem's own write()/release() callbacks; here nothing
+            // calls into this crate at all until a watcher thread notices a
+            // real file event.
+            for machine in &description.machines {
+                let watcher = Arc::new(datafs::flatfile::build_machine_transaction_watcher(
+                    root_path,
+                    machine,
+                    transaction_sender.clone(),
+                ));
+                watcher.initialize().unwrap_or_else(|error| {
+                    panic!(
+                        "failed to initialize {}'s transactions/ directory: {error}",
+                        machine.name
+                    )
+                });
+                if let Err(error) = watcher.apply_permissions(fuse_permissions.transactions) {
+                    eprintln!(
+                        "warning: failed to apply permissions for {}'s transactions/: {error}",
+                        machine.name
+                    );
+                }
+                std::thread::spawn(move || {
+                    if let Err(error) = watcher.run_forever() {
+                        eprintln!("transactions/ watcher stopped: {error}");
+                    }
+                });
+            }
 
+            // No push-based change notification yet (see datafs::flatfile's
+            // own module doc comment) — a plain periodic re-render is the
+            // deliberately simple mechanism for now, purely local so it's
+            // never gated on a Modbus round trip.
+            runtime.spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(200));
+                loop {
+                    interval.tick().await;
+                    for reader in readers.values() {
+                        let _ = reader.render_once();
+                    }
+                }
+            });
+
+            wait_for_shutdown_signal(&runtime);
+
+            // Mirrors the FUSE branch's unmount-on-shutdown: a real
+            // directory doesn't disappear on its own the way a FUSE mount
+            // does, so this has to remove it explicitly.
+            std::fs::remove_dir_all(&root)
+                .unwrap_or_else(|error| eprintln!("warning: failed to clean up {root}: {error}"));
+        }
+    }
+}
+
+fn wait_for_shutdown_signal(runtime: &tokio::runtime::Runtime) {
     runtime.block_on(async {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to register SIGTERM handler");
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => println!("Received Ctrl+C, unmounting..."),
-            _ = sigterm.recv() => println!("Received SIGTERM, unmounting..."),
+            _ = tokio::signal::ctrl_c() => println!("Received Ctrl+C, shutting down..."),
+            _ = sigterm.recv() => println!("Received SIGTERM, shutting down..."),
         }
     });
-
-    session
-        .umount_and_join()
-        .unwrap_or_else(|error| panic!("failed to unmount cleanly: {error}"));
 }
