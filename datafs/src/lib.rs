@@ -1,5 +1,6 @@
 pub mod client_trust;
 pub mod filesystem;
+pub mod flatfile;
 pub mod permissions;
 pub mod register_encoding;
 
@@ -97,6 +98,18 @@ impl RegisterStore {
 
     pub fn set(&mut self, name: impl Into<String>, value: RegisterValue) {
         self.values.insert(name.into(), value);
+    }
+}
+
+// How a holding register's file content is rendered, shared by every
+// presentation layer that needs to show it: empty until the store has a
+// value (nothing polled/written yet), `"<value>\n"` once it does. Extracted
+// once a second, non-FUSE consumer (`flatfile`) needed the exact same
+// rendering `filesystem::MachineFs::register_content` already had.
+pub fn register_file_content(store: &RegisterStore, name: &str) -> String {
+    match store.get(name) {
+        Some(value) => format!("{value}\n"),
+        None => String::new(),
     }
 }
 

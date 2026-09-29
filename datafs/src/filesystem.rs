@@ -678,10 +678,7 @@ impl MachineFs {
     }
 
     fn register_content(&self, register: &RegisterDescription) -> String {
-        match self.store_lock().get(&register.name) {
-            Some(value) => format!("{value}\n"),
-            None => String::new(),
-        }
+        crate::register_file_content(&self.store_lock(), &register.name)
     }
 
     fn coil_content(&self, coil: &CoilDescription) -> String {

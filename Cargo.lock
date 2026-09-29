@@ -146,6 +146,7 @@ dependencies = [
  "libc",
  "protocol",
  "serde",
+ "tempfile",
  "toml",
 ]
 
