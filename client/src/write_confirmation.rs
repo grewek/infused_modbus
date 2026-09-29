@@ -2,8 +2,8 @@
 // turning the device's response back into a WriteStatus.
 
 use crate::connection::Connection;
-use fuse_fs::register_encoding::register_value_to_words;
-use fuse_fs::{CoilValue, RegisterValue, WriteStatus};
+use datafs::register_encoding::register_value_to_words;
+use datafs::{CoilValue, RegisterValue, WriteStatus};
 use protocol::DecodeError;
 use protocol::device_description::{CoilDescription, MemLayout, RegisterDescription};
 use protocol::pdu::{
@@ -154,7 +154,7 @@ pub async fn confirm_write_multiple(
 /// Sends a Mask Write Register (FC 0x16) request for `register` — the
 /// counterpart of `confirm_write` for a `transactions/<name>` file staged
 /// with the `MASK <and_mask> <or_mask>` content form (see
-/// fuse_fs::filesystem::InfusedFilesystem::parse_masked_register_value)
+/// datafs::filesystem::InfusedFilesystem::parse_masked_register_value)
 /// instead of a plain value. Unlike a plain write, this can never be
 /// batched with anything else — Modbus has no "mask write multiple
 /// registers" function code — so `client::transaction_consumer` sends one

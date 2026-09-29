@@ -17,7 +17,7 @@
 //   cargo run -p client -- <mountpoint> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>]
 //
 // --fuse-permissions sets custom mode/uid/gid for holding-registers/,
-// transactions/, report/, and coils/ (see fuse_fs::permissions), enforced
+// transactions/, report/, and coils/ (see datafs::permissions), enforced
 // by the kernel via the `default_permissions` mount option. Without it,
 // every directory keeps its historical hardcoded behavior (mode 0o755,
 // owned by whichever uid/gid made a given FUSE request).
@@ -58,7 +58,7 @@ use client::device_identification::fetch_device_description;
 use client::polling::run_polling_loop;
 use client::reconnect::{ReconnectSignal, run_reconnect_loop};
 use client::transaction_consumer::{MachineTransactionConfig, run_transaction_consumer};
-use fuse_fs::filesystem::{InfusedFilesystem, WriteMode};
+use datafs::filesystem::{InfusedFilesystem, WriteMode};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::DeviceDescription;
 use std::collections::HashMap;
@@ -109,9 +109,9 @@ fn extract_expected_server_fingerprint(
 /// (order-independent, same shape as `--expect-server-fingerprint`),
 /// leaving the rest of `args` untouched. Absent entirely, every directory
 /// keeps its historical hardcoded behavior (`FusePermissions::default()`).
-fn extract_fuse_permissions(args: &mut Vec<String>) -> fuse_fs::permissions::FusePermissions {
+fn extract_fuse_permissions(args: &mut Vec<String>) -> datafs::permissions::FusePermissions {
     let Some(flag_index) = args.iter().position(|arg| arg == "--fuse-permissions") else {
-        return fuse_fs::permissions::FusePermissions::default();
+        return datafs::permissions::FusePermissions::default();
     };
     if flag_index + 1 >= args.len() {
         panic!("--fuse-permissions requires a path");
@@ -120,7 +120,7 @@ fn extract_fuse_permissions(args: &mut Vec<String>) -> fuse_fs::permissions::Fus
     let path = args.remove(flag_index);
     let toml_source = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
-    fuse_fs::permissions::FusePermissions::parse(&toml_source)
+    datafs::permissions::FusePermissions::parse(&toml_source)
         .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
 }
 
@@ -247,14 +247,14 @@ fn main() {
     ));
 
     // One fresh set of stores per configured machine — see
-    // fuse_fs::build_machine_stores.
-    let machine_stores = fuse_fs::build_machine_stores(&description.machines);
+    // datafs::build_machine_stores.
+    let machine_stores = datafs::build_machine_stores(&description.machines);
 
     let (transaction_sender, transaction_receiver) = mpsc::channel();
 
     // One consumer thread services every machine's writes, reading a
     // single shared channel tagged with the originating machine's name
-    // (see fuse-fs's multi-machine `InfusedFilesystem` — the same
+    // (see datafs's multi-machine `InfusedFilesystem` — the same
     // "TRANSACTION_END confirmation semantics" apply per machine).
     let machine_transaction_configs: HashMap<String, MachineTransactionConfig> = description
         .machines
@@ -344,14 +344,14 @@ fn main() {
     );
 
     let mut machine_stores = machine_stores;
-    let machines_for_fs: Vec<fuse_fs::filesystem::MachineConfig> = description
+    let machines_for_fs: Vec<datafs::filesystem::MachineConfig> = description
         .machines
         .into_iter()
         .map(|machine| {
             let stores = machine_stores
                 .remove(&machine.name)
                 .expect("machine_stores was built from the same machine list");
-            fuse_fs::filesystem::MachineConfig {
+            datafs::filesystem::MachineConfig {
                 name: machine.name,
                 registers: machine.registers,
                 coils: machine.coils,
@@ -375,13 +375,13 @@ fn main() {
         transaction_sender,
         WriteMode::Staged,
         // client-trust/ only exists on the server — see CLAUDE.md's TLS
-        // design and fuse_fs::client_trust::ClientTrustState.
+        // design and datafs::client_trust::ClientTrustState.
         None,
     );
     // spawn_mount (not the blocking mount()) so Ctrl+C/SIGTERM below can
     // unmount cleanly instead of just killing the process and leaving a
     // stale mountpoint behind. default_permissions makes the kernel
-    // actually enforce what getattr reports (see fuse_fs::permissions)
+    // actually enforce what getattr reports (see datafs::permissions)
     // instead of every request being allowed regardless of mode/uid/gid.
     let mut mount_config = fuser::Config::default();
     mount_config.mount_options = vec![fuser::MountOption::DefaultPermissions];

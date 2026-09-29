@@ -99,7 +99,7 @@ pub async fn serve_rtu_connection<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuse_fs::{
+    use datafs::{
         CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore,
         RegisterValue,
     };

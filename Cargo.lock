@@ -106,7 +106,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 name = "client"
 version = "0.1.0"
 dependencies = [
- "fuse-fs",
+ "datafs",
  "fuser",
  "protocol",
  "rustls",
@@ -137,6 +137,17 @@ name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
+name = "datafs"
+version = "0.1.0"
+dependencies = [
+ "fuser",
+ "libc",
+ "protocol",
+ "serde",
+ "toml",
+]
 
 [[package]]
 name = "der-parser"
@@ -196,17 +207,6 @@ name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
-
-[[package]]
-name = "fuse-fs"
-version = "0.1.0"
-dependencies = [
- "fuser",
- "libc",
- "protocol",
- "serde",
- "toml",
-]
 
 [[package]]
 name = "fuser"
@@ -777,7 +777,7 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
- "fuse-fs",
+ "datafs",
  "fuser",
  "libc",
  "protocol",

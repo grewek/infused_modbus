@@ -3,14 +3,14 @@
 // plain shell commands.
 //
 // Usage:
-//   cargo run -p fuse-fs --example mount_demo -- <mountpoint> [device-description.toml]
+//   cargo run -p datafs --example mount_demo -- <mountpoint> [device-description.toml]
 //
 // If given a TOML file, only its *first* configured machine is mounted —
 // this rig predates the multi-machine device description and is a manual
 // smoke-test tool, not a full multi-machine demo (see `client`/`server`'s
 // own `main.rs` for that). The mounted machine is always named "Demo", so
 // every path below is under <mountpoint>/Demo/ (every machine gets its own
-// top-level directory — see fuse_fs::filesystem::InfusedFilesystem).
+// top-level directory — see datafs::filesystem::InfusedFilesystem).
 //
 // Then, in another terminal:
 //   ls <mountpoint>/Demo/holding-registers
@@ -29,8 +29,8 @@
 //
 // Ctrl+C to stop; the kernel unmounts automatically once the process exits.
 
-use fuse_fs::filesystem::{InfusedFilesystem, MachineConfig, WriteMode};
-use fuse_fs::{
+use datafs::filesystem::{InfusedFilesystem, MachineConfig, WriteMode};
+use datafs::{
     CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore,
     RegisterValue, StagedValue, WriteReport, WriteStatus,
 };
@@ -147,7 +147,7 @@ fn main() {
                         | StagedValue::FileRecord { .. } => {
                             // This demo only mounts in WriteMode::Staged, so
                             // these are never actually produced — see
-                            // fuse_fs::filesystem's "server direct-write
+                            // datafs::filesystem's "server direct-write
                             // model" doc comment.
                             println!("(demo) unreachable in WriteMode::Staged: {name}");
                         }
@@ -199,7 +199,7 @@ fn main() {
         input_register_store,
         file_record_store,
         report,
-        permissions: fuse_fs::permissions::FusePermissions::default(),
+        permissions: datafs::permissions::FusePermissions::default(),
         server_id: None,
     };
     let filesystem =

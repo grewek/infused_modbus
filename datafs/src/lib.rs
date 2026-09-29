@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 // whichever of these its TOML description declares it to be. U24/I24 have
 // no native Rust type, so they're stored in the next-larger native integer
 // (u32/i32) with the value always kept within the 24-bit range — see
-// fuse_fs::filesystem::InfusedFilesystem::parse_register_value, the one
+// datafs::filesystem::InfusedFilesystem::parse_register_value, the one
 // place that constructs a RegisterValue from user/text input and enforces
 // that range.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -224,7 +224,7 @@ pub enum StagedValue {
     Register(RegisterValue),
     Coil(CoilValue),
     // Only ever produced by the server's direct-write path (WriteMode::
-    // Direct) — see fuse_fs::filesystem's "server direct-write model" doc
+    // Direct) — see datafs::filesystem's "server direct-write model" doc
     // comment. The client never constructs these: it has no write path at
     // all for discrete inputs/input registers, staged or direct.
     DiscreteInput(CoilValue),

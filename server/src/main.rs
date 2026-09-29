@@ -40,7 +40,7 @@
 // over the wire instead of needing its own local copy — see
 // device_identification.rs for the object layout.
 
-use fuse_fs::filesystem::{InfusedFilesystem, MachineConfig, WriteMode};
+use datafs::filesystem::{InfusedFilesystem, MachineConfig, WriteMode};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::DeviceDescription;
 use server::connection::{serve_rtu_connection, serve_tcp_connection};
@@ -103,9 +103,9 @@ fn usage() -> ! {
 /// entirely, every directory keeps its historical hardcoded behavior
 /// (`FusePermissions::default()`). Extracted before the `admin` subcommand
 /// check, so it's harmless (simply unused) if given alongside `admin`.
-fn extract_fuse_permissions(args: &mut Vec<String>) -> fuse_fs::permissions::FusePermissions {
+fn extract_fuse_permissions(args: &mut Vec<String>) -> datafs::permissions::FusePermissions {
     let Some(flag_index) = args.iter().position(|arg| arg == "--fuse-permissions") else {
-        return fuse_fs::permissions::FusePermissions::default();
+        return datafs::permissions::FusePermissions::default();
     };
     if flag_index + 1 >= args.len() {
         panic!("--fuse-permissions requires a path");
@@ -114,7 +114,7 @@ fn extract_fuse_permissions(args: &mut Vec<String>) -> fuse_fs::permissions::Fus
     let path = args.remove(flag_index);
     let toml_source = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
-    fuse_fs::permissions::FusePermissions::parse(&toml_source)
+    datafs::permissions::FusePermissions::parse(&toml_source)
         .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
 }
 
@@ -200,7 +200,7 @@ fn start_serving(
     server_options: server::server_options::ServerOptions,
     machines: Arc<HashMap<u8, ServerMachineState>>,
     toml_source: Arc<String>,
-    client_trust: Arc<Mutex<fuse_fs::client_trust::ClientTrustState>>,
+    client_trust: Arc<Mutex<datafs::client_trust::ClientTrustState>>,
     approved_clients: Arc<Mutex<server::client_trust::ApprovedClients>>,
     live_connections: Arc<Mutex<server::live_connections::LiveConnections>>,
 ) {
@@ -442,15 +442,15 @@ fn main() {
 
     // One fresh set of stores per configured machine, name-keyed — shared
     // by the transaction consumer (below) and the FUSE tree (further down).
-    // See fuse_fs::build_machine_stores.
-    let machine_stores: HashMap<String, fuse_fs::MachineStores> =
-        fuse_fs::build_machine_stores(&description.machines);
+    // See datafs::build_machine_stores.
+    let machine_stores: HashMap<String, datafs::MachineStores> =
+        datafs::build_machine_stores(&description.machines);
 
     let (transaction_sender, transaction_receiver) = mpsc::channel();
 
     // One consumer thread services every machine's direct writes, reading a
     // single shared channel tagged with the originating machine's name (see
-    // fuse-fs's multi-machine `InfusedFilesystem`).
+    // datafs's multi-machine `InfusedFilesystem`).
     std::thread::spawn({
         let machine_stores = machine_stores.clone();
         move || {
@@ -497,7 +497,7 @@ fn main() {
     // subtree (which displays that same state) — one `ClientTrustState`,
     // not two independently-populated copies. See O2's "known gap" note:
     // this is what closes it.
-    let client_trust = Arc::new(Mutex::new(fuse_fs::client_trust::ClientTrustState::new()));
+    let client_trust = Arc::new(Mutex::new(datafs::client_trust::ClientTrustState::new()));
     // Shared between the TLS client-cert verifier (which enforces it) and
     // the admin socket below (which is the only thing that ever mutates
     // it) — same one-writer-per-piece-of-state precedent as `client_trust`
@@ -546,7 +546,7 @@ fn main() {
 
     // Always served, regardless of connection type — approving/revoking
     // clients is meaningful only under tls+tcp://, but `client-trust/`'s
-    // FUSE presence is likewise unconditional (see fuse-fs O1), so the
+    // FUSE presence is likewise unconditional (see datafs O1), so the
     // admin channel that manages it follows the same precedent rather than
     // depending on which transport was chosen.
     runtime.spawn({
@@ -630,7 +630,7 @@ fn main() {
         Some(client_trust),
     );
     // default_permissions makes the kernel actually enforce what getattr
-    // reports (see fuse_fs::permissions) instead of every request being
+    // reports (see datafs::permissions) instead of every request being
     // allowed regardless of mode/uid/gid.
     let mut mount_config = fuser::Config::default();
     mount_config.mount_options = vec![fuser::MountOption::DefaultPermissions];

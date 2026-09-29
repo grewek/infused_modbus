@@ -11,7 +11,7 @@
 // `crate::batching`), not just how many registers are in the batch, and
 // `poll_once` walks the decoded response the same number of words at a
 // time per register, reassembling each one via
-// `fuse_fs::register_encoding::register_value_from_words` (which needs the
+// `datafs::register_encoding::register_value_from_words` (which needs the
 // device's `mem_layout` for anything wider than one register).
 //
 // Traffic is reduced by batching contiguous register addresses into a
@@ -24,8 +24,8 @@
 use crate::batching::{Batch, build_batches};
 use crate::connection::Connection;
 use crate::reconnect::ReconnectSignal;
-use fuse_fs::register_encoding::register_value_from_words;
-use fuse_fs::{
+use datafs::register_encoding::register_value_from_words;
+use datafs::{
     CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore,
 };
 use protocol::device_description::{
@@ -517,7 +517,7 @@ pub async fn run_polling_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuse_fs::RegisterValue;
+    use datafs::RegisterValue;
     use protocol::device_description::{AccessRight, DataType};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

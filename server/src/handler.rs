@@ -31,8 +31,8 @@
 
 use crate::device_identification::{build_objects, handle_read_device_identification};
 use crate::server_options::ServerOptions;
-use fuse_fs::register_encoding::{register_value_from_words, register_value_to_words};
-use fuse_fs::{
+use datafs::register_encoding::{register_value_from_words, register_value_to_words};
+use datafs::{
     CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore,
     RegisterValue,
 };
@@ -1316,7 +1316,7 @@ mod tests {
 
     #[test]
     fn read_returns_a_correctly_assembled_multi_register_value() {
-        use fuse_fs::register_encoding::register_value_from_words;
+        use datafs::register_encoding::register_value_from_words;
 
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         store
@@ -1732,7 +1732,7 @@ mod tests {
 
     #[test]
     fn write_multiple_registers_writes_a_correctly_assembled_multi_register_value() {
-        use fuse_fs::register_encoding::register_value_to_words;
+        use datafs::register_encoding::register_value_to_words;
 
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         let coil_store = Arc::new(Mutex::new(CoilStore::new()));
@@ -2676,7 +2676,7 @@ mod tests {
 
     #[test]
     fn read_input_registers_returns_a_correctly_assembled_multi_register_value() {
-        use fuse_fs::register_encoding::register_value_from_words;
+        use datafs::register_encoding::register_value_from_words;
 
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         let coil_store = Arc::new(Mutex::new(CoilStore::new()));

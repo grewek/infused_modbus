@@ -1,7 +1,7 @@
 // Owns the receiving end of InfusedFilesystem's transaction_sender channel
 // and is where CLAUDE.md's "TRANSACTION_END confirmation semantics" are
 // actually fulfilled: for every register/coil in a drained transaction,
-// attempt the real write and update `report` with the outcome. `fuse-fs`
+// attempt the real write and update `report` with the outcome. `datafs`
 // itself never does this — see the module doc comment on
 // InfusedFilesystem.
 //
@@ -57,8 +57,8 @@ use crate::write_confirmation::{
     confirm_coil_write, confirm_coil_write_multiple, confirm_file_record_write, confirm_mask_write,
     confirm_write, confirm_write_multiple,
 };
-use fuse_fs::register_encoding::register_value_to_words;
-use fuse_fs::{CoilValue, RegisterValue, StagedValue, WriteReport, WriteStatus};
+use datafs::register_encoding::register_value_to_words;
+use datafs::{CoilValue, RegisterValue, StagedValue, WriteReport, WriteStatus};
 use protocol::device_description::{
     CoilDescription, FileRecordDescription, MemLayout, RegisterDescription,
 };
@@ -110,7 +110,7 @@ fn build_coil_write_batches(entries: Vec<(CoilDescription, bool)>) -> Vec<CoilWr
 /// validate staged writes against, its own report sink, its own wire
 /// mem_layout, and which unit_id on the shared link it answers to. The
 /// outer `InfusedFilesystem`'s `transaction_sender` is shared by every
-/// machine (see fuse-fs step 3), so `run_transaction_consumer` needs one of
+/// machine (see datafs step 3), so `run_transaction_consumer` needs one of
 /// these per configured machine name to know how to process a drained
 /// transaction tagged with that name.
 pub struct MachineTransactionConfig {
@@ -159,7 +159,7 @@ fn process_transaction(
     // Resolve every staged name against the known registers/coils
     // first, reporting anything unknown or mismatched immediately —
     // only what's left gets batched below. A type mismatch shouldn't
-    // actually happen (fuse_fs always stages a value parsed against
+    // actually happen (datafs always stages a value parsed against
     // the register's own declared type), but is worth checking rather
     // than assuming.
     for (name, value) in transaction {
@@ -199,7 +199,7 @@ fn process_transaction(
                         .set(name, WriteStatus::Failed(reason));
                 }
             },
-            // Never actually produced on the client — fuse-fs only
+            // Never actually produced on the client — datafs only
             // constructs these from its server-only direct-write path
             // (WriteMode::Direct), and the client always runs
             // WriteMode::Staged. Handled defensively rather than
@@ -413,7 +413,7 @@ fn process_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuse_fs::{CoilValue, RegisterValue};
+    use datafs::{CoilValue, RegisterValue};
     use protocol::device_description::{AccessRight, DataType};
 
     const TEST_MACHINE_NAME: &str = "TestMachine";

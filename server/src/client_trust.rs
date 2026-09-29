@@ -1,7 +1,7 @@
 // The server's client-approval policy state — which TLS client
 // fingerprints are allowed to connect (see CLAUDE.md's "client-trust"
 // design). Plain data structure, no interior mutability: callers share it
-// the same way as fuse_fs::RegisterStore/CoilStore, via an externally
+// the same way as datafs::RegisterStore/CoilStore, via an externally
 // applied Arc<Mutex<ApprovedClients>>, not a lock owned by this type.
 
 use protocol::tls::Fingerprint;

@@ -12,13 +12,13 @@
 //
 // One consumer thread services every configured machine's writes, reading a
 // single shared channel tagged with the originating machine's *name* (see
-// fuse-fs's multi-machine `InfusedFilesystem`/`MachineFs::commit_transaction`
+// datafs's multi-machine `InfusedFilesystem`/`MachineFs::commit_transaction`
 // — every send is tagged this way, since that's how a machine identifies
 // itself on the FUSE side; `unit_id`, by contrast, is only meaningful for
 // wire dispatch in `handler.rs`/`connection.rs`, a completely different
 // lookup key from this one).
 
-use fuse_fs::{MachineStores, StagedValue, WriteStatus};
+use datafs::{MachineStores, StagedValue, WriteStatus};
 use std::collections::HashMap;
 use std::sync::{PoisonError, mpsc};
 
@@ -77,7 +77,7 @@ pub fn run_transaction_consumer(
                 }
                 // Never actually produced on the server: MASK-format
                 // staging only happens inside the transactions/ write path
-                // (fuse_fs::filesystem::release), and transactions/ only
+                // (datafs::filesystem::release), and transactions/ only
                 // exists at all in WriteMode::Staged, which the server
                 // never runs (see CLAUDE.md's "server direct-write
                 // model"). Handled defensively rather than assumed
@@ -99,7 +99,7 @@ pub fn run_transaction_consumer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuse_fs::{CoilValue, RegisterValue};
+    use datafs::{CoilValue, RegisterValue};
 
     const TEST_MACHINE_NAME: &str = "TestMachine";
 

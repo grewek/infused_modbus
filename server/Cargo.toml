@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 protocol = { path = "../protocol" }
-fuse-fs = { path = "../fuse-fs" }
+datafs = { path = "../datafs" }
 fuser = "0.18"
 tokio-serial = "5"
 tokio = { version = "1", features = [

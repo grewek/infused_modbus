@@ -3,7 +3,7 @@
 // subcommand talks to, so approving/revoking a TLS client never requires
 // speaking the raw protocol by hand (see CLAUDE.md's "Approval/revocation
 // channel"). APPROVE/REVOKE mutate both `ApprovedClients` (N1, which the
-// real TLS `ClientCertVerifier` consults) and `fuse_fs::client_trust::
+// real TLS `ClientCertVerifier` consults) and `datafs::client_trust::
 // ClientTrustState` (the read-only `client-trust/approved/` FUSE mirror) —
 // keeping these in sync here is what closes O2's "known gap" note about
 // the two never being wired to the same writer. REVOKE also terminates any
@@ -12,7 +12,7 @@
 
 use crate::client_trust::{ApprovalOutcome, ApprovedClients};
 use crate::live_connections::LiveConnections;
-use fuse_fs::client_trust::ClientTrustState;
+use datafs::client_trust::ClientTrustState;
 use protocol::tls::Fingerprint;
 use std::fmt;
 use std::os::unix::fs::PermissionsExt;

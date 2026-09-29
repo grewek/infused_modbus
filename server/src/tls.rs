@@ -6,7 +6,7 @@
 // built from this config) works with it as-is. No new serve-loop needed.
 
 use crate::client_trust::ApprovedClients;
-use fuse_fs::client_trust::ClientTrustState;
+use datafs::client_trust::ClientTrustState;
 use protocol::tls::{Fingerprint, Identity};
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::WebPkiSupportedAlgorithms;
@@ -254,7 +254,7 @@ where
 mod tests {
     use super::*;
     use crate::connection::serve_tcp_connection;
-    use fuse_fs::{CoilStore, RegisterStore};
+    use datafs::{CoilStore, RegisterStore};
     use protocol::adu::TcpAdu;
     use protocol::device_description::{AccessRight, DataType, MemLayout, RegisterDescription};
     use protocol::pdu::{ReadHoldingRegistersRequest, ReadHoldingRegistersResponse};
@@ -545,7 +545,7 @@ mod tests {
         store
             .lock()
             .unwrap()
-            .set("Tank_Temperature", fuse_fs::RegisterValue::U16(72));
+            .set("Tank_Temperature", datafs::RegisterValue::U16(72));
         let mut machines = std::collections::HashMap::new();
         machines.insert(
             0x01,
@@ -555,11 +555,11 @@ mod tests {
                 coils: Arc::new(Vec::new()),
                 coil_store: Arc::new(Mutex::new(CoilStore::new())),
                 discrete_inputs: Arc::new(Vec::new()),
-                discrete_input_store: Arc::new(Mutex::new(fuse_fs::DiscreteInputStore::new())),
+                discrete_input_store: Arc::new(Mutex::new(datafs::DiscreteInputStore::new())),
                 input_registers: Arc::new(Vec::new()),
-                input_register_store: Arc::new(Mutex::new(fuse_fs::InputRegisterStore::new())),
+                input_register_store: Arc::new(Mutex::new(datafs::InputRegisterStore::new())),
                 file_records: Arc::new(Vec::new()),
-                file_record_store: Arc::new(Mutex::new(fuse_fs::FileRecordStore::new())),
+                file_record_store: Arc::new(Mutex::new(datafs::FileRecordStore::new())),
                 mem_layout: MemLayout::Abcd,
                 input_register_mem_layout: MemLayout::Abcd,
                 server_id: None,
