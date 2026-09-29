@@ -680,10 +680,7 @@ impl MachineFs {
     // Content of a report/ file: the outcome of the most recent write
     // attempt for that register, or empty if none has been attempted yet.
     fn report_content(&self, name: &str) -> String {
-        match self.report_lock().get(name) {
-            Some(status) => format!("{status}\n"),
-            None => String::new(),
-        }
+        crate::report_file_content(&self.report_lock(), name)
     }
 
     // Resolves a transaction file's inode back to its register name. Used

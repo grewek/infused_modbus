@@ -569,6 +569,16 @@ impl WriteReport {
     }
 }
 
+// How a `report/<name>` file's content is rendered: empty until a write has
+// been attempted for that name, `"<status>\n"` once one has — same "empty
+// until set" shape every other store-backed data type's file content
+// already has. Extracted for the same reason `register_file_content` etc.
+// were: a second, non-FUSE consumer needed the exact same rendering
+// `filesystem::MachineFs::report_content` already had.
+pub fn report_file_content(report: &WriteReport, name: &str) -> String {
+    file_content(report.get(name))
+}
+
 // Bundles one instance of every per-machine store type + its write report —
 // see CLAUDE.md's "Planned: multi-machine device description & FUSE layout"
 // section. A multi-machine deployment holds one of these per configured

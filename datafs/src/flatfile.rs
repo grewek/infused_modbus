@@ -36,10 +36,10 @@
 use crate::client_trust::ClientTrustState;
 use crate::{
     CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore, MachineStores,
-    PendingTransaction, RegisterStore, StagedValue, coil_file_content, discrete_input_file_content,
-    file_record_file_content, input_register_file_content, parse_coil_value,
-    parse_file_record_name, parse_file_record_value, parse_masked_register_value,
-    parse_register_value, register_file_content,
+    PendingTransaction, RegisterStore, StagedValue, WriteReport, coil_file_content,
+    discrete_input_file_content, file_record_file_content, input_register_file_content,
+    parse_coil_value, parse_file_record_name, parse_file_record_value, parse_masked_register_value,
+    parse_register_value, register_file_content, report_file_content,
 };
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use protocol::device_description::{
@@ -357,6 +357,71 @@ impl FlatfileFileRecordRenderer {
             }
         }
         seen
+    }
+}
+
+/// Renders `report/` — one file per configured register, coil, and file
+/// record (by its `<file_number>:<record_number>` colon key), mirroring
+/// `filesystem::MachineFs`'s own static `report_register_by_ino`/
+/// `report_coil_by_ino`/`report_file_record_by_ino` ino ranges exactly:
+/// declared but never written = empty content, `"<status>\n"` once a write
+/// has been attempted. Discrete inputs/input registers are deliberately not
+/// covered (H3's original scope, never extended to them). Present on both
+/// client and server for the same reason `report_ino` is always allocated
+/// in the FUSE tree regardless of `WriteMode` — only the client's
+/// `transaction_consumer`/`write_confirmation` ever actually populates the
+/// underlying `WriteReport`, so a server's `report/` stays permanently
+/// empty in practice, not hidden.
+pub struct FlatfileReportRenderer {
+    directory: PathBuf,
+    names: Vec<String>,
+    report: Arc<Mutex<WriteReport>>,
+    last_rendered: Mutex<HashMap<String, String>>,
+}
+
+impl FlatfileReportRenderer {
+    pub fn new(
+        directory: PathBuf,
+        registers: &[RegisterDescription],
+        coils: &[CoilDescription],
+        file_records: &[FileRecordDescription],
+        report: Arc<Mutex<WriteReport>>,
+    ) -> Self {
+        let mut names: Vec<String> = registers.iter().map(|r| r.name.clone()).collect();
+        names.extend(coils.iter().map(|coil| coil.name.clone()));
+        names.extend(
+            file_records
+                .iter()
+                .map(|record| format!("{}:{}", record.file_number, record.record_number)),
+        );
+        Self {
+            directory,
+            names,
+            report,
+            last_rendered: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn initialize(&self) -> io::Result<()> {
+        fs::create_dir_all(&self.directory)?;
+        self.render_once()
+    }
+
+    pub fn render_once(&self) -> io::Result<()> {
+        let report = self
+            .report
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut last_rendered = self
+            .last_rendered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        render_named_files(
+            &self.directory,
+            self.names.iter().cloned(),
+            |name| report_file_content(&report, name),
+            &mut last_rendered,
+        )
     }
 }
 
@@ -833,6 +898,7 @@ pub struct MachineFlatfileReaders {
     pub discrete_inputs: FlatfileDiscreteInputRenderer,
     pub input_registers: FlatfileInputRegisterRenderer,
     pub file_records: FlatfileFileRecordRenderer,
+    pub report: FlatfileReportRenderer,
 }
 
 impl MachineFlatfileReaders {
@@ -863,6 +929,13 @@ impl MachineFlatfileReaders {
                 machine.file_records.clone(),
                 stores.file_records.clone(),
             ),
+            report: FlatfileReportRenderer::new(
+                machine_directory(root, &machine.name, "report"),
+                &machine.registers,
+                &machine.coils,
+                &machine.file_records,
+                stores.report.clone(),
+            ),
         }
     }
 
@@ -873,7 +946,8 @@ impl MachineFlatfileReaders {
         self.coils.initialize()?;
         self.discrete_inputs.initialize()?;
         self.input_registers.initialize()?;
-        self.file_records.initialize()
+        self.file_records.initialize()?;
+        self.report.initialize()
     }
 
     /// Re-renders every directory to match its store's current values.
@@ -882,7 +956,8 @@ impl MachineFlatfileReaders {
         self.coils.render_once()?;
         self.discrete_inputs.render_once()?;
         self.input_registers.render_once()?;
-        self.file_records.render_once()
+        self.file_records.render_once()?;
+        self.report.render_once()
     }
 }
 
@@ -1394,6 +1469,58 @@ mod tests {
         assert_eq!(
             fs::read_to_string(directory.join("4").join("1")).unwrap(),
             "0D FE 00 20\n"
+        );
+    }
+
+    #[test]
+    fn report_renderer_starts_empty_for_every_configured_name() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("report");
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let renderer = FlatfileReportRenderer::new(
+            directory.clone(),
+            &[a_register("Tank_Temperature")],
+            &[a_coil("Motor_Running")],
+            &[a_file_record(4, 1, 2)],
+            report,
+        );
+
+        renderer.initialize().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(directory.join("Tank_Temperature")).unwrap(),
+            ""
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join("Motor_Running")).unwrap(),
+            ""
+        );
+        assert_eq!(fs::read_to_string(directory.join("4:1")).unwrap(), "");
+    }
+
+    #[test]
+    fn report_renderer_reflects_a_reported_status() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("report");
+        let report = Arc::new(Mutex::new(WriteReport::new()));
+        let renderer = FlatfileReportRenderer::new(
+            directory.clone(),
+            &[a_register("Tank_Temperature")],
+            &[],
+            &[],
+            report.clone(),
+        );
+        renderer.initialize().unwrap();
+
+        report
+            .lock()
+            .unwrap()
+            .set("Tank_Temperature", crate::WriteStatus::Ok);
+        renderer.render_once().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(directory.join("Tank_Temperature")).unwrap(),
+            "OK\n"
         );
     }
 
