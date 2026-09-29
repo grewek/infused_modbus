@@ -1,8 +1,9 @@
 use crate::client_trust::ClientTrustState;
 use crate::permissions::{DirectoryPermissions, FusePermissions};
 use crate::{
-    CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore,
-    PendingTransaction, RegisterStore, RegisterValue, StagedValue, WriteReport,
+    CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, PendingTransaction,
+    RegisterStore, StagedValue, WriteReport, parse_coil_value, parse_file_record_name,
+    parse_file_record_value, parse_masked_register_value, parse_register_value,
 };
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner, OpenFlags,
@@ -10,8 +11,8 @@ use fuser::{
     TimeOrNow,
 };
 use protocol::device_description::{
-    CoilDescription, DataType, DiscreteInputDescription, FileRecordDescription,
-    InputRegisterDescription, RegisterDescription,
+    CoilDescription, DiscreteInputDescription, FileRecordDescription, InputRegisterDescription,
+    RegisterDescription,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -72,33 +73,6 @@ const TRANSACTION_END_NAME: &str = "TRANSACTION_END";
 // independently), so this is kept short rather than the usual much longer
 // default.
 const ATTR_TTL: Duration = Duration::from_secs(1);
-
-// U24/I24 are stored in the next-larger native integer (u32/i32 — see
-// RegisterValue's own doc comment) but must still be kept within the real
-// 24-bit range, since nothing else validates that later. I24's range is the
-// standard two's-complement 24-bit one: -2^23..=2^23-1.
-const U24_MAX: u32 = 0x00FF_FFFF;
-const I24_MIN: i32 = -0x0080_0000;
-const I24_MAX: i32 = 0x007F_FFFF;
-
-// Parses `text` as either a `0x`/`0X`-prefixed hex literal or a plain
-// decimal one. Shared by every unsigned-integer DataType's text parsing in
-// `parse_register_value` below — the identical hex-or-decimal shape showed
-// up for U8/U16/U32/U64 (and U24's underlying u32) all at once while adding
-// the new DataType variants, so it was extracted immediately rather than
-// left duplicated across all of them (per this project's
-// extraction-based-programming convention: recognized pattern, refactor
-// right away).
-fn parse_hex_or_decimal<T>(
-    text: &str,
-    from_hex: impl FnOnce(&str) -> Result<T, std::num::ParseIntError>,
-    from_decimal: impl FnOnce(&str) -> Result<T, std::num::ParseIntError>,
-) -> Option<T> {
-    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        Some(hex) => from_hex(hex).ok(),
-        None => from_decimal(text).ok(),
-    }
-}
 
 // Bookkeeping for `transactions/`'s dynamic children — unlike
 // `holding-registers/`'s register files (fixed set, known at construction
@@ -737,125 +711,6 @@ impl MachineFs {
         if !drained.is_empty() {
             let _ = self.transaction_sender.send((self.name.clone(), drained));
         }
-    }
-
-    fn parse_register_value(data_type: DataType, text: &str) -> Option<RegisterValue> {
-        let text = text.trim();
-        match data_type {
-            DataType::U8 => Some(RegisterValue::U8(parse_hex_or_decimal(
-                text,
-                |hex| u8::from_str_radix(hex, 16),
-                |decimal| decimal.parse(),
-            )?)),
-            DataType::I8 => Some(RegisterValue::I8(text.parse().ok()?)),
-            DataType::U16 => Some(RegisterValue::U16(parse_hex_or_decimal(
-                text,
-                |hex| u16::from_str_radix(hex, 16),
-                |decimal| decimal.parse(),
-            )?)),
-            DataType::I16 => Some(RegisterValue::I16(text.parse().ok()?)),
-            DataType::U24 => {
-                let value = parse_hex_or_decimal(
-                    text,
-                    |hex| u32::from_str_radix(hex, 16),
-                    |decimal| decimal.parse(),
-                )?;
-                (value <= U24_MAX).then_some(RegisterValue::U24(value))
-            }
-            DataType::I24 => {
-                let value: i32 = text.parse().ok()?;
-                (I24_MIN..=I24_MAX)
-                    .contains(&value)
-                    .then_some(RegisterValue::I24(value))
-            }
-            DataType::U32 => Some(RegisterValue::U32(parse_hex_or_decimal(
-                text,
-                |hex| u32::from_str_radix(hex, 16),
-                |decimal| decimal.parse(),
-            )?)),
-            DataType::I32 => Some(RegisterValue::I32(text.parse().ok()?)),
-            DataType::U64 => Some(RegisterValue::U64(parse_hex_or_decimal(
-                text,
-                |hex| u64::from_str_radix(hex, 16),
-                |decimal| decimal.parse(),
-            )?)),
-            DataType::I64 => Some(RegisterValue::I64(text.parse().ok()?)),
-            DataType::F32 => Some(RegisterValue::F32(text.parse().ok()?)),
-            DataType::F64 => Some(RegisterValue::F64(text.parse().ok()?)),
-        }
-    }
-
-    // `MASK <and_mask> <or_mask>` (case-insensitive keyword, whitespace
-    // separated, each mask a plain `0x`-hex or decimal u16 exactly like a
-    // U16 register value) — the one-file syntax for staging a Mask Write
-    // Register (FC 0x16) instead of a plain overwrite. Deliberately doesn't
-    // check the target register's DataType here (this function only sees
-    // text, not which register it's for): a MASK staged against a register
-    // wider than one wire word parses fine but is rejected later, with a
-    // real reason, by client::transaction_consumer when it tries to send
-    // it — matching how encode_write_request already rejects an
-    // over-wide plain write at send time rather than at parse time.
-    fn parse_masked_register_value(text: &str) -> Option<(u16, u16)> {
-        let mut tokens = text.split_whitespace();
-        if !tokens.next()?.eq_ignore_ascii_case("MASK") {
-            return None;
-        }
-        let and_mask = parse_hex_or_decimal(
-            tokens.next()?,
-            |hex| u16::from_str_radix(hex, 16),
-            |decimal| decimal.parse(),
-        )?;
-        let or_mask = parse_hex_or_decimal(
-            tokens.next()?,
-            |hex| u16::from_str_radix(hex, 16),
-            |decimal| decimal.parse(),
-        )?;
-        if tokens.next().is_some() {
-            return None;
-        }
-        Some((and_mask, or_mask))
-    }
-
-    fn parse_coil_value(text: &str) -> Option<CoilValue> {
-        match text.trim() {
-            "0" => Some(CoilValue(false)),
-            "1" => Some(CoilValue(true)),
-            _ => None,
-        }
-    }
-
-    // A file record's content is a plain hex dump — see CLAUDE.md's "FC
-    // 0x14 (Read File Record)" section: what the bytes mean is entirely
-    // vendor-specific, so this project only ever carries them, never
-    // decodes them. Accepts whitespace-separated byte pairs
-    // ("0D FE 00 20") or one contiguous run ("0DFE0020") equally — all
-    // whitespace is stripped before parsing, so both forms (and anything
-    // in between) parse identically. No length check against the
-    // register's own declared `record_length` here — that's enforced at
-    // the wire-response boundary (`server::handler::handle_read_file_record`),
-    // not the FUSE write boundary, so what a technician wrote is always
-    // visible exactly as typed via a subsequent read, even if it doesn't
-    // match.
-    // The `transactions/<file_number>:<record_number>` naming a client
-    // stages a Write File Record (FC 0x15) through — same colon-separated
-    // synthetic identifier as `file_record_report_name`, but parsed back
-    // here rather than just constructed, since this is the one place a
-    // human actually types it in. Not itself a membership check — callers
-    // still verify the parsed numbers name a real configured file record.
-    fn parse_file_record_name(name: &str) -> Option<(u16, u16)> {
-        let (file_number, record_number) = name.split_once(':')?;
-        Some((file_number.parse().ok()?, record_number.parse().ok()?))
-    }
-
-    fn parse_file_record_value(text: &str) -> Option<Vec<u8>> {
-        let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        if cleaned.is_empty() || !cleaned.len().is_multiple_of(2) {
-            return None;
-        }
-        (0..cleaned.len())
-            .step_by(2)
-            .map(|start| u8::from_str_radix(&cleaned[start..start + 2], 16).ok())
-            .collect()
     }
 
     // Defaults to `2 * record_length` zero bytes until directly written —
@@ -1726,7 +1581,7 @@ impl MachineFs {
 
         let is_known_target = self.register_by_name(name).is_some()
             || self.coil_by_name(name).is_some()
-            || Self::parse_file_record_name(name).is_some_and(|(file_number, record_number)| {
+            || parse_file_record_name(name).is_some_and(|(file_number, record_number)| {
                 self.file_record_by_numbers(file_number, record_number)
                     .is_some()
             });
@@ -1816,20 +1671,20 @@ impl MachineFs {
             && let Ok(text) = String::from_utf8(buffer)
         {
             let staged = if let Some(register) = self.register_by_name(&name) {
-                if let Some((and_mask, or_mask)) = Self::parse_masked_register_value(&text) {
+                if let Some((and_mask, or_mask)) = parse_masked_register_value(&text) {
                     Some(StagedValue::MaskedRegister { and_mask, or_mask })
                 } else {
-                    Self::parse_register_value(register.data_type, &text).map(StagedValue::Register)
+                    parse_register_value(register.data_type, &text).map(StagedValue::Register)
                 }
             } else if self.coil_by_name(&name).is_some() {
-                Self::parse_coil_value(&text).map(StagedValue::Coil)
-            } else if let Some((file_number, record_number)) = Self::parse_file_record_name(&name)
-                .filter(|&(file_number, record_number)| {
+                parse_coil_value(&text).map(StagedValue::Coil)
+            } else if let Some((file_number, record_number)) =
+                parse_file_record_name(&name).filter(|&(file_number, record_number)| {
                     self.file_record_by_numbers(file_number, record_number)
                         .is_some()
                 })
             {
-                Self::parse_file_record_value(&text).map(|value| StagedValue::FileRecord {
+                parse_file_record_value(&text).map(|value| StagedValue::FileRecord {
                     file_number,
                     record_number,
                     value,
@@ -1859,20 +1714,19 @@ impl MachineFs {
             && let Ok(text) = String::from_utf8(buffer)
         {
             let direct = if let Some(register) = self.register_by_ino(ino) {
-                Self::parse_register_value(register.data_type, &text)
+                parse_register_value(register.data_type, &text)
                     .map(|value| (register.name.clone(), StagedValue::Register(value)))
             } else if let Some(coil) = self.coil_by_ino(ino) {
-                Self::parse_coil_value(&text)
-                    .map(|value| (coil.name.clone(), StagedValue::Coil(value)))
+                parse_coil_value(&text).map(|value| (coil.name.clone(), StagedValue::Coil(value)))
             } else if let Some(discrete_input) = self.discrete_input_by_ino(ino) {
-                Self::parse_coil_value(&text).map(|value| {
+                parse_coil_value(&text).map(|value| {
                     (
                         discrete_input.name.clone(),
                         StagedValue::DiscreteInput(value),
                     )
                 })
             } else if let Some(input_register) = self.input_register_by_ino(ino) {
-                Self::parse_register_value(input_register.data_type, &text).map(|value| {
+                parse_register_value(input_register.data_type, &text).map(|value| {
                     (
                         input_register.name.clone(),
                         StagedValue::InputRegister(value),
@@ -1881,7 +1735,7 @@ impl MachineFs {
             } else if let Some(description) = self.file_record_by_ino(ino) {
                 let file_number = description.file_number;
                 let record_number = description.record_number;
-                Self::parse_file_record_value(&text).map(|value| {
+                parse_file_record_value(&text).map(|value| {
                     (
                         Self::file_record_report_name(file_number, record_number),
                         StagedValue::FileRecord {
@@ -2520,8 +2374,8 @@ impl Filesystem for InfusedFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WriteStatus;
-    use protocol::device_description::AccessRight;
+    use crate::{CoilValue, RegisterValue, WriteStatus};
+    use protocol::device_description::{AccessRight, DataType};
 
     // Every fixture below constructs its lone `MachineFs` with `base = 1`
     // (so `dir_ino` == `INodeNo(1)`, exactly matching the pre-multi-machine
@@ -3176,19 +3030,19 @@ mod tests {
     #[test]
     fn parse_register_value_accepts_decimal_for_every_unsigned_type() {
         assert_eq!(
-            MachineFs::parse_register_value(DataType::U8, "255"),
+            parse_register_value(DataType::U8, "255"),
             Some(RegisterValue::U8(255))
         );
         assert_eq!(
-            MachineFs::parse_register_value(DataType::U16, "65535"),
+            parse_register_value(DataType::U16, "65535"),
             Some(RegisterValue::U16(65535))
         );
         assert_eq!(
-            MachineFs::parse_register_value(DataType::U32, "4000000000"),
+            parse_register_value(DataType::U32, "4000000000"),
             Some(RegisterValue::U32(4_000_000_000))
         );
         assert_eq!(
-            MachineFs::parse_register_value(DataType::U64, "18000000000000000000"),
+            parse_register_value(DataType::U64, "18000000000000000000"),
             Some(RegisterValue::U64(18_000_000_000_000_000_000))
         );
     }
@@ -3196,19 +3050,19 @@ mod tests {
     #[test]
     fn parse_register_value_accepts_hex_for_every_unsigned_type() {
         assert_eq!(
-            MachineFs::parse_register_value(DataType::U8, "0xFF"),
+            parse_register_value(DataType::U8, "0xFF"),
             Some(RegisterValue::U8(255))
         );
         assert_eq!(
-            MachineFs::parse_register_value(DataType::U16, "0xBEEF"),
+            parse_register_value(DataType::U16, "0xBEEF"),
             Some(RegisterValue::U16(0xBEEF))
         );
         assert_eq!(
-            MachineFs::parse_register_value(DataType::U32, "0xDEADBEEF"),
+            parse_register_value(DataType::U32, "0xDEADBEEF"),
             Some(RegisterValue::U32(0xDEADBEEF))
         );
         assert_eq!(
-            MachineFs::parse_register_value(DataType::U64, "0xFFFFFFFFFFFFFFFF"),
+            parse_register_value(DataType::U64, "0xFFFFFFFFFFFFFFFF"),
             Some(RegisterValue::U64(u64::MAX))
         );
     }
@@ -3216,19 +3070,19 @@ mod tests {
     #[test]
     fn parse_register_value_accepts_decimal_for_every_signed_type() {
         assert_eq!(
-            MachineFs::parse_register_value(DataType::I8, "-128"),
+            parse_register_value(DataType::I8, "-128"),
             Some(RegisterValue::I8(-128))
         );
         assert_eq!(
-            MachineFs::parse_register_value(DataType::I16, "-32768"),
+            parse_register_value(DataType::I16, "-32768"),
             Some(RegisterValue::I16(-32768))
         );
         assert_eq!(
-            MachineFs::parse_register_value(DataType::I32, "-2000000000"),
+            parse_register_value(DataType::I32, "-2000000000"),
             Some(RegisterValue::I32(-2_000_000_000))
         );
         assert_eq!(
-            MachineFs::parse_register_value(DataType::I64, "-9000000000000000000"),
+            parse_register_value(DataType::I64, "-9000000000000000000"),
             Some(RegisterValue::I64(-9_000_000_000_000_000_000))
         );
     }
@@ -3236,11 +3090,11 @@ mod tests {
     #[test]
     fn parse_register_value_accepts_decimal_for_both_float_types() {
         assert_eq!(
-            MachineFs::parse_register_value(DataType::F32, "3.5"),
+            parse_register_value(DataType::F32, "3.5"),
             Some(RegisterValue::F32(3.5))
         );
         assert_eq!(
-            MachineFs::parse_register_value(DataType::F64, "3.5"),
+            parse_register_value(DataType::F64, "3.5"),
             Some(RegisterValue::F64(3.5))
         );
     }
@@ -3248,142 +3102,115 @@ mod tests {
     #[test]
     fn parse_register_value_accepts_u24_within_range_decimal_and_hex() {
         assert_eq!(
-            MachineFs::parse_register_value(DataType::U24, "16777215"),
+            parse_register_value(DataType::U24, "16777215"),
             Some(RegisterValue::U24(0x00FF_FFFF))
         );
         assert_eq!(
-            MachineFs::parse_register_value(DataType::U24, "0xFFFFFF"),
+            parse_register_value(DataType::U24, "0xFFFFFF"),
             Some(RegisterValue::U24(0x00FF_FFFF))
         );
     }
 
     #[test]
     fn parse_register_value_rejects_u24_above_the_24_bit_range() {
-        assert_eq!(
-            MachineFs::parse_register_value(DataType::U24, "16777216"),
-            None
-        );
+        assert_eq!(parse_register_value(DataType::U24, "16777216"), None);
     }
 
     #[test]
     fn parse_register_value_accepts_i24_within_range() {
         assert_eq!(
-            MachineFs::parse_register_value(DataType::I24, "-8388608"),
+            parse_register_value(DataType::I24, "-8388608"),
             Some(RegisterValue::I24(-8_388_608))
         );
         assert_eq!(
-            MachineFs::parse_register_value(DataType::I24, "8388607"),
+            parse_register_value(DataType::I24, "8388607"),
             Some(RegisterValue::I24(8_388_607))
         );
     }
 
     #[test]
     fn parse_register_value_rejects_i24_outside_the_24_bit_range() {
-        assert_eq!(
-            MachineFs::parse_register_value(DataType::I24, "8388608"),
-            None
-        );
-        assert_eq!(
-            MachineFs::parse_register_value(DataType::I24, "-8388609"),
-            None
-        );
+        assert_eq!(parse_register_value(DataType::I24, "8388608"), None);
+        assert_eq!(parse_register_value(DataType::I24, "-8388609"), None);
     }
 
     #[test]
     fn parse_register_value_trims_whitespace() {
         assert_eq!(
-            MachineFs::parse_register_value(DataType::U16, " 42\n"),
+            parse_register_value(DataType::U16, " 42\n"),
             Some(RegisterValue::U16(42))
         );
     }
 
     #[test]
     fn parse_register_value_rejects_garbage() {
-        assert_eq!(
-            MachineFs::parse_register_value(DataType::U16, "not a number"),
-            None
-        );
-        assert_eq!(
-            MachineFs::parse_register_value(DataType::I32, "not a number"),
-            None
-        );
-        assert_eq!(
-            MachineFs::parse_register_value(DataType::F64, "not a number"),
-            None
-        );
+        assert_eq!(parse_register_value(DataType::U16, "not a number"), None);
+        assert_eq!(parse_register_value(DataType::I32, "not a number"), None);
+        assert_eq!(parse_register_value(DataType::F64, "not a number"), None);
     }
 
     #[test]
     fn parse_masked_register_value_accepts_hex_masks() {
         assert_eq!(
-            MachineFs::parse_masked_register_value("MASK 0x00F2 0x0025"),
+            parse_masked_register_value("MASK 0x00F2 0x0025"),
             Some((0x00F2, 0x0025))
         );
     }
 
     #[test]
     fn parse_masked_register_value_accepts_decimal_masks() {
-        assert_eq!(
-            MachineFs::parse_masked_register_value("MASK 242 37"),
-            Some((242, 37))
-        );
+        assert_eq!(parse_masked_register_value("MASK 242 37"), Some((242, 37)));
     }
 
     #[test]
     fn parse_masked_register_value_is_case_insensitive_and_trims_whitespace() {
         assert_eq!(
-            MachineFs::parse_masked_register_value("  mask 0x00F2 0x0025  \n"),
+            parse_masked_register_value("  mask 0x00F2 0x0025  \n"),
             Some((0x00F2, 0x0025))
         );
     }
 
     #[test]
     fn parse_masked_register_value_rejects_missing_keyword() {
-        assert_eq!(
-            MachineFs::parse_masked_register_value("0x00F2 0x0025"),
-            None
-        );
+        assert_eq!(parse_masked_register_value("0x00F2 0x0025"), None);
     }
 
     #[test]
     fn parse_masked_register_value_rejects_wrong_token_count() {
-        assert_eq!(MachineFs::parse_masked_register_value("MASK 0x00F2"), None);
+        assert_eq!(parse_masked_register_value("MASK 0x00F2"), None);
         assert_eq!(
-            MachineFs::parse_masked_register_value("MASK 0x00F2 0x0025 0x0000"),
+            parse_masked_register_value("MASK 0x00F2 0x0025 0x0000"),
             None
         );
     }
 
     #[test]
     fn parse_masked_register_value_rejects_garbage_masks() {
-        assert_eq!(
-            MachineFs::parse_masked_register_value("MASK not-a-mask 0x0025"),
-            None
-        );
+        assert_eq!(parse_masked_register_value("MASK not-a-mask 0x0025"), None);
     }
 
     #[test]
     fn parse_coil_value_accepts_zero_and_one() {
-        assert_eq!(MachineFs::parse_coil_value("0"), Some(CoilValue(false)));
-        assert_eq!(MachineFs::parse_coil_value("1"), Some(CoilValue(true)));
+        assert_eq!(parse_coil_value("0"), Some(CoilValue(false)));
+        assert_eq!(parse_coil_value("1"), Some(CoilValue(true)));
     }
 
     #[test]
     fn parse_coil_value_trims_whitespace() {
-        assert_eq!(MachineFs::parse_coil_value(" 1\n"), Some(CoilValue(true)));
+        assert_eq!(parse_coil_value(" 1\n"), Some(CoilValue(true)));
     }
 
     #[test]
     fn parse_coil_value_rejects_anything_else() {
-        assert_eq!(MachineFs::parse_coil_value("true"), None);
-        assert_eq!(MachineFs::parse_coil_value("2"), None);
-        assert_eq!(MachineFs::parse_coil_value(""), None);
+        assert_eq!(parse_coil_value("true"), None);
+        assert_eq!(parse_coil_value("2"), None);
+        assert_eq!(parse_coil_value(""), None);
     }
 
     #[test]
     fn parse_file_record_value_accepts_space_separated_hex() {
         assert_eq!(
-            MachineFs::parse_file_record_value("0D FE 00 20"),
+            parse_file_record_value("0D FE 00 20"),
             Some(vec![0x0D, 0xFE, 0x00, 0x20])
         );
     }
@@ -3391,7 +3218,7 @@ mod tests {
     #[test]
     fn parse_file_record_value_accepts_contiguous_hex() {
         assert_eq!(
-            MachineFs::parse_file_record_value("0dfe0020"),
+            parse_file_record_value("0dfe0020"),
             Some(vec![0x0D, 0xFE, 0x00, 0x20])
         );
     }
@@ -3399,41 +3226,41 @@ mod tests {
     #[test]
     fn parse_file_record_value_trims_surrounding_whitespace() {
         assert_eq!(
-            MachineFs::parse_file_record_value("\n  AB CD  \n"),
+            parse_file_record_value("\n  AB CD  \n"),
             Some(vec![0xAB, 0xCD])
         );
     }
 
     #[test]
     fn parse_file_record_value_rejects_odd_length() {
-        assert_eq!(MachineFs::parse_file_record_value("ABC"), None);
+        assert_eq!(parse_file_record_value("ABC"), None);
     }
 
     #[test]
     fn parse_file_record_value_rejects_non_hex_characters() {
-        assert_eq!(MachineFs::parse_file_record_value("ZZ"), None);
+        assert_eq!(parse_file_record_value("ZZ"), None);
     }
 
     #[test]
     fn parse_file_record_value_rejects_empty_input() {
-        assert_eq!(MachineFs::parse_file_record_value(""), None);
-        assert_eq!(MachineFs::parse_file_record_value("   "), None);
+        assert_eq!(parse_file_record_value(""), None);
+        assert_eq!(parse_file_record_value("   "), None);
     }
 
     #[test]
     fn parse_file_record_name_accepts_a_colon_separated_pair() {
-        assert_eq!(MachineFs::parse_file_record_name("4:1"), Some((4, 1)));
+        assert_eq!(parse_file_record_name("4:1"), Some((4, 1)));
     }
 
     #[test]
     fn parse_file_record_name_rejects_a_missing_colon() {
-        assert_eq!(MachineFs::parse_file_record_name("41"), None);
+        assert_eq!(parse_file_record_name("41"), None);
     }
 
     #[test]
     fn parse_file_record_name_rejects_non_numeric_parts() {
-        assert_eq!(MachineFs::parse_file_record_name("a:1"), None);
-        assert_eq!(MachineFs::parse_file_record_name("4:b"), None);
+        assert_eq!(parse_file_record_name("a:1"), None);
+        assert_eq!(parse_file_record_name("4:b"), None);
     }
 
     #[test]

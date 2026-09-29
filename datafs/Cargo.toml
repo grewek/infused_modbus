@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 protocol = { path = "../protocol" }
 fuser = "0.18"
+inotify = { version = "0.11", default-features = false }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

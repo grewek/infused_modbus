@@ -268,6 +268,157 @@ pub fn file_record_file_content(
     format!("{hex}\n")
 }
 
+// U24/I24 are stored in the next-larger native integer (u32/i32 — see
+// RegisterValue's own doc comment) but must still be kept within the real
+// 24-bit range, since nothing else validates that later. I24's range is the
+// standard two's-complement 24-bit one: -2^23..=2^23-1.
+const U24_MAX: u32 = 0x00FF_FFFF;
+const I24_MIN: i32 = -0x0080_0000;
+const I24_MAX: i32 = 0x007F_FFFF;
+
+// Parses `text` as either a `0x`/`0X`-prefixed hex literal or a plain
+// decimal one. Shared by every unsigned-integer DataType's text parsing in
+// `parse_register_value` below — the identical hex-or-decimal shape showed
+// up for U8/U16/U32/U64 (and U24's underlying u32) all at once while adding
+// the new DataType variants, so it was extracted immediately rather than
+// left duplicated across all of them (per this project's
+// extraction-based-programming convention: recognized pattern, refactor
+// right away).
+fn parse_hex_or_decimal<T>(
+    text: &str,
+    from_hex: impl FnOnce(&str) -> Result<T, std::num::ParseIntError>,
+    from_decimal: impl FnOnce(&str) -> Result<T, std::num::ParseIntError>,
+) -> Option<T> {
+    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        Some(hex) => from_hex(hex).ok(),
+        None => from_decimal(text).ok(),
+    }
+}
+
+// Parses a `transactions/<name>` file's content into the RegisterValue its
+// register's own declared DataType calls for — shared by every presentation
+// layer that stages a plain register write, not just FUSE's `create`/
+// `write`/`release` (which is where this used to live before the `flatfile`
+// backend needed the exact same parsing).
+pub fn parse_register_value(data_type: DataType, text: &str) -> Option<RegisterValue> {
+    let text = text.trim();
+    match data_type {
+        DataType::U8 => Some(RegisterValue::U8(parse_hex_or_decimal(
+            text,
+            |hex| u8::from_str_radix(hex, 16),
+            |decimal| decimal.parse(),
+        )?)),
+        DataType::I8 => Some(RegisterValue::I8(text.parse().ok()?)),
+        DataType::U16 => Some(RegisterValue::U16(parse_hex_or_decimal(
+            text,
+            |hex| u16::from_str_radix(hex, 16),
+            |decimal| decimal.parse(),
+        )?)),
+        DataType::I16 => Some(RegisterValue::I16(text.parse().ok()?)),
+        DataType::U24 => {
+            let value = parse_hex_or_decimal(
+                text,
+                |hex| u32::from_str_radix(hex, 16),
+                |decimal| decimal.parse(),
+            )?;
+            (value <= U24_MAX).then_some(RegisterValue::U24(value))
+        }
+        DataType::I24 => {
+            let value: i32 = text.parse().ok()?;
+            (I24_MIN..=I24_MAX)
+                .contains(&value)
+                .then_some(RegisterValue::I24(value))
+        }
+        DataType::U32 => Some(RegisterValue::U32(parse_hex_or_decimal(
+            text,
+            |hex| u32::from_str_radix(hex, 16),
+            |decimal| decimal.parse(),
+        )?)),
+        DataType::I32 => Some(RegisterValue::I32(text.parse().ok()?)),
+        DataType::U64 => Some(RegisterValue::U64(parse_hex_or_decimal(
+            text,
+            |hex| u64::from_str_radix(hex, 16),
+            |decimal| decimal.parse(),
+        )?)),
+        DataType::I64 => Some(RegisterValue::I64(text.parse().ok()?)),
+        DataType::F32 => Some(RegisterValue::F32(text.parse().ok()?)),
+        DataType::F64 => Some(RegisterValue::F64(text.parse().ok()?)),
+    }
+}
+
+// `MASK <and_mask> <or_mask>` (case-insensitive keyword, whitespace
+// separated, each mask a plain `0x`-hex or decimal u16 exactly like a
+// U16 register value) — the one-file syntax for staging a Mask Write
+// Register (FC 0x16) instead of a plain overwrite. Deliberately doesn't
+// check the target register's DataType here (this function only sees
+// text, not which register it's for): a MASK staged against a register
+// wider than one wire word parses fine but is rejected later, with a
+// real reason, by client::transaction_consumer when it tries to send
+// it — matching how encode_write_request already rejects an
+// over-wide plain write at send time rather than at parse time.
+pub fn parse_masked_register_value(text: &str) -> Option<(u16, u16)> {
+    let mut tokens = text.split_whitespace();
+    if !tokens.next()?.eq_ignore_ascii_case("MASK") {
+        return None;
+    }
+    let and_mask = parse_hex_or_decimal(
+        tokens.next()?,
+        |hex| u16::from_str_radix(hex, 16),
+        |decimal| decimal.parse(),
+    )?;
+    let or_mask = parse_hex_or_decimal(
+        tokens.next()?,
+        |hex| u16::from_str_radix(hex, 16),
+        |decimal| decimal.parse(),
+    )?;
+    if tokens.next().is_some() {
+        return None;
+    }
+    Some((and_mask, or_mask))
+}
+
+pub fn parse_coil_value(text: &str) -> Option<CoilValue> {
+    match text.trim() {
+        "0" => Some(CoilValue(false)),
+        "1" => Some(CoilValue(true)),
+        _ => None,
+    }
+}
+
+// A file record's content is a plain hex dump — see CLAUDE.md's "FC
+// 0x14 (Read File Record)" section: what the bytes mean is entirely
+// vendor-specific, so this project only ever carries them, never
+// decodes them. Accepts whitespace-separated byte pairs
+// ("0D FE 00 20") or one contiguous run ("0DFE0020") equally — all
+// whitespace is stripped before parsing, so both forms (and anything
+// in between) parse identically. No length check against the
+// register's own declared `record_length` here — that's enforced at
+// the wire-response boundary (`server::handler::handle_read_file_record`),
+// not the FUSE write boundary, so what a technician wrote is always
+// visible exactly as typed via a subsequent read, even if it doesn't
+// match.
+// The `transactions/<file_number>:<record_number>` naming a client
+// stages a Write File Record (FC 0x15) through — same colon-separated
+// synthetic identifier as `file_record_report_name`, but parsed back
+// here rather than just constructed, since this is the one place a
+// human actually types it in. Not itself a membership check — callers
+// still verify the parsed numbers name a real configured file record.
+pub fn parse_file_record_name(name: &str) -> Option<(u16, u16)> {
+    let (file_number, record_number) = name.split_once(':')?;
+    Some((file_number.parse().ok()?, record_number.parse().ok()?))
+}
+
+pub fn parse_file_record_value(text: &str) -> Option<Vec<u8>> {
+    let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if cleaned.is_empty() || !cleaned.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..cleaned.len())
+        .step_by(2)
+        .map(|start| u8::from_str_radix(&cleaned[start..start + 2], 16).ok())
+        .collect()
+}
+
 // A value staged in `transactions/`, before TRANSACTION_END hands it off to
 // be confirmed against the real device. Wraps whichever of RegisterValue or
 // CoilValue matches the name being staged — CLAUDE.md's transactions design

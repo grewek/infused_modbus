@@ -5,12 +5,14 @@
 //! concurrent reader never sees a torn value regardless of content size.
 //!
 //! Scope so far: M2 proved the mechanism with `holding-registers/` alone
-//! (single machine, read-only); M3 extends it to every other read-only data
+//! (single machine, read-only); M3 extended it to every other read-only data
 //! type — `coils/`, `discrete-inputs/`, `input-registers/`,
 //! `file-records/<file_number>/<record_number>` (nested), and `server-id`
-//! (a single static file, client-only). The write path via `inotify`
-//! (M4/M5), multi-machine layout (M6), and CLI wiring (M9) are still not
-//! here yet.
+//! (a single static file, client-only). M4 adds the client write path:
+//! `transactions/`+`TRANSACTION_END` via `inotify`, mirroring the FUSE
+//! layer's `write()`/`release()`-then-`create()` staging ritual —
+//! `FlatfileTransactionWatcher`. The server direct-write path (M5),
+//! multi-machine layout (M6), and CLI wiring (M9) are still not here yet.
 //!
 //! Deliberate scope reduction vs. the CLAUDE.md design text: that section
 //! describes change detection as push-based (`Notify`, fired by every
@@ -23,10 +25,13 @@
 //! the `Notify` wiring is worth its wider blast radius.
 
 use crate::{
-    CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore,
-    coil_file_content, discrete_input_file_content, file_record_file_content,
-    input_register_file_content, register_file_content,
+    CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, PendingTransaction,
+    RegisterStore, StagedValue, coil_file_content, discrete_input_file_content,
+    file_record_file_content, input_register_file_content, parse_coil_value,
+    parse_file_record_name, parse_file_record_value, parse_masked_register_value,
+    parse_register_value, register_file_content,
 };
+use inotify::{EventMask, Inotify, WatchMask};
 use protocol::device_description::{
     CoilDescription, DiscreteInputDescription, FileRecordDescription, InputRegisterDescription,
     RegisterDescription,
@@ -35,7 +40,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 // Writes `content` to `<path>.tmp` in the same directory as `path`, then
 // `rename()`s it over `path` — atomic on POSIX as long as both paths are on
@@ -354,6 +359,175 @@ pub fn write_server_id_file(path: &Path, server_id: Option<&str>) -> io::Result<
         None => return Ok(()),
     };
     atomic_write(path, &content)
+}
+
+// The sentinel name that triggers a transaction commit — same name and
+// meaning as `filesystem::TRANSACTION_END_NAME`, kept as its own constant
+// here rather than shared, since the two live in genuinely separate,
+// independent presentation layers (no code path imports across them).
+const TRANSACTION_END_NAME: &str = "TRANSACTION_END";
+
+/// Watches `transactions/` for the client's staging ritual — `inotify`
+/// stands in for the FUSE layer's own `write()`/`release()`-then-`create()`
+/// interception, which a real filesystem gives no way to hook directly.
+///
+/// Two events matter: `IN_CLOSE_WRITE` on a file under `transactions/`
+/// (a real `open()+write()+close()` sequence — exactly what `echo value >
+/// path` produces) stages that file's current content, and `IN_CREATE` of
+/// `TRANSACTION_END` drains everything staged so far and sends it down the
+/// same `(machine_name, HashMap<String, StagedValue>)`-tagged channel
+/// `client::transaction_consumer` already reads from — no changes needed
+/// downstream of the channel.
+///
+/// The daemon's own read-path updates (`FlatfileRegisterRenderer` and
+/// friends) go through `rename()`, which the kernel reports as
+/// `IN_MOVED_TO`, never `IN_CLOSE_WRITE` — so watching only `IN_CLOSE_WRITE`
+/// here can't ever mistake the daemon's own writes for user input, no
+/// origin-tagging needed (see CLAUDE.md's design section for this in full).
+///
+/// One real, structural difference from the FUSE layer, not fixable here:
+/// FUSE can reject an unknown target at `create()` time (`ENOENT`, so
+/// `echo` itself fails instantly). A real filesystem gives no such hook —
+/// `echo` always succeeds. The closest available parity is to notice the
+/// unknown target at `IN_CLOSE_WRITE` time and remove the stray file, which
+/// `stage_one` does — closer to "the write never really happened" than
+/// leaving it sitting there unprocessed, even though the user's `echo`
+/// itself didn't get an error the way it would under FUSE. A target that
+/// *is* known but whose content fails to parse is left exactly where FUSE
+/// leaves it too: not staged, file untouched, no feedback (an open gap
+/// noted in CLAUDE.md's Milestone H3, not solved by either layer).
+pub struct FlatfileTransactionWatcher {
+    machine_name: String,
+    directory: PathBuf,
+    registers: Vec<RegisterDescription>,
+    coils: Vec<CoilDescription>,
+    file_records: Vec<FileRecordDescription>,
+    transaction_sender: mpsc::Sender<(String, HashMap<String, StagedValue>)>,
+}
+
+impl FlatfileTransactionWatcher {
+    pub fn new(
+        machine_name: String,
+        directory: PathBuf,
+        registers: Vec<RegisterDescription>,
+        coils: Vec<CoilDescription>,
+        file_records: Vec<FileRecordDescription>,
+        transaction_sender: mpsc::Sender<(String, HashMap<String, StagedValue>)>,
+    ) -> Self {
+        Self {
+            machine_name,
+            directory,
+            registers,
+            coils,
+            file_records,
+            transaction_sender,
+        }
+    }
+
+    /// Creates `transactions/` if missing — mirrors every other renderer's
+    /// `initialize`, so `ls` shows an (empty) staging area immediately.
+    pub fn initialize(&self) -> io::Result<()> {
+        fs::create_dir_all(&self.directory)
+    }
+
+    /// Blocks the calling thread forever, watching `transactions/`. Returns
+    /// only if setting up or reading the inotify watch itself fails — a
+    /// caller is expected to run this on its own dedicated thread.
+    pub fn run_forever(&self) -> io::Result<()> {
+        let mut inotify = Inotify::init()?;
+        inotify
+            .watches()
+            .add(&self.directory, WatchMask::CLOSE_WRITE | WatchMask::CREATE)?;
+        let mut pending = PendingTransaction::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let events = inotify.read_events_blocking(&mut buffer)?;
+            for event in events {
+                let Some(name) = event.name.and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if event.mask.contains(EventMask::CREATE) && name == TRANSACTION_END_NAME {
+                    self.commit(&mut pending);
+                } else if event.mask.contains(EventMask::CLOSE_WRITE) {
+                    self.stage_one(&mut pending, name);
+                }
+            }
+        }
+    }
+
+    fn register_by_name(&self, name: &str) -> Option<&RegisterDescription> {
+        self.registers.iter().find(|register| register.name == name)
+    }
+
+    fn coil_by_name(&self, name: &str) -> Option<&CoilDescription> {
+        self.coils.iter().find(|coil| coil.name == name)
+    }
+
+    fn file_record_by_numbers(&self, file_number: u16, record_number: u16) -> bool {
+        self.file_records.iter().any(|description| {
+            description.file_number == file_number && description.record_number == record_number
+        })
+    }
+
+    // Mirrors `filesystem::MachineFs::release`'s staging dispatch exactly
+    // (same precedence: masked register, then plain register, then coil,
+    // then file record), just reading the file's already-closed content
+    // from disk instead of an in-memory write buffer.
+    fn stage_one(&self, pending: &mut PendingTransaction, name: &str) {
+        let path = self.directory.join(name);
+        let Ok(text) = fs::read_to_string(&path) else {
+            return;
+        };
+
+        let staged = if let Some(register) = self.register_by_name(name) {
+            if let Some((and_mask, or_mask)) = parse_masked_register_value(&text) {
+                Some(StagedValue::MaskedRegister { and_mask, or_mask })
+            } else {
+                parse_register_value(register.data_type, &text).map(StagedValue::Register)
+            }
+        } else if self.coil_by_name(name).is_some() {
+            parse_coil_value(&text).map(StagedValue::Coil)
+        } else if let Some((file_number, record_number)) =
+            parse_file_record_name(name).filter(|&(file_number, record_number)| {
+                self.file_record_by_numbers(file_number, record_number)
+            })
+        {
+            parse_file_record_value(&text).map(|value| StagedValue::FileRecord {
+                file_number,
+                record_number,
+                value,
+            })
+        } else {
+            // Unknown target — FUSE would have refused to create this file
+            // at all (ENOENT); the closest available parity here is to
+            // remove the stray file rather than leave it sitting inert.
+            let _ = fs::remove_file(&path);
+            None
+        };
+
+        if let Some(staged) = staged {
+            pending.stage(name, staged);
+        }
+    }
+
+    // Drains whatever's staged, sends it (if non-empty) down
+    // `transaction_sender` exactly like `filesystem::MachineFs::
+    // commit_transaction`, then clears the real `transactions/` directory
+    // of every staged file plus the `TRANSACTION_END` sentinel itself —
+    // real files don't vanish on their own the way FUSE's synthetic ones
+    // do once their bookkeeping is forgotten, so this has to remove them.
+    fn commit(&self, pending: &mut PendingTransaction) {
+        let drained = pending.drain();
+        for name in drained.keys() {
+            let _ = fs::remove_file(self.directory.join(name));
+        }
+        let _ = fs::remove_file(self.directory.join(TRANSACTION_END_NAME));
+        if !drained.is_empty() {
+            let _ = self
+                .transaction_sender
+                .send((self.machine_name.clone(), drained));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -688,5 +862,212 @@ mod tests {
         write_server_id_file(&path, None).unwrap();
 
         assert!(!path.exists());
+    }
+
+    // Spawns `watcher.run_forever()` on its own thread and gives the
+    // inotify watch a moment to actually be registered before the caller
+    // starts writing files — inotify only reports events that happen after
+    // `watches().add(...)` returns, so a test that writes immediately could
+    // race the watch's own setup.
+    fn spawn_watcher(watcher: Arc<FlatfileTransactionWatcher>) {
+        watcher.initialize().unwrap();
+        std::thread::spawn(move || {
+            let _ = watcher.run_forever();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn staging_a_register_then_committing_sends_the_transaction() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("transactions");
+        let (sender, receiver) = mpsc::channel();
+        let watcher = Arc::new(FlatfileTransactionWatcher::new(
+            "PumpA".to_string(),
+            directory.clone(),
+            vec![a_register("Tank_Temperature")],
+            vec![],
+            vec![],
+            sender,
+        ));
+        spawn_watcher(watcher);
+
+        fs::write(directory.join("Tank_Temperature"), "42").unwrap();
+        fs::write(directory.join("TRANSACTION_END"), "").unwrap();
+
+        let (machine_name, transaction) = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(machine_name, "PumpA");
+        assert_eq!(
+            transaction.get("Tank_Temperature"),
+            Some(&StagedValue::Register(RegisterValue::U16(42)))
+        );
+    }
+
+    #[test]
+    fn commit_clears_every_staged_file_and_the_sentinel() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("transactions");
+        let (sender, receiver) = mpsc::channel();
+        let watcher = Arc::new(FlatfileTransactionWatcher::new(
+            "PumpA".to_string(),
+            directory.clone(),
+            vec![a_register("Tank_Temperature")],
+            vec![],
+            vec![],
+            sender,
+        ));
+        spawn_watcher(watcher);
+
+        fs::write(directory.join("Tank_Temperature"), "42").unwrap();
+        fs::write(directory.join("TRANSACTION_END"), "").unwrap();
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let entries: Vec<String> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "expected an empty directory, got {entries:?}"
+        );
+    }
+
+    #[test]
+    fn staging_a_coil_uses_zero_one_parsing() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("transactions");
+        let (sender, receiver) = mpsc::channel();
+        let watcher = Arc::new(FlatfileTransactionWatcher::new(
+            "PumpA".to_string(),
+            directory.clone(),
+            vec![],
+            vec![a_coil("Motor_Running")],
+            vec![],
+            sender,
+        ));
+        spawn_watcher(watcher);
+
+        fs::write(directory.join("Motor_Running"), "1").unwrap();
+        fs::write(directory.join("TRANSACTION_END"), "").unwrap();
+
+        let (_, transaction) = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            transaction.get("Motor_Running"),
+            Some(&StagedValue::Coil(CoilValue(true)))
+        );
+    }
+
+    #[test]
+    fn staging_a_mask_write_on_a_register_name_produces_a_masked_register() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("transactions");
+        let (sender, receiver) = mpsc::channel();
+        let watcher = Arc::new(FlatfileTransactionWatcher::new(
+            "PumpA".to_string(),
+            directory.clone(),
+            vec![a_register("Tank_Temperature")],
+            vec![],
+            vec![],
+            sender,
+        ));
+        spawn_watcher(watcher);
+
+        fs::write(directory.join("Tank_Temperature"), "MASK 0x00F2 0x0025").unwrap();
+        fs::write(directory.join("TRANSACTION_END"), "").unwrap();
+
+        let (_, transaction) = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            transaction.get("Tank_Temperature"),
+            Some(&StagedValue::MaskedRegister {
+                and_mask: 0x00F2,
+                or_mask: 0x0025
+            })
+        );
+    }
+
+    #[test]
+    fn staging_a_known_file_record_by_colon_name() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("transactions");
+        let (sender, receiver) = mpsc::channel();
+        let watcher = Arc::new(FlatfileTransactionWatcher::new(
+            "PumpA".to_string(),
+            directory.clone(),
+            vec![],
+            vec![],
+            vec![FileRecordDescription {
+                file_number: 4,
+                record_number: 1,
+                record_length: 2,
+            }],
+            sender,
+        ));
+        spawn_watcher(watcher);
+
+        fs::write(directory.join("4:1"), "0D FE 00 20").unwrap();
+        fs::write(directory.join("TRANSACTION_END"), "").unwrap();
+
+        let (_, transaction) = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            transaction.get("4:1"),
+            Some(&StagedValue::FileRecord {
+                file_number: 4,
+                record_number: 1,
+                value: vec![0x0D, 0xFE, 0x00, 0x20],
+            })
+        );
+    }
+
+    #[test]
+    fn staging_an_unknown_target_removes_the_stray_file() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("transactions");
+        let (sender, _receiver) = mpsc::channel();
+        let watcher = Arc::new(FlatfileTransactionWatcher::new(
+            "PumpA".to_string(),
+            directory.clone(),
+            vec![a_register("Tank_Temperature")],
+            vec![],
+            vec![],
+            sender,
+        ));
+        spawn_watcher(watcher);
+
+        fs::write(directory.join("Nonexistent_Register"), "1").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(!directory.join("Nonexistent_Register").exists());
+    }
+
+    #[test]
+    fn committing_with_nothing_staged_sends_nothing() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("transactions");
+        let (sender, receiver) = mpsc::channel();
+        let watcher = Arc::new(FlatfileTransactionWatcher::new(
+            "PumpA".to_string(),
+            directory.clone(),
+            vec![a_register("Tank_Temperature")],
+            vec![],
+            vec![],
+            sender,
+        ));
+        spawn_watcher(watcher);
+
+        fs::write(directory.join("TRANSACTION_END"), "").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(receiver.try_recv().is_err());
     }
 }
