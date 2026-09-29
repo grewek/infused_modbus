@@ -34,6 +34,7 @@
 //! the `Notify` wiring is worth its wider blast radius.
 
 use crate::client_trust::ClientTrustState;
+use crate::permissions::{DirectoryPermissions, FusePermissions};
 use crate::{
     CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore, MachineStores,
     PendingTransaction, RegisterStore, StagedValue, WriteReport, coil_file_content,
@@ -47,8 +48,10 @@ use protocol::device_description::{
     InputRegisterDescription, MachineDescription, RegisterDescription,
 };
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -121,6 +124,12 @@ impl FlatfileRegisterRenderer {
         self.render_once()
     }
 
+    /// Applies `fuse-permissions.toml`'s `[holding-registers]` section —
+    /// see `apply_directory_permissions`.
+    pub fn apply_permissions(&self, permissions: DirectoryPermissions) -> io::Result<()> {
+        apply_directory_permissions(&self.directory, permissions)
+    }
+
     /// Re-renders every configured register's file to match the store's
     /// current value — see `render_named_files` for the atomicity guarantee.
     pub fn render_once(&self) -> io::Result<()> {
@@ -166,6 +175,12 @@ impl FlatfileCoilRenderer {
     pub fn initialize(&self) -> io::Result<()> {
         fs::create_dir_all(&self.directory)?;
         self.render_once()
+    }
+
+    /// Applies `fuse-permissions.toml`'s `[coils]` section — see
+    /// `apply_directory_permissions`.
+    pub fn apply_permissions(&self, permissions: DirectoryPermissions) -> io::Result<()> {
+        apply_directory_permissions(&self.directory, permissions)
     }
 
     pub fn render_once(&self) -> io::Result<()> {
@@ -407,6 +422,12 @@ impl FlatfileReportRenderer {
         self.render_once()
     }
 
+    /// Applies `fuse-permissions.toml`'s `[report]` section — see
+    /// `apply_directory_permissions`.
+    pub fn apply_permissions(&self, permissions: DirectoryPermissions) -> io::Result<()> {
+        apply_directory_permissions(&self.directory, permissions)
+    }
+
     pub fn render_once(&self) -> io::Result<()> {
         let report = self
             .report
@@ -507,6 +528,12 @@ impl FlatfileTransactionWatcher {
     /// `initialize`, so `ls` shows an (empty) staging area immediately.
     pub fn initialize(&self) -> io::Result<()> {
         fs::create_dir_all(&self.directory)
+    }
+
+    /// Applies `fuse-permissions.toml`'s `[transactions]` section — see
+    /// `apply_directory_permissions`.
+    pub fn apply_permissions(&self, permissions: DirectoryPermissions) -> io::Result<()> {
+        apply_directory_permissions(&self.directory, permissions)
     }
 
     /// Blocks the calling thread forever, watching `transactions/`. Returns
@@ -959,6 +986,19 @@ impl MachineFlatfileReaders {
         self.file_records.render_once()?;
         self.report.render_once()
     }
+
+    /// Applies `fuse-permissions.toml` to every directory it covers —
+    /// `holding-registers/`, `coils/`, and `report/` — matching
+    /// `permissions::FusePermissions`'s own scope exactly.
+    /// `discrete-inputs/`/`input-registers/`/`file-records/` were never
+    /// configurable there, so they're left alone here too (same default
+    /// `0o755` every other unconfigured directory already had).
+    pub fn apply_permissions(&self, permissions: &FusePermissions) -> io::Result<()> {
+        self.registers
+            .apply_permissions(permissions.holding_registers)?;
+        self.coils.apply_permissions(permissions.coils)?;
+        self.report.apply_permissions(permissions.report)
+    }
 }
 
 /// One `MachineFlatfileReaders` per configured machine, keyed by machine
@@ -1037,6 +1077,43 @@ pub fn write_machine_server_id_file(root: &Path, machine: &MachineDescription) -
 
 fn chmod(path: &Path, mode: u32) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+// `std::fs` has no portable chown — shell out to the raw syscall, same
+// precedent as `permissions::real_uid_and_gid`'s own `libc::getuid`/
+// `libc::getgid` calls.
+fn chown(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    // SAFETY: c_path is a valid, NUL-terminated C string kept alive for the
+    // duration of this call; chown() only reads it and the two plain
+    // integer arguments, no memory is retained past the call returning.
+    let result = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Applies `fuse-permissions.toml`'s `mode`/`uid`/`gid` to a real directory
+/// — the `files` backend's counterpart to the FUSE layer's synthetic
+/// `getattr` response. One real difference worth knowing: FUSE can report
+/// *any* uid/gid in `getattr` without needing real privilege, since the
+/// kernel just passes that data through from userspace — a real `chown()`
+/// on an actual file, by contrast, requires `CAP_CHOWN` (root) to set an
+/// owner other than the calling process's own UID. Configuring a `uid`/
+/// `gid` other than the server's own real one in `fuse-permissions.toml`
+/// will make this call fail with `EPERM` unless the process actually has
+/// that privilege — deliberately not swallowed here, so a caller (M9) can
+/// decide whether to warn or treat it as fatal, rather than this crate
+/// silently pretending an ownership change that didn't happen did.
+pub fn apply_directory_permissions(
+    path: &Path,
+    permissions: DirectoryPermissions,
+) -> io::Result<()> {
+    chmod(path, permissions.mode as u32)?;
+    chown(path, permissions.uid, permissions.gid)
 }
 
 /// Renders `<root>/client-trust/` — server-only, root-level (not
@@ -2185,5 +2262,69 @@ mod tests {
         renderer.render_once().unwrap();
 
         assert!(!path.exists());
+    }
+
+    // chown() to an arbitrary uid/gid requires CAP_CHOWN (root) — these
+    // tests only chown to the process's own real uid/gid, which is always
+    // permitted even unprivileged, so they run correctly in ordinary CI.
+    fn own_permissions(mode: u16) -> DirectoryPermissions {
+        let (uid, gid) = crate::permissions::real_uid_and_gid();
+        DirectoryPermissions { mode, uid, gid }
+    }
+
+    #[test]
+    fn apply_directory_permissions_sets_the_mode() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("some-dir");
+        fs::create_dir_all(&directory).unwrap();
+
+        apply_directory_permissions(&directory, own_permissions(0o700)).unwrap();
+
+        assert_eq!(mode_of(&directory), 0o700);
+    }
+
+    #[test]
+    fn register_renderer_apply_permissions_sets_the_directory_mode() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("holding-registers");
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let renderer = FlatfileRegisterRenderer::new(directory.clone(), vec![], store);
+        renderer.initialize().unwrap();
+
+        renderer.apply_permissions(own_permissions(0o750)).unwrap();
+
+        assert_eq!(mode_of(&directory), 0o750);
+    }
+
+    #[test]
+    fn machine_flatfile_readers_apply_permissions_covers_holding_registers_coils_and_report() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let root = temporary_directory.path();
+        let machine = a_machine("PumpA", vec![]);
+        let stores = MachineStores::new();
+        let readers = MachineFlatfileReaders::new(root, &machine, &stores);
+        readers.initialize().unwrap();
+        let permissions = FusePermissions::parse(
+            r#"
+            [holding-registers]
+            mode = 0o710
+
+            [coils]
+            mode = 0o720
+
+            [report]
+            mode = 0o730
+            "#,
+        )
+        .unwrap();
+
+        readers.apply_permissions(&permissions).unwrap();
+
+        assert_eq!(
+            mode_of(&root.join("PumpA").join("holding-registers")),
+            0o710
+        );
+        assert_eq!(mode_of(&root.join("PumpA").join("coils")), 0o720);
+        assert_eq!(mode_of(&root.join("PumpA").join("report")), 0o730);
     }
 }
