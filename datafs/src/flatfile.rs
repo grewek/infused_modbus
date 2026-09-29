@@ -25,16 +25,16 @@
 //! the `Notify` wiring is worth its wider blast radius.
 
 use crate::{
-    CoilStore, DiscreteInputStore, FileRecordStore, InputRegisterStore, PendingTransaction,
-    RegisterStore, StagedValue, coil_file_content, discrete_input_file_content,
+    CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore,
+    PendingTransaction, RegisterStore, StagedValue, coil_file_content, discrete_input_file_content,
     file_record_file_content, input_register_file_content, parse_coil_value,
     parse_file_record_name, parse_file_record_value, parse_masked_register_value,
     parse_register_value, register_file_content,
 };
-use inotify::{EventMask, Inotify, WatchMask};
+use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use protocol::device_description::{
-    CoilDescription, DiscreteInputDescription, FileRecordDescription, InputRegisterDescription,
-    RegisterDescription,
+    AccessRight, CoilDescription, DiscreteInputDescription, FileRecordDescription,
+    InputRegisterDescription, RegisterDescription,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -527,6 +527,273 @@ impl FlatfileTransactionWatcher {
                 .transaction_sender
                 .send((self.machine_name.clone(), drained));
         }
+    }
+}
+
+// Which of the five directly-writable directories a given inotify watch
+// belongs to — `FlatfileDirectWriteWatcher::run_forever` looks this up by
+// `WatchDescriptor` to know how to interpret an event's `name`.
+enum DirectWriteKind {
+    Register,
+    Coil,
+    DiscreteInput,
+    InputRegister,
+    FileRecord { file_number: u16 },
+}
+
+/// Watches every directly-writable directory — `holding-registers/`,
+/// `coils/`, `discrete-inputs/`, `input-registers/`, and one subdirectory
+/// per unique `file_number` under `file-records/` — for `IN_CLOSE_WRITE`,
+/// server-only (mirrors `filesystem::MachineFs::release`'s `WriteMode::
+/// Direct` dispatch). Unlike `FlatfileTransactionWatcher`, there is no
+/// staging/commit ritual: each write is sent as its own implicit one-item
+/// transaction the instant its file is closed, exactly like FUSE's own
+/// direct-write `release()` handling.
+///
+/// `holding-registers/<name>` additionally respects the register's own
+/// declared `AccessRight` — a `read_only` register's write is discarded
+/// rather than staged, same as every other directly-writable data type
+/// respects the server-only/no-wire-write-path constraints that already
+/// apply to it. Kept application-level (skip staging, remove the stray
+/// file) rather than real kernel-enforced file permissions, matching
+/// `FlatfileTransactionWatcher`'s own "flatfile can't intercept before a
+/// write completes" gap — real per-file `chmod` parity is a candidate for
+/// M8 (`fuse-permissions.toml` → real `chmod`/`chown`), not solved here.
+pub struct FlatfileDirectWriteWatcher {
+    machine_name: String,
+    holding_registers_directory: PathBuf,
+    coils_directory: PathBuf,
+    discrete_inputs_directory: PathBuf,
+    input_registers_directory: PathBuf,
+    file_records_directory: PathBuf,
+    registers: Vec<RegisterDescription>,
+    coils: Vec<CoilDescription>,
+    discrete_inputs: Vec<DiscreteInputDescription>,
+    input_registers: Vec<InputRegisterDescription>,
+    file_records: Vec<FileRecordDescription>,
+    transaction_sender: mpsc::Sender<(String, HashMap<String, StagedValue>)>,
+}
+
+impl FlatfileDirectWriteWatcher {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        machine_name: String,
+        holding_registers_directory: PathBuf,
+        coils_directory: PathBuf,
+        discrete_inputs_directory: PathBuf,
+        input_registers_directory: PathBuf,
+        file_records_directory: PathBuf,
+        registers: Vec<RegisterDescription>,
+        coils: Vec<CoilDescription>,
+        discrete_inputs: Vec<DiscreteInputDescription>,
+        input_registers: Vec<InputRegisterDescription>,
+        file_records: Vec<FileRecordDescription>,
+        transaction_sender: mpsc::Sender<(String, HashMap<String, StagedValue>)>,
+    ) -> Self {
+        Self {
+            machine_name,
+            holding_registers_directory,
+            coils_directory,
+            discrete_inputs_directory,
+            input_registers_directory,
+            file_records_directory,
+            registers,
+            coils,
+            discrete_inputs,
+            input_registers,
+            file_records,
+            transaction_sender,
+        }
+    }
+
+    // First-seen order, deduplicated — same precedent as
+    // `FlatfileFileRecordRenderer::unique_file_numbers`.
+    fn unique_file_numbers(&self) -> Vec<u16> {
+        let mut seen = Vec::new();
+        for description in &self.file_records {
+            if !seen.contains(&description.file_number) {
+                seen.push(description.file_number);
+            }
+        }
+        seen
+    }
+
+    /// Blocks the calling thread forever, watching every directly-writable
+    /// directory. Returns only if setting up or reading the inotify watch
+    /// itself fails — a caller is expected to run this on its own dedicated
+    /// thread.
+    pub fn run_forever(&self) -> io::Result<()> {
+        let mut inotify = Inotify::init()?;
+        let mut watch_kinds: HashMap<WatchDescriptor, DirectWriteKind> = HashMap::new();
+        let mut watches = inotify.watches();
+        watch_kinds.insert(
+            watches.add(&self.holding_registers_directory, WatchMask::CLOSE_WRITE)?,
+            DirectWriteKind::Register,
+        );
+        watch_kinds.insert(
+            watches.add(&self.coils_directory, WatchMask::CLOSE_WRITE)?,
+            DirectWriteKind::Coil,
+        );
+        watch_kinds.insert(
+            watches.add(&self.discrete_inputs_directory, WatchMask::CLOSE_WRITE)?,
+            DirectWriteKind::DiscreteInput,
+        );
+        watch_kinds.insert(
+            watches.add(&self.input_registers_directory, WatchMask::CLOSE_WRITE)?,
+            DirectWriteKind::InputRegister,
+        );
+        for file_number in self.unique_file_numbers() {
+            let path = self.file_records_directory.join(file_number.to_string());
+            watch_kinds.insert(
+                watches.add(&path, WatchMask::CLOSE_WRITE)?,
+                DirectWriteKind::FileRecord { file_number },
+            );
+        }
+
+        let mut buffer = [0u8; 4096];
+        loop {
+            let events = inotify.read_events_blocking(&mut buffer)?;
+            for event in events {
+                if !event.mask.contains(EventMask::CLOSE_WRITE) {
+                    continue;
+                }
+                let Some(kind) = watch_kinds.get(&event.wd) else {
+                    continue;
+                };
+                let Some(name) = event.name.and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                self.handle_write(kind, name);
+            }
+        }
+    }
+
+    fn handle_write(&self, kind: &DirectWriteKind, name: &str) {
+        match kind {
+            DirectWriteKind::Register => {
+                self.handle_register_write(name);
+            }
+            DirectWriteKind::Coil => {
+                self.handle_simple_write(
+                    &self.coils_directory,
+                    name,
+                    self.coils.iter().any(|coil| coil.name == name),
+                    StagedValue::Coil,
+                );
+            }
+            DirectWriteKind::DiscreteInput => {
+                self.handle_simple_write(
+                    &self.discrete_inputs_directory,
+                    name,
+                    self.discrete_inputs
+                        .iter()
+                        .any(|discrete_input| discrete_input.name == name),
+                    StagedValue::DiscreteInput,
+                );
+            }
+            DirectWriteKind::InputRegister => {
+                self.handle_input_register_write(name);
+            }
+            DirectWriteKind::FileRecord { file_number } => {
+                self.handle_file_record_write(*file_number, name);
+            }
+        }
+    }
+
+    fn handle_register_write(&self, name: &str) {
+        let path = self.holding_registers_directory.join(name);
+        let Some(register) = self.registers.iter().find(|register| register.name == name) else {
+            let _ = fs::remove_file(&path);
+            return;
+        };
+        if register.access != AccessRight::ReadWrite {
+            let _ = fs::remove_file(&path);
+            return;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            return;
+        };
+        if let Some(value) = parse_register_value(register.data_type, &text) {
+            self.send(name.to_string(), StagedValue::Register(value));
+        }
+    }
+
+    fn handle_input_register_write(&self, name: &str) {
+        let path = self.input_registers_directory.join(name);
+        let Some(input_register) = self
+            .input_registers
+            .iter()
+            .find(|input_register| input_register.name == name)
+        else {
+            let _ = fs::remove_file(&path);
+            return;
+        };
+        let Ok(text) = fs::read_to_string(&path) else {
+            return;
+        };
+        if let Some(value) = parse_register_value(input_register.data_type, &text) {
+            self.send(name.to_string(), StagedValue::InputRegister(value));
+        }
+    }
+
+    // Shared by `coils/` and `discrete-inputs/`: both are plain 0/1 values
+    // with no per-entry access concept, only the target `StagedValue`
+    // variant differs.
+    fn handle_simple_write(
+        &self,
+        directory: &Path,
+        name: &str,
+        is_known_target: bool,
+        wrap: impl Fn(CoilValue) -> StagedValue,
+    ) {
+        let path = directory.join(name);
+        if !is_known_target {
+            let _ = fs::remove_file(&path);
+            return;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            return;
+        };
+        if let Some(value) = parse_coil_value(&text) {
+            self.send(name.to_string(), wrap(value));
+        }
+    }
+
+    fn handle_file_record_write(&self, file_number: u16, name: &str) {
+        let path = self
+            .file_records_directory
+            .join(file_number.to_string())
+            .join(name);
+        let Ok(record_number) = name.parse::<u16>() else {
+            let _ = fs::remove_file(&path);
+            return;
+        };
+        let is_known_target = self.file_records.iter().any(|description| {
+            description.file_number == file_number && description.record_number == record_number
+        });
+        if !is_known_target {
+            let _ = fs::remove_file(&path);
+            return;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            return;
+        };
+        if let Some(value) = parse_file_record_value(&text) {
+            self.send(
+                format!("{file_number}:{record_number}"),
+                StagedValue::FileRecord {
+                    file_number,
+                    record_number,
+                    value,
+                },
+            );
+        }
+    }
+
+    fn send(&self, name: String, value: StagedValue) {
+        let _ = self
+            .transaction_sender
+            .send((self.machine_name.clone(), HashMap::from([(name, value)])));
     }
 }
 
@@ -1069,5 +1336,211 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         assert!(receiver.try_recv().is_err());
+    }
+
+    struct DirectWriteDirs {
+        holding_registers: PathBuf,
+        coils: PathBuf,
+        discrete_inputs: PathBuf,
+        input_registers: PathBuf,
+        file_records: PathBuf,
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn spawn_direct_write_watcher(
+        registers: Vec<RegisterDescription>,
+        coils: Vec<CoilDescription>,
+        discrete_inputs: Vec<DiscreteInputDescription>,
+        input_registers: Vec<InputRegisterDescription>,
+        file_records: Vec<FileRecordDescription>,
+    ) -> (
+        tempfile::TempDir,
+        DirectWriteDirs,
+        mpsc::Receiver<(String, HashMap<String, StagedValue>)>,
+    ) {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let dirs = DirectWriteDirs {
+            holding_registers: temporary_directory.path().join("holding-registers"),
+            coils: temporary_directory.path().join("coils"),
+            discrete_inputs: temporary_directory.path().join("discrete-inputs"),
+            input_registers: temporary_directory.path().join("input-registers"),
+            file_records: temporary_directory.path().join("file-records"),
+        };
+        fs::create_dir_all(&dirs.holding_registers).unwrap();
+        fs::create_dir_all(&dirs.coils).unwrap();
+        fs::create_dir_all(&dirs.discrete_inputs).unwrap();
+        fs::create_dir_all(&dirs.input_registers).unwrap();
+        fs::create_dir_all(&dirs.file_records).unwrap();
+        for file_record in &file_records {
+            fs::create_dir_all(dirs.file_records.join(file_record.file_number.to_string()))
+                .unwrap();
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let watcher = Arc::new(FlatfileDirectWriteWatcher::new(
+            "PumpA".to_string(),
+            dirs.holding_registers.clone(),
+            dirs.coils.clone(),
+            dirs.discrete_inputs.clone(),
+            dirs.input_registers.clone(),
+            dirs.file_records.clone(),
+            registers,
+            coils,
+            discrete_inputs,
+            input_registers,
+            file_records,
+            sender,
+        ));
+        {
+            let watcher = watcher.clone();
+            std::thread::spawn(move || {
+                let _ = watcher.run_forever();
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        (temporary_directory, dirs, receiver)
+    }
+
+    #[test]
+    fn direct_write_to_a_register_sends_immediately_without_transaction_end() {
+        let mut register = a_register("Tank_Temperature");
+        register.access = AccessRight::ReadWrite;
+        let (_temporary_directory, dirs, receiver) =
+            spawn_direct_write_watcher(vec![register], vec![], vec![], vec![], vec![]);
+
+        fs::write(dirs.holding_registers.join("Tank_Temperature"), "42").unwrap();
+
+        let (machine_name, transaction) = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(machine_name, "PumpA");
+        assert_eq!(
+            transaction.get("Tank_Temperature"),
+            Some(&StagedValue::Register(RegisterValue::U16(42)))
+        );
+    }
+
+    #[test]
+    fn direct_write_to_a_read_only_register_is_discarded_and_the_file_removed() {
+        let mut register = a_register("Tank_Temperature");
+        register.access = AccessRight::ReadOnly;
+        let (_temporary_directory, dirs, receiver) =
+            spawn_direct_write_watcher(vec![register], vec![], vec![], vec![], vec![]);
+
+        fs::write(dirs.holding_registers.join("Tank_Temperature"), "42").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(receiver.try_recv().is_err());
+        assert!(!dirs.holding_registers.join("Tank_Temperature").exists());
+    }
+
+    #[test]
+    fn direct_write_to_a_coil_sends_immediately() {
+        let (_temporary_directory, dirs, receiver) = spawn_direct_write_watcher(
+            vec![],
+            vec![a_coil("Motor_Running")],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        fs::write(dirs.coils.join("Motor_Running"), "1").unwrap();
+
+        let (_, transaction) = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            transaction.get("Motor_Running"),
+            Some(&StagedValue::Coil(CoilValue(true)))
+        );
+    }
+
+    #[test]
+    fn direct_write_to_a_discrete_input_sends_immediately() {
+        let (_temporary_directory, dirs, receiver) = spawn_direct_write_watcher(
+            vec![],
+            vec![],
+            vec![a_discrete_input("Door_Open_Sensor")],
+            vec![],
+            vec![],
+        );
+
+        fs::write(dirs.discrete_inputs.join("Door_Open_Sensor"), "1").unwrap();
+
+        let (_, transaction) = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            transaction.get("Door_Open_Sensor"),
+            Some(&StagedValue::DiscreteInput(CoilValue(true)))
+        );
+    }
+
+    #[test]
+    fn direct_write_to_an_input_register_sends_immediately() {
+        let (_temporary_directory, dirs, receiver) = spawn_direct_write_watcher(
+            vec![],
+            vec![],
+            vec![],
+            vec![an_input_register("Flow_Rate")],
+            vec![],
+        );
+
+        fs::write(dirs.input_registers.join("Flow_Rate"), "7").unwrap();
+
+        let (_, transaction) = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            transaction.get("Flow_Rate"),
+            Some(&StagedValue::InputRegister(RegisterValue::U16(7)))
+        );
+    }
+
+    #[test]
+    fn direct_write_to_a_known_file_record_sends_immediately() {
+        let (_temporary_directory, dirs, receiver) = spawn_direct_write_watcher(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![FileRecordDescription {
+                file_number: 4,
+                record_number: 1,
+                record_length: 2,
+            }],
+        );
+
+        fs::write(dirs.file_records.join("4").join("1"), "0D FE 00 20").unwrap();
+
+        let (_, transaction) = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            transaction.get("4:1"),
+            Some(&StagedValue::FileRecord {
+                file_number: 4,
+                record_number: 1,
+                value: vec![0x0D, 0xFE, 0x00, 0x20],
+            })
+        );
+    }
+
+    #[test]
+    fn direct_write_to_an_unknown_register_name_removes_the_stray_file() {
+        let (_temporary_directory, dirs, receiver) = spawn_direct_write_watcher(
+            vec![a_register("Tank_Temperature")],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        fs::write(dirs.holding_registers.join("Nonexistent"), "1").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(receiver.try_recv().is_err());
+        assert!(!dirs.holding_registers.join("Nonexistent").exists());
     }
 }
