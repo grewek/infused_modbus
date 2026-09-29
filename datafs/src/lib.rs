@@ -101,16 +101,21 @@ impl RegisterStore {
     }
 }
 
-// How a holding register's file content is rendered, shared by every
-// presentation layer that needs to show it: empty until the store has a
-// value (nothing polled/written yet), `"<value>\n"` once it does. Extracted
-// once a second, non-FUSE consumer (`flatfile`) needed the exact same
-// rendering `filesystem::MachineFs::register_content` already had.
-pub fn register_file_content(store: &RegisterStore, name: &str) -> String {
-    match store.get(name) {
+// How a value is rendered as file content, shared by every store-backed data
+// type and every presentation layer that needs to show one: empty until the
+// store has a value (nothing polled/written yet), `"<value>\n"` once it
+// does. Extracted once a second, non-FUSE consumer (`flatfile`) needed the
+// exact same rendering `filesystem::MachineFs`'s own per-type `*_content`
+// methods already had.
+fn file_content<T: fmt::Display>(value: Option<T>) -> String {
+    match value {
         Some(value) => format!("{value}\n"),
         None => String::new(),
     }
+}
+
+pub fn register_file_content(store: &RegisterStore, name: &str) -> String {
+    file_content(store.get(name))
 }
 
 // Mirrors RegisterStore exactly, keyed by input-register name instead of
@@ -137,6 +142,10 @@ impl InputRegisterStore {
     pub fn set(&mut self, name: impl Into<String>, value: RegisterValue) {
         self.values.insert(name.into(), value);
     }
+}
+
+pub fn input_register_file_content(store: &InputRegisterStore, name: &str) -> String {
+    file_content(store.get(name))
 }
 
 // A coil's value. Always exactly one bit — unlike RegisterValue there's only
@@ -177,6 +186,10 @@ impl CoilStore {
     }
 }
 
+pub fn coil_file_content(store: &CoilStore, name: &str) -> String {
+    file_content(store.get(name))
+}
+
 // Mirrors CoilStore exactly, keyed by discrete-input name instead of coil
 // name. Reuses CoilValue rather than a new single-bit type, for the same
 // reason InputRegisterStore reuses RegisterValue above — discrete inputs
@@ -199,6 +212,10 @@ impl DiscreteInputStore {
     pub fn set(&mut self, name: impl Into<String>, value: CoilValue) {
         self.values.insert(name.into(), value);
     }
+}
+
+pub fn discrete_input_file_content(store: &DiscreteInputStore, name: &str) -> String {
+    file_content(store.get(name))
 }
 
 // Keyed by (file_number, record_number) rather than a name — file records
@@ -224,6 +241,31 @@ impl FileRecordStore {
     pub fn set(&mut self, file_number: u16, record_number: u16, value: Vec<u8>) {
         self.values.insert((file_number, record_number), value);
     }
+}
+
+// How a file record's file content is rendered: a space-separated uppercase
+// hex dump, defaulting to `2 * record_length` zero bytes until directly
+// written — same "declared but unset = zero" precedent as every other
+// store-backed data type, just with a record's own declared width standing
+// in for a fixed per-DataType default. Extracted for the same reason
+// `register_file_content` was: a second, non-FUSE consumer needs the exact
+// same rendering `filesystem::MachineFs::file_record_content` already had.
+pub fn file_record_file_content(
+    store: &FileRecordStore,
+    file_number: u16,
+    record_number: u16,
+    record_length: u16,
+) -> String {
+    let bytes = store
+        .get(file_number, record_number)
+        .cloned()
+        .unwrap_or_else(|| vec![0u8; record_length as usize * 2]);
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{hex}\n")
 }
 
 // A value staged in `transactions/`, before TRANSACTION_END hands it off to

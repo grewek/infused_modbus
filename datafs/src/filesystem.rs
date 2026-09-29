@@ -682,24 +682,15 @@ impl MachineFs {
     }
 
     fn coil_content(&self, coil: &CoilDescription) -> String {
-        match self.coil_store_lock().get(&coil.name) {
-            Some(value) => format!("{value}\n"),
-            None => String::new(),
-        }
+        crate::coil_file_content(&self.coil_store_lock(), &coil.name)
     }
 
     fn discrete_input_content(&self, discrete_input: &DiscreteInputDescription) -> String {
-        match self.discrete_input_store_lock().get(&discrete_input.name) {
-            Some(value) => format!("{value}\n"),
-            None => String::new(),
-        }
+        crate::discrete_input_file_content(&self.discrete_input_store_lock(), &discrete_input.name)
     }
 
     fn input_register_content(&self, input_register: &InputRegisterDescription) -> String {
-        match self.input_register_store_lock().get(&input_register.name) {
-            Some(value) => format!("{value}\n"),
-            None => String::new(),
-        }
+        crate::input_register_file_content(&self.input_register_store_lock(), &input_register.name)
     }
 
     // Content of an already-staged transaction file: whatever value is
@@ -867,27 +858,18 @@ impl MachineFs {
             .collect()
     }
 
-    fn format_file_record_hex(bytes: &[u8]) -> String {
-        let hex = bytes
-            .iter()
-            .map(|byte| format!("{byte:02X}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!("{hex}\n")
-    }
-
     // Defaults to `2 * record_length` zero bytes until directly written —
     // same "declared but unset = zero" precedent as
     // `default_register_value` in server::handler, just rendered here
     // rather than there since a file record's default depends on its own
     // declared width, not a fixed per-DataType shape.
     fn file_record_content(&self, description: &FileRecordDescription) -> String {
-        let bytes = self
-            .file_record_store_lock()
-            .get(description.file_number, description.record_number)
-            .cloned()
-            .unwrap_or_else(|| vec![0u8; description.record_length as usize * 2]);
-        Self::format_file_record_hex(&bytes)
+        crate::file_record_file_content(
+            &self.file_record_store_lock(),
+            description.file_number,
+            description.record_number,
+            description.record_length,
+        )
     }
 
     // `ino`'s owner/group: the configured `fuse-permissions.toml` value if
