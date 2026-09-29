@@ -16,7 +16,11 @@
 //! `build_machine_*` free functions, bundling one machine's full set of
 //! renderers/watchers rooted at `<root>/<machine_name>/` — multi-machine
 //! layout needs no inode-stride trick here, unlike the FUSE layer, since
-//! real nested directories already namespace themselves for free. CLI
+//! real nested directories already namespace themselves for free. M7 adds
+//! `FlatfileClientTrustRenderer` — the server-only, root-level (not
+//! per-machine) `client-trust/` subtree, reusing `client_trust::
+//! ClientTrustState` unchanged (it was already presentation-agnostic data;
+//! only its `fuser::INodeNo`-typed bookkeeping goes unused here). CLI
 //! wiring (M9) is still not here yet.
 //!
 //! Deliberate scope reduction vs. the CLAUDE.md design text: that section
@@ -29,6 +33,7 @@
 //! caller (M9) shows whether a tight poll loop is actually good enough or
 //! the `Notify` wiring is worth its wider blast radius.
 
+use crate::client_trust::ClientTrustState;
 use crate::{
     CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore, MachineStores,
     PendingTransaction, RegisterStore, StagedValue, coil_file_content, discrete_input_file_content,
@@ -44,6 +49,7 @@ use protocol::device_description::{
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -954,6 +960,129 @@ pub fn write_machine_server_id_file(root: &Path, machine: &MachineDescription) -
     )
 }
 
+fn chmod(path: &Path, mode: u32) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+/// Renders `<root>/client-trust/` — server-only, root-level (not
+/// per-machine, unlike every other renderer above; see CLAUDE.md's TLS
+/// section for why `client-trust/` sits outside any one machine's tree).
+/// Reuses `client_trust::ClientTrustState` completely unchanged: it was
+/// already presentation-agnostic data (fingerprints as plain `String`s, log
+/// entries as plain `String`s) — the only FUSE-specific part of that type,
+/// its `fuser::INodeNo`-typed dynamic-inode bookkeeping, simply goes unused
+/// here, the same way `RegisterStore`/`CoilStore` already had no FUSE
+/// awareness to begin with.
+///
+/// Real, kernel-enforced permissions, unlike `holding-registers/<name>`'s
+/// application-level `AccessRight` check in `FlatfileDirectWriteWatcher`:
+/// `client-trust/` and everything under it is `chmod`'d to `0o700`
+/// (directories) / `0o400` (files) at render time, matching CLAUDE.md's
+/// "hardcoded to maximum restriction, cannot appear in
+/// `fuse-permissions.toml`" requirement — this is achievable for real here
+/// because it's a fixed mode set once per render, not a per-register
+/// access right that has to survive an atomic-rename swap resetting
+/// whatever the temp file's default mode was.
+pub struct FlatfileClientTrustRenderer {
+    directory: PathBuf,
+    state: Arc<Mutex<ClientTrustState>>,
+    last_rendered_logs: Mutex<HashMap<&'static str, String>>,
+    last_rendered_approved: Mutex<HashMap<String, String>>,
+}
+
+impl FlatfileClientTrustRenderer {
+    pub fn new(directory: PathBuf, state: Arc<Mutex<ClientTrustState>>) -> Self {
+        Self {
+            directory,
+            state,
+            last_rendered_logs: Mutex::new(HashMap::new()),
+            last_rendered_approved: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn connection_attempts_directory(&self) -> PathBuf {
+        self.directory.join("connection_attempts")
+    }
+
+    fn approved_directory(&self) -> PathBuf {
+        self.directory.join("approved")
+    }
+
+    /// Creates `client-trust/`, `client-trust/connection_attempts/`, and
+    /// `client-trust/approved/`, `chmod`s all three to `0o700`, and renders
+    /// their current content.
+    pub fn initialize(&self) -> io::Result<()> {
+        fs::create_dir_all(self.connection_attempts_directory())?;
+        fs::create_dir_all(self.approved_directory())?;
+        for directory in [
+            &self.directory,
+            &self.connection_attempts_directory(),
+            &self.approved_directory(),
+        ] {
+            chmod(directory, 0o700)?;
+        }
+        self.render_once()
+    }
+
+    /// Re-renders the three fixed `connection_attempts/*.log` files and the
+    /// dynamic `approved/<fingerprint>` set — unlike every other renderer in
+    /// this module, `approved/` can genuinely *shrink* (a revoked
+    /// fingerprint), so this also removes files for fingerprints no longer
+    /// approved, not just add/update ones that are.
+    pub fn render_once(&self) -> io::Result<()> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut last_logs = self
+            .last_rendered_logs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (name, content) in [
+            ("approved.log", state.approved_log_content()),
+            ("pending.log", state.pending_log_content()),
+            ("rejected.log", state.rejected_log_content()),
+        ] {
+            if last_logs.get(name) == Some(&content) {
+                continue;
+            }
+            let path = self.connection_attempts_directory().join(name);
+            atomic_write(&path, &content)?;
+            chmod(&path, 0o400)?;
+            last_logs.insert(name, content);
+        }
+
+        let mut last_approved = self
+            .last_rendered_approved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current: HashMap<String, String> = state
+            .approved_entries()
+            .map(|(fingerprint, _ino)| (fingerprint.to_string(), format!("{fingerprint}\n")))
+            .collect();
+        let stale: Vec<String> = last_approved
+            .keys()
+            .filter(|fingerprint| !current.contains_key(*fingerprint))
+            .cloned()
+            .collect();
+        for fingerprint in stale {
+            let _ = fs::remove_file(self.approved_directory().join(&fingerprint));
+            last_approved.remove(&fingerprint);
+        }
+        for (fingerprint, content) in current {
+            if last_approved.get(&fingerprint) == Some(&content) {
+                continue;
+            }
+            let path = self.approved_directory().join(&fingerprint);
+            atomic_write(&path, &content)?;
+            chmod(&path, 0o400)?;
+            last_approved.insert(fingerprint, content);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1849,5 +1978,85 @@ mod tests {
             fs::read_to_string(root.join("PumpA").join("server-id")).unwrap(),
             "pump-a-plc\n"
         );
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn client_trust_initialize_creates_directories_chmodded_0700() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("client-trust");
+        let state = Arc::new(Mutex::new(ClientTrustState::new()));
+        let renderer = FlatfileClientTrustRenderer::new(directory.clone(), state);
+
+        renderer.initialize().unwrap();
+
+        assert_eq!(mode_of(&directory), 0o700);
+        assert_eq!(mode_of(&directory.join("connection_attempts")), 0o700);
+        assert_eq!(mode_of(&directory.join("approved")), 0o700);
+    }
+
+    #[test]
+    fn client_trust_render_once_writes_the_three_log_files_chmodded_0400() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("client-trust");
+        let state = Arc::new(Mutex::new(ClientTrustState::new()));
+        state.lock().unwrap().log_approved("aa:bb approved");
+        state.lock().unwrap().log_pending("cc:dd pending");
+        state.lock().unwrap().log_rejected("ee:ff rejected");
+        let renderer = FlatfileClientTrustRenderer::new(directory.clone(), state);
+
+        renderer.initialize().unwrap();
+
+        let logs = directory.join("connection_attempts");
+        assert_eq!(
+            fs::read_to_string(logs.join("approved.log")).unwrap(),
+            "aa:bb approved\n"
+        );
+        assert_eq!(
+            fs::read_to_string(logs.join("pending.log")).unwrap(),
+            "cc:dd pending\n"
+        );
+        assert_eq!(
+            fs::read_to_string(logs.join("rejected.log")).unwrap(),
+            "ee:ff rejected\n"
+        );
+        assert_eq!(mode_of(&logs.join("approved.log")), 0o400);
+    }
+
+    #[test]
+    fn client_trust_render_once_reflects_an_approved_fingerprint() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("client-trust");
+        let state = Arc::new(Mutex::new(ClientTrustState::new()));
+        let renderer = FlatfileClientTrustRenderer::new(directory.clone(), state.clone());
+        renderer.initialize().unwrap();
+
+        state.lock().unwrap().insert_approved("aa:bb:cc");
+        renderer.render_once().unwrap();
+
+        let path = directory.join("approved").join("aa:bb:cc");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "aa:bb:cc\n");
+        assert_eq!(mode_of(&path), 0o400);
+    }
+
+    #[test]
+    fn client_trust_render_once_removes_a_revoked_fingerprint() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let directory = temporary_directory.path().join("client-trust");
+        let state = Arc::new(Mutex::new(ClientTrustState::new()));
+        let renderer = FlatfileClientTrustRenderer::new(directory.clone(), state.clone());
+        renderer.initialize().unwrap();
+        state.lock().unwrap().insert_approved("aa:bb:cc");
+        renderer.render_once().unwrap();
+        let path = directory.join("approved").join("aa:bb:cc");
+        assert!(path.exists());
+
+        state.lock().unwrap().remove_approved("aa:bb:cc");
+        renderer.render_once().unwrap();
+
+        assert!(!path.exists());
     }
 }
