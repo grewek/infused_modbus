@@ -1454,7 +1454,16 @@ impl ReadFileRecordResponse {
 fn encode_write_file_record(
     function_code: u8,
     sub_requests: &[WriteFileRecordSubRequest],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, EncodeError> {
+    for sub_request in sub_requests {
+        if sub_request.record_data.len() % 2 != 0 {
+            return Err(EncodeError::OddFileRecordDataLength {
+                file_number: sub_request.file_number,
+                record_number: sub_request.record_number,
+                length: sub_request.record_data.len(),
+            });
+        }
+    }
     let data_len: usize = sub_requests
         .iter()
         .map(|sub_request| FILE_RECORD_SUB_REQUEST_LEN + sub_request.record_data.len())
@@ -1470,7 +1479,7 @@ fn encode_write_file_record(
         buffer.extend_from_slice(&record_length.to_be_bytes());
         buffer.extend_from_slice(&sub_request.record_data);
     }
-    buffer
+    Ok(buffer)
 }
 
 fn decode_write_file_record(
@@ -1529,7 +1538,7 @@ fn decode_write_file_record(
 }
 
 impl WriteFileRecordRequest {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
         encode_write_file_record(FUNCTION_CODE_WRITE_FILE_RECORD, &self.sub_requests)
     }
 
@@ -1541,7 +1550,7 @@ impl WriteFileRecordRequest {
 }
 
 impl WriteFileRecordResponse {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
         encode_write_file_record(FUNCTION_CODE_WRITE_FILE_RECORD, &self.sub_requests)
     }
 
@@ -3102,7 +3111,7 @@ mod tests {
                 record_data: vec![0x06, 0xAF, 0x04, 0xBE, 0x10, 0x0D],
             }],
         };
-        let encoded = request.encode();
+        let encoded = request.encode().unwrap();
         let decoded = WriteFileRecordRequest::decode(&encoded).unwrap();
         assert_eq!(request, decoded);
     }
@@ -3120,7 +3129,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            request.encode(),
+            request.encode().unwrap(),
             vec![
                 0x15, 0x0D, 0x06, 0x00, 0x04, 0x00, 0x07, 0x00, 0x03, 0x06, 0xAF, 0x04, 0xBE, 0x10,
                 0x0D,
@@ -3137,7 +3146,7 @@ mod tests {
                 record_data: vec![0x06, 0xAF, 0x04, 0xBE, 0x10, 0x0D],
             }],
         };
-        let encoded = response.encode();
+        let encoded = response.encode().unwrap();
         let decoded = WriteFileRecordResponse::decode(&encoded).unwrap();
         assert_eq!(response, decoded);
     }
@@ -3154,7 +3163,7 @@ mod tests {
         let response = WriteFileRecordResponse {
             sub_requests: request.sub_requests.clone(),
         };
-        assert_eq!(request.encode(), response.encode());
+        assert_eq!(request.encode().unwrap(), response.encode().unwrap());
     }
 
     #[test]
@@ -3166,7 +3175,7 @@ mod tests {
                 record_data: vec![0xAA, 0xBB],
             }],
         };
-        let encoded = request.encode();
+        let encoded = request.encode().unwrap();
         // Layout: [0]=FC [1]=byte_count [2]=ref_type [3..5]=file_number
         // [5..7]=record_number [7..9]=record_length [9..]=data.
         assert_eq!(&encoded[7..9], &[0x00, 0x01]);
@@ -3188,7 +3197,7 @@ mod tests {
                 },
             ],
         };
-        let encoded = request.encode();
+        let encoded = request.encode().unwrap();
         let decoded = WriteFileRecordRequest::decode(&encoded).unwrap();
         assert_eq!(request, decoded);
     }
@@ -3252,6 +3261,44 @@ mod tests {
         assert_eq!(
             WriteFileRecordRequest::decode(&bytes),
             Err(DecodeError::TooShort)
+        );
+    }
+
+    #[test]
+    fn write_file_record_request_encode_rejects_odd_length_record_data() {
+        let request = WriteFileRecordRequest {
+            sub_requests: vec![WriteFileRecordSubRequest {
+                file_number: 4,
+                record_number: 7,
+                record_data: vec![0x06, 0xAF, 0x04],
+            }],
+        };
+        assert_eq!(
+            request.encode(),
+            Err(EncodeError::OddFileRecordDataLength {
+                file_number: 4,
+                record_number: 7,
+                length: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn write_file_record_response_encode_rejects_odd_length_record_data() {
+        let response = WriteFileRecordResponse {
+            sub_requests: vec![WriteFileRecordSubRequest {
+                file_number: 4,
+                record_number: 7,
+                record_data: vec![0x06, 0xAF, 0x04],
+            }],
+        };
+        assert_eq!(
+            response.encode(),
+            Err(EncodeError::OddFileRecordDataLength {
+                file_number: 4,
+                record_number: 7,
+                length: 3,
+            })
         );
     }
 }

@@ -359,6 +359,9 @@ fn handle_write_file_record(
         sub_requests: request.sub_requests,
     }
     .encode()
+    .expect(
+        "every sub_request.record_data was just checked to be record_length * 2 bytes, always even",
+    )
 }
 
 // Zero (or 0.0) for every DataType — what an unset register reads back as,
@@ -3063,7 +3066,8 @@ mod tests {
         let request = WriteFileRecordRequest {
             sub_requests: sub_requests.clone(),
         }
-        .encode();
+        .encode()
+        .unwrap();
         let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
@@ -3112,7 +3116,8 @@ mod tests {
                 record_data: vec![0x00, 0x00, 0x00, 0x00],
             }],
         }
-        .encode();
+        .encode()
+        .unwrap();
         let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
@@ -3159,7 +3164,8 @@ mod tests {
                 record_data: vec![0x00, 0x00],
             }],
         }
-        .encode();
+        .encode()
+        .unwrap();
         let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
@@ -3213,7 +3219,8 @@ mod tests {
                 },
             ],
         }
-        .encode();
+        .encode()
+        .unwrap();
         let response = test_handle_request(
             &request,
             &ServerOptions::allow_all(),
@@ -3258,7 +3265,8 @@ mod tests {
                 record_data: vec![0x00, 0x00, 0x00, 0x00],
             }],
         }
-        .encode();
+        .encode()
+        .unwrap();
         let response = test_handle_request(
             &request,
             &ServerOptions::default(),

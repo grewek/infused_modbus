@@ -234,10 +234,16 @@ pub async fn confirm_file_record_write(
         record_number,
         record_data: value,
     }];
-    let pdu = WriteFileRecordRequest {
+    let pdu = match (WriteFileRecordRequest {
         sub_requests: sub_requests.clone(),
-    }
-    .encode();
+    })
+    .encode()
+    {
+        Ok(pdu) => pdu,
+        Err(error) => {
+            return WriteStatus::Failed(format!("failed to build write request: {error:?}"));
+        }
+    };
     match connection.request(unit_id, pdu, timeout).await {
         Ok(response_pdu) => interpret_write_file_record_response(&response_pdu, &sub_requests),
         Err(error) => WriteStatus::Failed(format!("write failed: {error}")),
@@ -830,7 +836,8 @@ mod tests {
         let response = WriteFileRecordResponse {
             sub_requests: sent.clone(),
         }
-        .encode();
+        .encode()
+        .unwrap();
         assert_eq!(
             interpret_write_file_record_response(&response, &sent),
             WriteStatus::Ok
@@ -847,7 +854,8 @@ mod tests {
                 record_data: vec![0x00, 0x00, 0x00, 0x00],
             }],
         }
-        .encode();
+        .encode()
+        .unwrap();
         assert!(matches!(
             interpret_write_file_record_response(&response, &sent),
             WriteStatus::Failed(_)

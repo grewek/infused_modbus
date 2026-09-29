@@ -34,10 +34,22 @@ pub enum DecodeError {
 // a register-value vec whose length isn't bounded by the type system, so an
 // over-long one has to be rejected explicitly rather than silently truncated
 // by the `as u16`/`as u8` casts their wire format's own quantity/byte-count
-// fields need.
+// fields need. `WriteFileRecordRequest::encode`/`WriteFileRecordResponse::encode`
+// are the same kind of exception: `record_data`'s byte length isn't bounded
+// to be even by the type system either, and the wire's own `record_length`
+// field (`record_data.len() / 2`) would otherwise silently truncate an odd
+// length instead of failing loudly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodeError {
-    TooManyRegisters { count: usize, max: usize },
+    TooManyRegisters {
+        count: usize,
+        max: usize,
+    },
+    OddFileRecordDataLength {
+        file_number: u16,
+        record_number: u16,
+        length: usize,
+    },
 }
 
 pub(crate) fn read_u16_be(bytes: &[u8], offset: usize) -> u16 {

@@ -695,15 +695,12 @@ fn fuzz_round_trips(rng: &mut Xorshift64) {
     println!("ReadFileRecordResponse: {ROUND_TRIP_FUZZ_ITERATIONS} round trips ok");
 
     // record_data's length must be even: encode derives the wire's own
-    // record_length field as `record_data.len() / 2`, so an odd length would
-    // silently drop the last byte's worth of precision from that field
-    // while still writing every byte — a real, currently-unfixed encode/
-    // decode mismatch for a caller that ever passes one (see this session's
-    // own follow-up notes; not exercised here, matching how this fuzzer
-    // already worked around the equivalent WriteMultipleRegistersRequest gap
-    // before that one got fixed). Every real producer of this data in this
-    // project (fuse_fs::filesystem's hex-pair parsing) already only ever
-    // produces even lengths, so this isn't reachable in practice today.
+    // record_length field as `record_data.len() / 2`, so an odd length is
+    // rejected outright by encode() rather than silently dropping the last
+    // byte's worth of precision from that field while still writing every
+    // byte (see the dedicated rejection-path checks below). Round-trip
+    // generation here stays even-only, matching the type's actual valid
+    // domain.
     for _ in 0..ROUND_TRIP_FUZZ_ITERATIONS {
         let sub_request_count = rng.next_usize_below(MAX_FILE_RECORD_SUB_REQUESTS + 1);
         let request = WriteFileRecordRequest {
@@ -718,7 +715,10 @@ fn fuzz_round_trips(rng: &mut Xorshift64) {
                 })
                 .collect(),
         };
-        let decoded = WriteFileRecordRequest::decode(&request.encode())
+        let encoded = request
+            .encode()
+            .unwrap_or_else(|error| panic!("WriteFileRecordRequest failed to encode: {error:?}"));
+        let decoded = WriteFileRecordRequest::decode(&encoded)
             .unwrap_or_else(|error| panic!("WriteFileRecordRequest failed to decode: {error:?}"));
         assert_eq!(
             request, decoded,
@@ -726,6 +726,43 @@ fn fuzz_round_trips(rng: &mut Xorshift64) {
         );
     }
     println!("WriteFileRecordRequest: {ROUND_TRIP_FUZZ_ITERATIONS} round trips ok");
+
+    // Dedicated rejection-path check, mirroring the TooManyRegisters ones
+    // for FC16/FC17 above — an odd-length record_data must always come back
+    // as EncodeError::OddFileRecordDataLength, never a silently-truncated
+    // PDU.
+    for _ in 0..ROUND_TRIP_FUZZ_ITERATIONS {
+        let file_number = rng.next_u16();
+        let record_number = rng.next_u16();
+        let word_count = rng.next_usize_below(MAX_FILE_RECORD_DATA_WORDS + 1);
+        let mut record_data = rng.next_bytes(word_count * 2);
+        record_data.push(rng.next_u16() as u8);
+        let length = record_data.len();
+        let request = WriteFileRecordRequest {
+            sub_requests: vec![WriteFileRecordSubRequest {
+                file_number,
+                record_number,
+                record_data,
+            }],
+        };
+        match request.encode() {
+            Err(EncodeError::OddFileRecordDataLength {
+                file_number: actual_file_number,
+                record_number: actual_record_number,
+                length: actual_length,
+            }) => {
+                assert_eq!(actual_file_number, file_number);
+                assert_eq!(actual_record_number, record_number);
+                assert_eq!(actual_length, length);
+            }
+            other => panic!(
+                "WriteFileRecordRequest with odd-length record_data ({length} bytes) should have been rejected, got {other:?}"
+            ),
+        }
+    }
+    println!(
+        "WriteFileRecordRequest: {ROUND_TRIP_FUZZ_ITERATIONS} odd-length encodes correctly rejected"
+    );
 
     for _ in 0..ROUND_TRIP_FUZZ_ITERATIONS {
         let sub_request_count = rng.next_usize_below(MAX_FILE_RECORD_SUB_REQUESTS + 1);
@@ -741,7 +778,10 @@ fn fuzz_round_trips(rng: &mut Xorshift64) {
                 })
                 .collect(),
         };
-        let decoded = WriteFileRecordResponse::decode(&response.encode())
+        let encoded = response
+            .encode()
+            .unwrap_or_else(|error| panic!("WriteFileRecordResponse failed to encode: {error:?}"));
+        let decoded = WriteFileRecordResponse::decode(&encoded)
             .unwrap_or_else(|error| panic!("WriteFileRecordResponse failed to decode: {error:?}"));
         assert_eq!(
             response, decoded,
@@ -749,6 +789,39 @@ fn fuzz_round_trips(rng: &mut Xorshift64) {
         );
     }
     println!("WriteFileRecordResponse: {ROUND_TRIP_FUZZ_ITERATIONS} round trips ok");
+
+    for _ in 0..ROUND_TRIP_FUZZ_ITERATIONS {
+        let file_number = rng.next_u16();
+        let record_number = rng.next_u16();
+        let word_count = rng.next_usize_below(MAX_FILE_RECORD_DATA_WORDS + 1);
+        let mut record_data = rng.next_bytes(word_count * 2);
+        record_data.push(rng.next_u16() as u8);
+        let length = record_data.len();
+        let response = WriteFileRecordResponse {
+            sub_requests: vec![WriteFileRecordSubRequest {
+                file_number,
+                record_number,
+                record_data,
+            }],
+        };
+        match response.encode() {
+            Err(EncodeError::OddFileRecordDataLength {
+                file_number: actual_file_number,
+                record_number: actual_record_number,
+                length: actual_length,
+            }) => {
+                assert_eq!(actual_file_number, file_number);
+                assert_eq!(actual_record_number, record_number);
+                assert_eq!(actual_length, length);
+            }
+            other => panic!(
+                "WriteFileRecordResponse with odd-length record_data ({length} bytes) should have been rejected, got {other:?}"
+            ),
+        }
+    }
+    println!(
+        "WriteFileRecordResponse: {ROUND_TRIP_FUZZ_ITERATIONS} odd-length encodes correctly rejected"
+    );
 
     for _ in 0..ROUND_TRIP_FUZZ_ITERATIONS {
         // Real Modbus function codes are always below 0x80; the top bit is reserved
