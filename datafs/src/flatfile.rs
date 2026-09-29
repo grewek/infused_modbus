@@ -11,8 +11,13 @@
 //! (a single static file, client-only). M4 adds the client write path:
 //! `transactions/`+`TRANSACTION_END` via `inotify`, mirroring the FUSE
 //! layer's `write()`/`release()`-then-`create()` staging ritual —
-//! `FlatfileTransactionWatcher`. The server direct-write path (M5),
-//! multi-machine layout (M6), and CLI wiring (M9) are still not here yet.
+//! `FlatfileTransactionWatcher`. M5 adds the server direct-write path,
+//! `FlatfileDirectWriteWatcher`. M6 adds `MachineFlatfileReaders` and the
+//! `build_machine_*` free functions, bundling one machine's full set of
+//! renderers/watchers rooted at `<root>/<machine_name>/` — multi-machine
+//! layout needs no inode-stride trick here, unlike the FUSE layer, since
+//! real nested directories already namespace themselves for free. CLI
+//! wiring (M9) is still not here yet.
 //!
 //! Deliberate scope reduction vs. the CLAUDE.md design text: that section
 //! describes change detection as push-based (`Notify`, fired by every
@@ -25,7 +30,7 @@
 //! the `Notify` wiring is worth its wider blast radius.
 
 use crate::{
-    CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore,
+    CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore, MachineStores,
     PendingTransaction, RegisterStore, StagedValue, coil_file_content, discrete_input_file_content,
     file_record_file_content, input_register_file_content, parse_coil_value,
     parse_file_record_name, parse_file_record_value, parse_masked_register_value,
@@ -34,7 +39,7 @@ use crate::{
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use protocol::device_description::{
     AccessRight, CoilDescription, DiscreteInputDescription, FileRecordDescription,
-    InputRegisterDescription, RegisterDescription,
+    InputRegisterDescription, MachineDescription, RegisterDescription,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -358,6 +363,9 @@ pub fn write_server_id_file(path: &Path, server_id: Option<&str>) -> io::Result<
         Some(server_id) => format!("{server_id}\n"),
         None => return Ok(()),
     };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     atomic_write(path, &content)
 }
 
@@ -795,6 +803,155 @@ impl FlatfileDirectWriteWatcher {
             .transaction_sender
             .send((self.machine_name.clone(), HashMap::from([(name, value)])));
     }
+}
+
+// `<root>/<machine_name>/<subdirectory>` — the same path shape every
+// `build_machine_*` function below uses to root one machine's tree.
+// Multi-machine layout needs nothing more than this: unlike the FUSE
+// layer's inode-stride trick (`MACHINE_INO_STRIDE`), real nested
+// directories already namespace themselves for free — two machines named
+// "PumpA"/"PumpB" simply can never collide on disk, the same way two
+// unrelated directories never collide.
+fn machine_directory(root: &Path, machine_name: &str, subdirectory: &str) -> PathBuf {
+    root.join(machine_name).join(subdirectory)
+}
+
+/// Bundles every read-side renderer for one machine, rooted at
+/// `<root>/<machine_name>/` — used identically by both client and server,
+/// since both render the same read-only view of a machine's data; only the
+/// write side (`FlatfileTransactionWatcher` vs. `FlatfileDirectWriteWatcher`)
+/// differs by role, which is why it isn't bundled in here too.
+pub struct MachineFlatfileReaders {
+    pub registers: FlatfileRegisterRenderer,
+    pub coils: FlatfileCoilRenderer,
+    pub discrete_inputs: FlatfileDiscreteInputRenderer,
+    pub input_registers: FlatfileInputRegisterRenderer,
+    pub file_records: FlatfileFileRecordRenderer,
+}
+
+impl MachineFlatfileReaders {
+    pub fn new(root: &Path, machine: &MachineDescription, stores: &MachineStores) -> Self {
+        Self {
+            registers: FlatfileRegisterRenderer::new(
+                machine_directory(root, &machine.name, "holding-registers"),
+                machine.registers.clone(),
+                stores.registers.clone(),
+            ),
+            coils: FlatfileCoilRenderer::new(
+                machine_directory(root, &machine.name, "coils"),
+                machine.coils.clone(),
+                stores.coils.clone(),
+            ),
+            discrete_inputs: FlatfileDiscreteInputRenderer::new(
+                machine_directory(root, &machine.name, "discrete-inputs"),
+                machine.discrete_inputs.clone(),
+                stores.discrete_inputs.clone(),
+            ),
+            input_registers: FlatfileInputRegisterRenderer::new(
+                machine_directory(root, &machine.name, "input-registers"),
+                machine.input_registers.clone(),
+                stores.input_registers.clone(),
+            ),
+            file_records: FlatfileFileRecordRenderer::new(
+                machine_directory(root, &machine.name, "file-records"),
+                machine.file_records.clone(),
+                stores.file_records.clone(),
+            ),
+        }
+    }
+
+    /// Creates every subdirectory and writes every configured entry's
+    /// current content — see each renderer's own `initialize`.
+    pub fn initialize(&self) -> io::Result<()> {
+        self.registers.initialize()?;
+        self.coils.initialize()?;
+        self.discrete_inputs.initialize()?;
+        self.input_registers.initialize()?;
+        self.file_records.initialize()
+    }
+
+    /// Re-renders every directory to match its store's current values.
+    pub fn render_once(&self) -> io::Result<()> {
+        self.registers.render_once()?;
+        self.coils.render_once()?;
+        self.discrete_inputs.render_once()?;
+        self.input_registers.render_once()?;
+        self.file_records.render_once()
+    }
+}
+
+/// One `MachineFlatfileReaders` per configured machine, keyed by machine
+/// name — the multi-machine counterpart of `crate::build_machine_stores`,
+/// consumed identically by both `client` and `server` (M9). `stores` is
+/// expected to already have one entry per machine in `machines` (i.e. built
+/// via `crate::build_machine_stores(machines)` against this same slice) —
+/// a machine missing from `stores` is a caller bug, not a condition this
+/// function tries to handle gracefully.
+pub fn build_machine_readers(
+    root: &Path,
+    machines: &[MachineDescription],
+    stores: &HashMap<String, MachineStores>,
+) -> HashMap<String, MachineFlatfileReaders> {
+    machines
+        .iter()
+        .map(|machine| {
+            let machine_stores = &stores[&machine.name];
+            (
+                machine.name.clone(),
+                MachineFlatfileReaders::new(root, machine, machine_stores),
+            )
+        })
+        .collect()
+}
+
+/// Builds one machine's `transactions/`-watching `FlatfileTransactionWatcher`
+/// — the client-side write path, rooted at `<root>/<machine_name>/transactions`.
+pub fn build_machine_transaction_watcher(
+    root: &Path,
+    machine: &MachineDescription,
+    transaction_sender: mpsc::Sender<(String, HashMap<String, StagedValue>)>,
+) -> FlatfileTransactionWatcher {
+    FlatfileTransactionWatcher::new(
+        machine.name.clone(),
+        machine_directory(root, &machine.name, "transactions"),
+        machine.registers.clone(),
+        machine.coils.clone(),
+        machine.file_records.clone(),
+        transaction_sender,
+    )
+}
+
+/// Builds one machine's `FlatfileDirectWriteWatcher` — the server-side write
+/// path, rooted at `<root>/<machine_name>/`.
+pub fn build_machine_direct_write_watcher(
+    root: &Path,
+    machine: &MachineDescription,
+    transaction_sender: mpsc::Sender<(String, HashMap<String, StagedValue>)>,
+) -> FlatfileDirectWriteWatcher {
+    FlatfileDirectWriteWatcher::new(
+        machine.name.clone(),
+        machine_directory(root, &machine.name, "holding-registers"),
+        machine_directory(root, &machine.name, "coils"),
+        machine_directory(root, &machine.name, "discrete-inputs"),
+        machine_directory(root, &machine.name, "input-registers"),
+        machine_directory(root, &machine.name, "file-records"),
+        machine.registers.clone(),
+        machine.coils.clone(),
+        machine.discrete_inputs.clone(),
+        machine.input_registers.clone(),
+        machine.file_records.clone(),
+        transaction_sender,
+    )
+}
+
+/// Writes `<root>/<machine_name>/server-id` — client-only, mirrors
+/// `write_server_id_file`'s own "single static file, nothing to poll"
+/// reasoning, just resolving the per-machine path for the caller.
+pub fn write_machine_server_id_file(root: &Path, machine: &MachineDescription) -> io::Result<()> {
+    write_server_id_file(
+        &root.join(&machine.name).join("server-id"),
+        machine.server_id.as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -1542,5 +1699,155 @@ mod tests {
 
         assert!(receiver.try_recv().is_err());
         assert!(!dirs.holding_registers.join("Nonexistent").exists());
+    }
+
+    fn a_machine(name: &str, registers: Vec<RegisterDescription>) -> MachineDescription {
+        MachineDescription {
+            name: name.to_string(),
+            unit_id: 1,
+            registers,
+            coils: vec![],
+            discrete_inputs: vec![],
+            input_registers: vec![],
+            file_records: vec![],
+            mem_layout: Default::default(),
+            input_register_mem_layout: Default::default(),
+            server_id: None,
+        }
+    }
+
+    #[test]
+    fn build_machine_readers_creates_one_entry_per_machine_name() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let machines = vec![a_machine("PumpA", vec![]), a_machine("PumpB", vec![])];
+        let stores = HashMap::from([
+            ("PumpA".to_string(), MachineStores::new()),
+            ("PumpB".to_string(), MachineStores::new()),
+        ]);
+
+        let readers = build_machine_readers(temporary_directory.path(), &machines, &stores);
+
+        assert_eq!(readers.len(), 2);
+        assert!(readers.contains_key("PumpA"));
+        assert!(readers.contains_key("PumpB"));
+    }
+
+    #[test]
+    fn two_machines_render_independently_under_the_same_root() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let root = temporary_directory.path();
+        let machines = vec![
+            a_machine("PumpA", vec![a_register("Tank_Temperature")]),
+            a_machine("PumpB", vec![a_register("Tank_Temperature")]),
+        ];
+        let stores = HashMap::from([
+            ("PumpA".to_string(), MachineStores::new()),
+            ("PumpB".to_string(), MachineStores::new()),
+        ]);
+        let readers = build_machine_readers(root, &machines, &stores);
+        for reader in readers.values() {
+            reader.initialize().unwrap();
+        }
+
+        stores["PumpA"]
+            .registers
+            .lock()
+            .unwrap()
+            .set("Tank_Temperature", RegisterValue::U16(11));
+        stores["PumpB"]
+            .registers
+            .lock()
+            .unwrap()
+            .set("Tank_Temperature", RegisterValue::U16(22));
+        for reader in readers.values() {
+            reader.render_once().unwrap();
+        }
+
+        assert_eq!(
+            fs::read_to_string(
+                root.join("PumpA")
+                    .join("holding-registers")
+                    .join("Tank_Temperature")
+            )
+            .unwrap(),
+            "11\n"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                root.join("PumpB")
+                    .join("holding-registers")
+                    .join("Tank_Temperature")
+            )
+            .unwrap(),
+            "22\n"
+        );
+    }
+
+    #[test]
+    fn build_machine_transaction_watcher_tags_events_with_its_own_machine_name() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let root = temporary_directory.path();
+        let mut register_a = a_register("Tank_Temperature");
+        register_a.access = AccessRight::ReadWrite;
+        let machine_a = a_machine("PumpA", vec![register_a.clone()]);
+        let machine_b = a_machine("PumpB", vec![register_a]);
+        let (sender, receiver) = mpsc::channel();
+
+        let watcher_a = Arc::new(build_machine_transaction_watcher(
+            root,
+            &machine_a,
+            sender.clone(),
+        ));
+        let watcher_b = Arc::new(build_machine_transaction_watcher(root, &machine_b, sender));
+        watcher_a.initialize().unwrap();
+        watcher_b.initialize().unwrap();
+        for watcher in [watcher_a.clone(), watcher_b.clone()] {
+            std::thread::spawn(move || {
+                let _ = watcher.run_forever();
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        fs::write(
+            root.join("PumpB")
+                .join("transactions")
+                .join("Tank_Temperature"),
+            "5",
+        )
+        .unwrap();
+        fs::write(
+            root.join("PumpB")
+                .join("transactions")
+                .join("TRANSACTION_END"),
+            "",
+        )
+        .unwrap();
+
+        let (machine_name, transaction) = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(machine_name, "PumpB");
+        assert_eq!(
+            transaction.get("Tank_Temperature"),
+            Some(&StagedValue::Register(RegisterValue::U16(5)))
+        );
+        // Only PumpB's transaction should have arrived — PumpA's own
+        // transactions/ directory was never touched.
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn write_machine_server_id_file_writes_under_the_machine_directory() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let root = temporary_directory.path();
+        let mut machine = a_machine("PumpA", vec![]);
+        machine.server_id = Some("pump-a-plc".to_string());
+
+        write_machine_server_id_file(root, &machine).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("PumpA").join("server-id")).unwrap(),
+            "pump-a-plc\n"
+        );
     }
 }
