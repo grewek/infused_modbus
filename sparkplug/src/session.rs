@@ -53,6 +53,41 @@ pub fn build_nbirth_payload(
     }
 }
 
+/// Builds the `DBIRTH` payload for one Device under this Edge Node, carrying
+/// its full current metric list (built by `client::sparkplug_translator`,
+/// outside this crate — `sparkplug` itself has no Modbus knowledge). Unlike
+/// `NBIRTH`, a `DBIRTH`'s `seq` continues the Edge Node's single running
+/// sequence rather than resetting it — only `NBIRTH` ever resets `seq` to 0,
+/// since the sequence is shared across the whole session, node and every
+/// device on it alike.
+pub fn build_dbirth_payload(
+    metrics: Vec<Metric>,
+    timestamp_millis: u64,
+    seq_counter: &mut SeqCounter,
+) -> Payload {
+    let seq = seq_counter.next_seq();
+    Payload {
+        timestamp: Some(timestamp_millis),
+        metrics,
+        seq: Some(u64::from(seq)),
+    }
+}
+
+/// Builds the `DDEATH` payload for one Device. Unlike `NDEATH` (delivered via
+/// the MQTT Will for an uncleanly dropped *connection*), `DDEATH` is actively
+/// published by the Edge Node itself when it detects that one particular
+/// device has gone offline while the node/connection otherwise stays up — so
+/// it carries a real `seq` from the running counter, not `None`. No metrics:
+/// per spec a device's death carries no data, just the fact of it.
+pub fn build_ddeath_payload(timestamp_millis: u64, seq_counter: &mut SeqCounter) -> Payload {
+    let seq = seq_counter.next_seq();
+    Payload {
+        timestamp: Some(timestamp_millis),
+        metrics: Vec::new(),
+        seq: Some(u64::from(seq)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +145,47 @@ mod tests {
         let ndeath = build_ndeath_payload(bd_seq);
         let nbirth = build_nbirth_payload(bd_seq, 0, &mut seq_counter);
         assert_eq!(ndeath.metrics[0].value, nbirth.metrics[0].value);
+    }
+
+    #[test]
+    fn dbirth_payload_carries_the_given_metrics_and_continues_the_running_seq() {
+        let mut seq_counter = SeqCounter::new();
+        let _nbirth = build_nbirth_payload(0, 0, &mut seq_counter);
+
+        let metrics = vec![Metric {
+            name: "Tank_Temperature".to_string(),
+            alias: Some(0),
+            data_type: DataType::UInt16,
+            value: MetricValue::Int(21),
+        }];
+        let dbirth = build_dbirth_payload(metrics.clone(), 1_700_000_000_000, &mut seq_counter);
+
+        assert_eq!(dbirth.timestamp, Some(1_700_000_000_000));
+        assert_eq!(dbirth.seq, Some(1));
+        assert_eq!(dbirth.metrics, metrics);
+    }
+
+    #[test]
+    fn ddeath_payload_carries_no_metrics_but_a_real_seq() {
+        let mut seq_counter = SeqCounter::new();
+        let _nbirth = build_nbirth_payload(0, 0, &mut seq_counter);
+        let _dbirth = build_dbirth_payload(Vec::new(), 0, &mut seq_counter);
+
+        let ddeath = build_ddeath_payload(1_700_000_000_000, &mut seq_counter);
+
+        assert_eq!(ddeath.timestamp, Some(1_700_000_000_000));
+        assert_eq!(ddeath.seq, Some(2));
+        assert!(ddeath.metrics.is_empty());
+    }
+
+    #[test]
+    fn dbirth_does_not_reset_the_seq_counter_unlike_nbirth() {
+        let mut seq_counter = SeqCounter::new();
+        seq_counter.next_seq();
+        seq_counter.next_seq();
+        seq_counter.next_seq();
+
+        let dbirth = build_dbirth_payload(Vec::new(), 0, &mut seq_counter);
+        assert_eq!(dbirth.seq, Some(3));
     }
 }

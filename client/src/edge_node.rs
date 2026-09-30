@@ -18,10 +18,13 @@
 //! deliberately (mirroring how `client::reconnect` already handles this for
 //! the Modbus side).
 
-use rumqttc::{AsyncClient, Event, Incoming, LastWill, MqttOptions, QoS};
+use rumqttc::{AsyncClient, ClientError, Event, Incoming, LastWill, MqttOptions, QoS};
+use sparkplug::metric::Metric;
 use sparkplug::payload::encode_payload;
 use sparkplug::seq_counter::{BdSeqCounter, SeqCounter};
-use sparkplug::session::{build_nbirth_payload, build_ndeath_payload};
+use sparkplug::session::{
+    build_dbirth_payload, build_ddeath_payload, build_nbirth_payload, build_ndeath_payload,
+};
 use sparkplug::topic::{MessageType, build_topic};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -113,6 +116,60 @@ pub async fn connect_edge_node(
     }
 }
 
+impl EdgeNodeConnection {
+    /// Publishes a `DBIRTH` for the Device identified by `device_id`,
+    /// carrying `metrics` (built by `client::sparkplug_translator::
+    /// build_machine_metrics`, outside this module — kept Modbus-agnostic
+    /// here just like `connect_edge_node` itself). Advances the Edge Node's
+    /// one shared `seq_counter` rather than resetting it, since only
+    /// `NBIRTH` ever resets `seq` to 0.
+    pub async fn publish_dbirth(
+        &self,
+        device_id: &str,
+        metrics: Vec<Metric>,
+    ) -> Result<(), ClientError> {
+        let payload = {
+            let mut seq_counter = self.seq_counter.lock().await;
+            build_dbirth_payload(metrics, current_timestamp_millis(), &mut seq_counter)
+        };
+        let mut payload_bytes = Vec::new();
+        encode_payload(&payload, &mut payload_bytes);
+        let topic = build_topic(
+            &self.group_id,
+            MessageType::DBirth,
+            &self.edge_node_id,
+            Some(device_id),
+        )
+        .expect("DBIRTH is a device-scoped message type and always carries a device_id");
+        self.client
+            .publish(topic, QoS::AtLeastOnce, false, payload_bytes)
+            .await
+    }
+
+    /// Publishes a `DDEATH` for the Device identified by `device_id` — see
+    /// `sparkplug::session::build_ddeath_payload` for why this is actively
+    /// published here rather than delivered via the MQTT Will the way
+    /// `NDEATH` is.
+    pub async fn publish_ddeath(&self, device_id: &str) -> Result<(), ClientError> {
+        let payload = {
+            let mut seq_counter = self.seq_counter.lock().await;
+            build_ddeath_payload(current_timestamp_millis(), &mut seq_counter)
+        };
+        let mut payload_bytes = Vec::new();
+        encode_payload(&payload, &mut payload_bytes);
+        let topic = build_topic(
+            &self.group_id,
+            MessageType::DDeath,
+            &self.edge_node_id,
+            Some(device_id),
+        )
+        .expect("DDEATH is a device-scoped message type and always carries a device_id");
+        self.client
+            .publish(topic, QoS::AtLeastOnce, false, payload_bytes)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +225,68 @@ mod tests {
             // continue the sequence rather than restart it.
             let mut seq_counter = edge_node.seq_counter.lock().await;
             assert_eq!(seq_counter.next_seq(), 1);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn edge_node_publishes_dbirth_and_ddeath_for_a_device_continuing_the_shared_seq() {
+        timeout(Duration::from_secs(10), async {
+            let port = 18833;
+            start_embedded_broker(BrokerConfig {
+                listen_address: format!("127.0.0.1:{port}"),
+                ..BrokerConfig::default()
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let mut external_options = MqttOptions::new("external-subscriber-2", "127.0.0.1", port);
+            external_options.set_keep_alive(Duration::from_secs(30));
+            let (external_client, mut external_eventloop) = AsyncClient::new(external_options, 10);
+            external_client
+                .subscribe("spBv1.0/TestGroup/+/TestEdge/PumpA", QoS::AtLeastOnce)
+                .await
+                .unwrap();
+            loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::SubAck(_)) => break,
+                    _ => continue,
+                }
+            }
+
+            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge").await;
+
+            let metrics = vec![Metric {
+                name: "Tank_Temperature".to_string(),
+                alias: Some(0),
+                data_type: sparkplug::data_type::DataType::UInt16,
+                value: MetricValue::Int(21),
+            }];
+            edge_node
+                .publish_dbirth("PumpA", metrics.clone())
+                .await
+                .unwrap();
+            edge_node.publish_ddeath("PumpA").await.unwrap();
+
+            let dbirth_bytes = loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::Publish(publish)) => break publish.payload,
+                    _ => continue,
+                }
+            };
+            let dbirth = decode_payload(&dbirth_bytes).unwrap();
+            assert_eq!(dbirth.seq, Some(1));
+            assert_eq!(dbirth.metrics, metrics);
+
+            let ddeath_bytes = loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::Publish(publish)) => break publish.payload,
+                    _ => continue,
+                }
+            };
+            let ddeath = decode_payload(&ddeath_bytes).unwrap();
+            assert_eq!(ddeath.seq, Some(2));
+            assert!(ddeath.metrics.is_empty());
         })
         .await
         .expect("test timed out");
