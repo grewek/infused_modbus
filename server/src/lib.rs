@@ -1,9 +1,11 @@
 pub mod admin;
 pub mod client_trust;
 pub mod connection;
+pub mod data_daemon;
 pub mod device_identification;
 pub mod handler;
 pub mod live_connections;
+pub mod peer_auth;
 pub mod persistence;
 pub mod server_handle;
 pub mod server_options;

@@ -12,6 +12,7 @@
 
 use crate::client_trust::{ApprovalOutcome, ApprovedClients};
 use crate::live_connections::LiveConnections;
+use crate::peer_auth::is_authorized_uid;
 use datafs::client_trust::ClientTrustState;
 use protocol::tls::Fingerprint;
 use std::fmt;
@@ -20,29 +21,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-
-/// The real UID this process is running as — the only UID ever allowed to
-/// talk to the admin socket (see `is_authorized_uid`). Read once via
-/// `libc::getuid()` (already a transitive dependency through `fuser`, so
-/// this reuses it rather than adding a second crate like `nix`/`rustix`
-/// just for one syscall) rather than cached, since a UID can't change
-/// during a process's lifetime.
-fn server_uid() -> libc::uid_t {
-    // SAFETY: getuid() takes no arguments, performs no memory access, and
-    // cannot fail — it's one of the few POSIX calls with no error return.
-    unsafe { libc::getuid() }
-}
-
-/// Whether a peer presenting `peer_uid` (as reported by the kernel via
-/// `SO_PEERCRED`, see `UnixStream::peer_cred`) is allowed to use the admin
-/// socket — only this server's own real UID, never anyone else's, matching
-/// the socket file's own `0600` permissions with a second, kernel-verified
-/// check that doesn't depend on the filesystem permission bits being
-/// correct (see CLAUDE.md's "Approval/revocation channel": "defense in
-/// depth if the file permissions were ever misconfigured").
-fn is_authorized_uid(peer_uid: libc::uid_t) -> bool {
-    peer_uid == server_uid()
-}
 
 /// Same "owned by the server's own service account" discipline as the TLS
 /// private key file (see `protocol::tls::PRIVATE_KEY_FILE_MODE`) — nobody
@@ -287,16 +265,6 @@ mod tests {
 
     fn other_fingerprint() -> Fingerprint {
         Fingerprint::of(b"admin-socket-test-other")
-    }
-
-    #[test]
-    fn is_authorized_uid_accepts_the_servers_own_uid() {
-        assert!(is_authorized_uid(server_uid()));
-    }
-
-    #[test]
-    fn is_authorized_uid_rejects_a_different_uid() {
-        assert!(!is_authorized_uid(server_uid().wrapping_add(1)));
     }
 
     #[test]
@@ -720,7 +688,7 @@ mod tests {
         // guards the regression the SO_PEERCRED check could introduce by
         // mistake: rejecting the server's own legitimate caller. The
         // rejection logic itself is covered directly by
-        // `is_authorized_uid_rejects_a_different_uid` above.
+        // `peer_auth::tests::is_authorized_uid_rejects_a_different_uid`.
         let temporary_directory = tempfile::tempdir().unwrap();
         let socket_path = temporary_directory.path().join("admin.sock");
         let (approved, client_trust, live_connections, state_temp_dir) = state();
