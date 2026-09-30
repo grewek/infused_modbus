@@ -38,12 +38,24 @@ pub struct EdgeNodeConnection {
     pub group_id: String,
     pub edge_node_id: String,
     pub seq_counter: Mutex<SeqCounter>,
+    /// Fixed for the whole life of this connection session — kept around so
+    /// a later `Rebirth` request (see `publish_nbirth`) republishes `NBIRTH`
+    /// with the *same* `bdSeq` the connection's `NDEATH` Will was registered
+    /// with, not a new one (a new `bdSeq` is only ever warranted by a new
+    /// MQTT connection, which a `Rebirth` request is not).
+    bd_seq: u64,
     /// Every `DCMD` publish this Edge Node has subscribed to (see
     /// `subscribe_dcmd`), as `(device_id, raw_payload_bytes)` — decoding and
     /// resolving these into a real write belongs to `client::
     /// sparkplug_command`, which has the Modbus knowledge this module
     /// deliberately doesn't.
     pub dcmd_receiver: Mutex<mpsc::UnboundedReceiver<(String, Vec<u8>)>>,
+    /// Every `NCMD` publish addressed to this Edge Node itself (not any one
+    /// device) — in practice, as of M8, only ever a `Node Control/Rebirth`
+    /// request, but modeled as raw bytes here for the same reason
+    /// `dcmd_receiver` is: decoding is Modbus/Sparkplug-metric-aware glue
+    /// that belongs in `client::sparkplug_command`.
+    pub ncmd_receiver: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
 }
 
 fn current_timestamp_millis() -> u64 {
@@ -96,18 +108,22 @@ pub async fn connect_edge_node(
 
     // rumqttc only makes progress (keepalive pings, acks, automatic
     // reconnection) while something keeps polling the event loop. Piggybacks
-    // on that same loop to also pick out DCMD publishes for any device this
-    // Edge Node has subscribed to (see `subscribe_dcmd`) and forward them
-    // into `dcmd_sender`, rather than running a second, competing consumer
-    // of the one `AsyncClient`/`EventLoop` pair.
+    // on that same loop to also pick out DCMD/NCMD publishes and forward
+    // them into their respective channels, rather than running a second,
+    // competing consumer of the one `AsyncClient`/`EventLoop` pair.
     let dcmd_topic_prefix = format!("spBv1.0/{group_id}/DCMD/{edge_node_id}/");
+    let ncmd_topic = build_topic(group_id, MessageType::NCmd, edge_node_id, None)
+        .expect("NCMD is a node-scoped message type and never needs a device_id");
     let (dcmd_sender, dcmd_receiver) = mpsc::unbounded_channel();
+    let (ncmd_sender, ncmd_receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         loop {
             match eventloop.poll().await {
                 Ok(Event::Incoming(Incoming::Publish(publish))) => {
                     if let Some(device_id) = publish.topic.strip_prefix(&dcmd_topic_prefix) {
                         let _ = dcmd_sender.send((device_id.to_string(), publish.payload.to_vec()));
+                    } else if publish.topic == ncmd_topic {
+                        let _ = ncmd_sender.send(publish.payload.to_vec());
                     }
                 }
                 Ok(_) => {}
@@ -116,24 +132,20 @@ pub async fn connect_edge_node(
         }
     });
 
-    let mut seq_counter = SeqCounter::new();
-    let nbirth_payload = build_nbirth_payload(bd_seq, current_timestamp_millis(), &mut seq_counter);
-    let mut nbirth_bytes = Vec::new();
-    encode_payload(&nbirth_payload, &mut nbirth_bytes);
-    let nbirth_topic = build_topic(group_id, MessageType::NBirth, edge_node_id, None)
-        .expect("NBIRTH is a node-scoped message type and never needs a device_id");
-    client
-        .publish(nbirth_topic, QoS::AtLeastOnce, false, nbirth_bytes)
-        .await
-        .expect("failed to publish NBIRTH after connecting");
-
-    EdgeNodeConnection {
+    let connection = EdgeNodeConnection {
         client,
         group_id: group_id.to_string(),
         edge_node_id: edge_node_id.to_string(),
-        seq_counter: Mutex::new(seq_counter),
+        seq_counter: Mutex::new(SeqCounter::new()),
+        bd_seq,
         dcmd_receiver: Mutex::new(dcmd_receiver),
-    }
+        ncmd_receiver: Mutex::new(ncmd_receiver),
+    };
+    connection
+        .publish_nbirth()
+        .await
+        .expect("failed to publish NBIRTH after connecting");
+    connection
 }
 
 impl EdgeNodeConnection {
@@ -150,6 +162,43 @@ impl EdgeNodeConnection {
         )
         .expect("DCMD is a device-scoped message type and always carries a device_id");
         self.client.subscribe(topic, QoS::AtLeastOnce).await
+    }
+
+    /// Subscribes to this Edge Node's own `NCMD` topic, so incoming
+    /// node-level commands (as of M8, only ever `Node Control/Rebirth`)
+    /// start showing up on `ncmd_receiver`. Must be called once per
+    /// connection — never subscribed automatically by `connect_edge_node`
+    /// itself, matching `subscribe_dcmd`'s own "caller opts in" precedent.
+    pub async fn subscribe_ncmd(&self) -> Result<(), ClientError> {
+        let topic = build_topic(&self.group_id, MessageType::NCmd, &self.edge_node_id, None)
+            .expect("NCMD is a node-scoped message type and never needs a device_id");
+        self.client.subscribe(topic, QoS::AtLeastOnce).await
+    }
+
+    /// (Re-)publishes `NBIRTH`, resetting `seq_counter` to 0 first (per
+    /// spec, every `NBIRTH` always carries `seq = 0`) but reusing this
+    /// connection's original `bd_seq` unchanged — see the field's own doc
+    /// comment for why a `Rebirth` request must not get a fresh one. Called
+    /// once by `connect_edge_node` itself right after connecting, and again
+    /// by `client::sparkplug_command`'s rebirth handling whenever a `Node
+    /// Control/Rebirth` request arrives.
+    pub async fn publish_nbirth(&self) -> Result<(), ClientError> {
+        let payload = {
+            let mut seq_counter = self.seq_counter.lock().await;
+            build_nbirth_payload(self.bd_seq, current_timestamp_millis(), &mut seq_counter)
+        };
+        let mut payload_bytes = Vec::new();
+        encode_payload(&payload, &mut payload_bytes);
+        let topic = build_topic(
+            &self.group_id,
+            MessageType::NBirth,
+            &self.edge_node_id,
+            None,
+        )
+        .expect("NBIRTH is a node-scoped message type and never needs a device_id");
+        self.client
+            .publish(topic, QoS::AtLeastOnce, false, payload_bytes)
+            .await
     }
 
     /// Publishes a `DBIRTH` for the Device identified by `device_id`,
@@ -504,6 +553,123 @@ mod tests {
                 .expect("dcmd_receiver closed unexpectedly");
             assert_eq!(device_id, "PumpA");
             assert_eq!(payload_bytes, vec![1, 2, 3]);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn edge_node_forwards_ncmd_publishes_but_not_dcmd_ones() {
+        timeout(Duration::from_secs(10), async {
+            let port = 18837;
+            start_embedded_broker(BrokerConfig {
+                listen_address: format!("127.0.0.1:{port}"),
+                ..BrokerConfig::default()
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge").await;
+            edge_node.subscribe_ncmd().await.unwrap();
+
+            let mut host_options = MqttOptions::new("host-application-3", "127.0.0.1", port);
+            host_options.set_keep_alive(Duration::from_secs(30));
+            let (host_client, mut host_eventloop) = AsyncClient::new(host_options, 10);
+            tokio::spawn(async move {
+                loop {
+                    if host_eventloop.poll().await.is_err() {
+                        break;
+                    }
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Never subscribed to any device's DCMD, so this must not
+            // surface on ncmd_receiver either.
+            host_client
+                .publish(
+                    "spBv1.0/TestGroup/DCMD/TestEdge/PumpA",
+                    QoS::AtLeastOnce,
+                    false,
+                    vec![9, 9],
+                )
+                .await
+                .unwrap();
+            host_client
+                .publish(
+                    "spBv1.0/TestGroup/NCMD/TestEdge",
+                    QoS::AtLeastOnce,
+                    false,
+                    vec![1, 2, 3],
+                )
+                .await
+                .unwrap();
+
+            let payload_bytes = edge_node
+                .ncmd_receiver
+                .lock()
+                .await
+                .recv()
+                .await
+                .expect("ncmd_receiver closed unexpectedly");
+            assert_eq!(payload_bytes, vec![1, 2, 3]);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publish_nbirth_resets_seq_but_reuses_the_same_bd_seq() {
+        timeout(Duration::from_secs(10), async {
+            let port = 18838;
+            start_embedded_broker(BrokerConfig {
+                listen_address: format!("127.0.0.1:{port}"),
+                ..BrokerConfig::default()
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let mut external_options = MqttOptions::new("external-subscriber-4", "127.0.0.1", port);
+            external_options.set_keep_alive(Duration::from_secs(30));
+            let (external_client, mut external_eventloop) = AsyncClient::new(external_options, 10);
+            external_client
+                .subscribe("spBv1.0/TestGroup/NBIRTH/TestEdge", QoS::AtLeastOnce)
+                .await
+                .unwrap();
+            loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::SubAck(_)) => break,
+                    _ => continue,
+                }
+            }
+
+            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge").await;
+            // advance seq past 0 before the "rebirth"
+            {
+                let mut seq_counter = edge_node.seq_counter.lock().await;
+                seq_counter.next_seq();
+                seq_counter.next_seq();
+            }
+
+            edge_node.publish_nbirth().await.unwrap();
+
+            let first_nbirth_bytes = loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::Publish(publish)) => break publish.payload,
+                    _ => continue,
+                }
+            };
+            let first_bd_seq = decode_payload(&first_nbirth_bytes).unwrap().metrics[0]
+                .value
+                .clone();
+
+            let second_nbirth_bytes = loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::Publish(publish)) => break publish.payload,
+                    _ => continue,
+                }
+            };
+            let second_nbirth = decode_payload(&second_nbirth_bytes).unwrap();
+            assert_eq!(second_nbirth.seq, Some(0));
+            assert_eq!(second_nbirth.metrics[0].value, first_bd_seq);
         })
         .await
         .expect("test timed out");
