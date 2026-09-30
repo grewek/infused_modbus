@@ -1,4 +1,5 @@
 pub mod batching;
+pub mod broker;
 pub mod connection;
 pub mod device_identification;
 pub mod polling;

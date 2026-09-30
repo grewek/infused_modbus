@@ -4,4 +4,5 @@
 
 pub mod data_type;
 pub mod metric_value;
+pub mod topic;
 pub mod wire;
