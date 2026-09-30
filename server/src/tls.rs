@@ -13,7 +13,23 @@ use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
+
+static CRYPTO_PROVIDER_INSTALL: Once = Once::new();
+
+/// Installs `ring` as the process-wide default `rustls` crypto provider,
+/// exactly once. `ServerConfig::builder()`/`ClientConfig::builder()` below
+/// rely on rustls auto-detecting the default provider, which only works
+/// when exactly one provider crate is linked into the binary — running
+/// `cargo test --workspace` unifies the dependency graph across every crate,
+/// and `client`'s `rumqttc`/`rumqttd` (M3) transitively link `aws-lc-rs`
+/// alongside the `ring` this crate itself asks for, so the ambiguity has to
+/// be resolved explicitly rather than left to autodetection.
+fn ensure_crypto_provider_installed() {
+    CRYPTO_PROVIDER_INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 /// The `ClientCertVerifier` methods concerned with checking that a
 /// handshake signature is cryptographically valid — i.e. that the peer
@@ -214,6 +230,7 @@ pub fn build_server_config(
     approved: Arc<Mutex<ApprovedClients>>,
     client_trust: Arc<Mutex<ClientTrustState>>,
 ) -> Result<ServerConfig, String> {
+    ensure_crypto_provider_installed();
     let certificate = CertificateDer::from(identity.certificate_der.clone());
     let private_key = PrivateKeyDer::try_from(identity.private_key_der.clone())
         .map_err(|error| error.to_string())?;
@@ -377,6 +394,7 @@ mod tests {
 
         let client_certificate = CertificateDer::from(client_identity.certificate_der);
         let client_private_key = PrivateKeyDer::try_from(client_identity.private_key_der).unwrap();
+        ensure_crypto_provider_installed();
         let client_config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(InsecureAcceptAnyServerCert::new()))
@@ -585,6 +603,7 @@ mod tests {
         // test and any identity worked.
         let client_certificate = CertificateDer::from(client_identity.certificate_der);
         let client_private_key = PrivateKeyDer::try_from(client_identity.private_key_der).unwrap();
+        ensure_crypto_provider_installed();
         let client_config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(InsecureAcceptAnyServerCert::new()))
@@ -645,6 +664,7 @@ mod tests {
 
         let client_certificate = CertificateDer::from(client_identity.certificate_der);
         let client_private_key = PrivateKeyDer::try_from(client_identity.private_key_der).unwrap();
+        ensure_crypto_provider_installed();
         let client_config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(InsecureAcceptAnyServerCert::new()))
@@ -680,6 +700,7 @@ mod tests {
             let _ = acceptor.accept(tcp_stream).await;
         });
 
+        ensure_crypto_provider_installed();
         let client_config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(InsecureAcceptAnyServerCert::new()))
@@ -736,6 +757,7 @@ mod tests {
         let client_identity = protocol::tls::generate_self_signed_identity().unwrap();
         let client_certificate = CertificateDer::from(client_identity.certificate_der);
         let client_private_key = PrivateKeyDer::try_from(client_identity.private_key_der).unwrap();
+        ensure_crypto_provider_installed();
         let client_config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(InsecureAcceptAnyServerCert::new()))

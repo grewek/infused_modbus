@@ -443,6 +443,7 @@ dependencies = [
  "rumqttd",
  "rustls 0.23.45",
  "rustls-webpki 0.103.15",
+ "sparkplug",
  "tokio",
  "tokio-rustls 0.26.5",
  "tokio-serial",

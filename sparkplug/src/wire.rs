@@ -136,6 +136,20 @@ pub fn decode_fixed64(bytes: &[u8]) -> Result<(u64, usize), DecodeError> {
     Ok((value, 8))
 }
 
+/// Consumes and discards one field's value of the given wire type from the
+/// start of `bytes`, returning how many bytes it occupied. Used by message
+/// decoders (`metric`, `payload`) to skip over fields they don't model,
+/// rather than rejecting a message just because it carries a field this
+/// crate hasn't implemented yet.
+pub fn skip_field(wire_type: WireType, bytes: &[u8]) -> Result<usize, DecodeError> {
+    match wire_type {
+        WireType::Varint => decode_varint(bytes).map(|(_, consumed)| consumed),
+        WireType::Fixed32 => decode_fixed32(bytes).map(|(_, consumed)| consumed),
+        WireType::Fixed64 => decode_fixed64(bytes).map(|(_, consumed)| consumed),
+        WireType::LengthDelimited => decode_length_delimited(bytes).map(|(_, consumed)| consumed),
+    }
+}
+
 /// Encodes `value` as an unsigned LEB128 varint, appending to `buffer`.
 pub fn encode_varint(mut value: u64, buffer: &mut Vec<u8>) {
     loop {
@@ -561,5 +575,40 @@ mod tests {
     #[test]
     fn decode_fixed64_rejects_empty_input() {
         assert_eq!(decode_fixed64(&[]), Err(DecodeError::TooShort));
+    }
+
+    #[test]
+    fn skip_field_consumes_a_varint() {
+        let mut buffer = Vec::new();
+        encode_varint(300, &mut buffer);
+        buffer.extend_from_slice(&[0xAA]);
+        assert_eq!(skip_field(WireType::Varint, &buffer), Ok(2));
+    }
+
+    #[test]
+    fn skip_field_consumes_a_length_delimited_value() {
+        let mut buffer = Vec::new();
+        encode_length_delimited(b"hello", &mut buffer);
+        buffer.extend_from_slice(&[0xAA]);
+        assert_eq!(skip_field(WireType::LengthDelimited, &buffer), Ok(6));
+    }
+
+    #[test]
+    fn skip_field_consumes_fixed32_and_fixed64() {
+        let mut buffer32 = Vec::new();
+        encode_fixed32(7, &mut buffer32);
+        assert_eq!(skip_field(WireType::Fixed32, &buffer32), Ok(4));
+
+        let mut buffer64 = Vec::new();
+        encode_fixed64(7, &mut buffer64);
+        assert_eq!(skip_field(WireType::Fixed64, &buffer64), Ok(8));
+    }
+
+    #[test]
+    fn skip_field_propagates_decode_error() {
+        assert_eq!(
+            skip_field(WireType::Fixed32, &[0x01, 0x02]),
+            Err(DecodeError::TooShort)
+        );
     }
 }

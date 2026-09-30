@@ -3,6 +3,10 @@
 //! and session (seq/bdSeq) semantics. Not a general-purpose protobuf library.
 
 pub mod data_type;
+pub mod metric;
 pub mod metric_value;
+pub mod payload;
+pub mod seq_counter;
+pub mod session;
 pub mod topic;
 pub mod wire;

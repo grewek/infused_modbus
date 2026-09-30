@@ -12,12 +12,27 @@ use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
+
+static CRYPTO_PROVIDER_INSTALL: Once = Once::new();
+
+/// Installs `ring` as the process-wide default `rustls` crypto provider,
+/// exactly once. Needed because `ClientConfig::builder()`/`ServerConfig::
+/// builder()` below rely on rustls auto-detecting the default provider,
+/// which only works when exactly one provider crate is linked into the
+/// binary — true before `rumqttc`/`rumqttd` were added (M3), but their own
+/// transitive `rustls` dependency also links `aws-lc-rs`, so the ambiguity
+/// has to be resolved explicitly now rather than left to autodetection.
+fn ensure_crypto_provider_installed() {
+    CRYPTO_PROVIDER_INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 pub enum Connection {
     Tcp {
@@ -235,6 +250,7 @@ impl Connection {
         expected_server_fingerprint: Option<protocol::tls::Fingerprint>,
         client_identity: Option<protocol::tls::Identity>,
     ) -> io::Result<Self> {
+        ensure_crypto_provider_installed();
         let tcp_stream = TcpStream::connect(address).await?;
 
         let verifier: Arc<dyn ServerCertVerifier> = match expected_server_fingerprint {
@@ -407,6 +423,7 @@ mod tests {
     // against a real TLS handshake, not against `server`. Also returns the
     // identity's fingerprint so L3 tests can pin/mismatch against it.
     fn test_server_config() -> (rustls::ServerConfig, protocol::tls::Fingerprint) {
+        ensure_crypto_provider_installed();
         let identity = protocol::tls::generate_self_signed_identity().unwrap();
         let fingerprint = protocol::tls::Fingerprint::of(&identity.public_key_der);
         let certificate = rustls::pki_types::CertificateDer::from(identity.certificate_der);
@@ -553,6 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn tls_connection_succeeds_when_the_server_requires_a_client_certificate() {
+        ensure_crypto_provider_installed();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let client_cert_verifier = AcceptAnyClientCert {
