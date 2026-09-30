@@ -21,6 +21,7 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-webpki = "0.103.15"
 rumqttd = "0.20"
+rumqttc = "0.25"
 config = "0.14"
 
 [dev-dependencies]
