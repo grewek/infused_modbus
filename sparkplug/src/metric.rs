@@ -1,17 +1,20 @@
 //! Encode/decode for Sparkplug B's `Metric` message — the missing link between
 //! `wire`'s raw protobuf primitives and `data_type`/`metric_value`'s pure data
-//! types. Deliberately minimal: only `name` (field 1), `datatype` (field 4),
-//! and the scalar `value` oneof (fields 10-16, via `MetricValue`) are
-//! modeled. `alias`/`timestamp`/`is_historical`/`is_transient`/`is_null`/
+//! types. Deliberately minimal: `name` (field 1), `alias` (field 2), `datatype`
+//! (field 4), and the scalar `value` oneof (fields 10-16, via `MetricValue`)
+//! are modeled. `timestamp`/`is_historical`/`is_transient`/`is_null`/
 //! `metadata`/`properties` aren't yet — no concrete need for them has shown
 //! up; add them once one does, per this project's Extraction-Based
-//! Programming convention.
+//! Programming convention. (`alias` itself was added in M5, once
+//! `client::sparkplug_alias`'s per-Edge-Node alias assignment became a real
+//! need — M4 had deliberately left it out for the same reason.)
 
 use crate::data_type::DataType;
 use crate::metric_value::MetricValue;
 use crate::wire::{self, Tag, WireType};
 
 const FIELD_NAME: u32 = 1;
+const FIELD_ALIAS: u32 = 2;
 const FIELD_DATATYPE: u32 = 4;
 const FIELD_INT_VALUE: u32 = 10;
 const FIELD_LONG_VALUE: u32 = 11;
@@ -24,6 +27,7 @@ const FIELD_BYTES_VALUE: u32 = 16;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Metric {
     pub name: String,
+    pub alias: Option<u64>,
     pub data_type: DataType,
     pub value: MetricValue,
 }
@@ -52,6 +56,17 @@ pub fn encode_metric(metric: &Metric, buffer: &mut Vec<u8>) {
         buffer,
     );
     wire::encode_length_delimited(metric.name.as_bytes(), buffer);
+
+    if let Some(alias) = metric.alias {
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_ALIAS,
+                wire_type: WireType::Varint,
+            },
+            buffer,
+        );
+        wire::encode_varint(alias, buffer);
+    }
 
     wire::encode_tag(
         Tag {
@@ -144,6 +159,7 @@ pub fn encode_metric(metric: &Metric, buffer: &mut Vec<u8>) {
 /// still parse the fields this crate does care about.
 pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
     let mut name: Option<String> = None;
+    let mut alias: Option<u64> = None;
     let mut data_type: Option<DataType> = None;
     let mut value: Option<MetricValue> = None;
 
@@ -156,6 +172,11 @@ pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
             FIELD_NAME => {
                 let (field_bytes, consumed) = wire::decode_length_delimited(&bytes[offset..])?;
                 name = Some(String::from_utf8_lossy(field_bytes).into_owned());
+                offset += consumed;
+            }
+            FIELD_ALIAS => {
+                let (value, consumed) = wire::decode_varint(&bytes[offset..])?;
+                alias = Some(value);
                 offset += consumed;
             }
             FIELD_DATATYPE => {
@@ -213,6 +234,7 @@ pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
 
     Ok(Metric {
         name: name.ok_or(DecodeError::MissingName)?,
+        alias,
         data_type: data_type.ok_or(DecodeError::MissingDataType)?,
         value: value.ok_or(DecodeError::MissingValue)?,
     })
@@ -232,8 +254,19 @@ mod tests {
     fn round_trips_int_value() {
         round_trip(Metric {
             name: "Status_Flags".to_string(),
+            alias: None,
             data_type: DataType::UInt8,
             value: MetricValue::Int(42),
+        });
+    }
+
+    #[test]
+    fn round_trips_with_an_alias_present() {
+        round_trip(Metric {
+            name: "Tank_Temperature".to_string(),
+            alias: Some(7),
+            data_type: DataType::UInt16,
+            value: MetricValue::Int(21),
         });
     }
 
@@ -241,6 +274,7 @@ mod tests {
     fn round_trips_long_value() {
         round_trip(Metric {
             name: "bdSeq".to_string(),
+            alias: None,
             data_type: DataType::UInt64,
             value: MetricValue::Long(7),
         });
@@ -250,6 +284,7 @@ mod tests {
     fn round_trips_float_value() {
         round_trip(Metric {
             name: "Frequency".to_string(),
+            alias: None,
             data_type: DataType::Float,
             value: MetricValue::Float(50.05),
         });
@@ -259,6 +294,7 @@ mod tests {
     fn round_trips_double_value() {
         round_trip(Metric {
             name: "Flow_Rate".to_string(),
+            alias: None,
             data_type: DataType::Double,
             value: MetricValue::Double(12.345_678_9),
         });
@@ -268,6 +304,7 @@ mod tests {
     fn round_trips_boolean_value() {
         round_trip(Metric {
             name: "Motor_Running".to_string(),
+            alias: None,
             data_type: DataType::Boolean,
             value: MetricValue::Boolean(true),
         });
@@ -277,6 +314,7 @@ mod tests {
     fn round_trips_string_value() {
         round_trip(Metric {
             name: "server-id".to_string(),
+            alias: None,
             data_type: DataType::String,
             value: MetricValue::String("pump-a-plc".to_string()),
         });
@@ -286,6 +324,7 @@ mod tests {
     fn round_trips_bytes_value() {
         round_trip(Metric {
             name: "file-record".to_string(),
+            alias: None,
             data_type: DataType::Bytes,
             value: MetricValue::Bytes(vec![0x0D, 0xFE, 0x00, 0x20]),
         });
@@ -295,6 +334,7 @@ mod tests {
     fn decode_rejects_missing_name() {
         let metric = Metric {
             name: String::new(),
+            alias: None,
             data_type: DataType::Boolean,
             value: MetricValue::Boolean(true),
         };
@@ -325,10 +365,10 @@ mod tests {
     #[test]
     fn decode_skips_unknown_field_and_still_parses_known_ones() {
         let mut buffer = Vec::new();
-        // An unmodeled field: alias (field 2), varint wire type.
+        // An unmodeled field: timestamp (field 3), varint wire type.
         wire::encode_tag(
             Tag {
-                field_number: 2,
+                field_number: 3,
                 wire_type: WireType::Varint,
             },
             &mut buffer,
@@ -337,6 +377,7 @@ mod tests {
 
         let metric = Metric {
             name: "Tank_Temperature".to_string(),
+            alias: None,
             data_type: DataType::UInt16,
             value: MetricValue::Int(21),
         };

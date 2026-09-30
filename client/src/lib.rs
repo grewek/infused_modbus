@@ -5,5 +5,7 @@ pub mod device_identification;
 pub mod edge_node;
 pub mod polling;
 pub mod reconnect;
+pub mod sparkplug_alias;
+pub mod sparkplug_translator;
 pub mod transaction_consumer;
 pub mod write_confirmation;

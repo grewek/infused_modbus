@@ -77,6 +77,29 @@ impl fmt::Display for RegisterValue {
     }
 }
 
+// Zero (or 0.0) for every DataType — what an unset register reads back as,
+// same meaning "no value staged/confirmed yet" as U16's old bare `0` did.
+// Moved here from server::handler (M5 of the MQTT/Sparkplug design) once
+// client::sparkplug_translator needed the exact same "unset register renders
+// as a typed zero" behavior for building DBIRTH payloads — a second concrete
+// consumer, per this project's Extraction-Based Programming convention.
+pub fn default_register_value(data_type: DataType) -> RegisterValue {
+    match data_type {
+        DataType::U8 => RegisterValue::U8(0),
+        DataType::I8 => RegisterValue::I8(0),
+        DataType::U16 => RegisterValue::U16(0),
+        DataType::I16 => RegisterValue::I16(0),
+        DataType::U24 => RegisterValue::U24(0),
+        DataType::I24 => RegisterValue::I24(0),
+        DataType::U32 => RegisterValue::U32(0),
+        DataType::I32 => RegisterValue::I32(0),
+        DataType::U64 => RegisterValue::U64(0),
+        DataType::I64 => RegisterValue::I64(0),
+        DataType::F32 => RegisterValue::F32(0.0),
+        DataType::F64 => RegisterValue::F64(0.0),
+    }
+}
+
 // The shared state between protocol I/O (which updates values from what a
 // real device reports) and the FUSE layer (which reads/writes them by name).
 // Not thread-safe on its own — how it gets wrapped for concurrent access

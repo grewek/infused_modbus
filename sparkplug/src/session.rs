@@ -14,6 +14,7 @@ const BD_SEQ_METRIC_NAME: &str = "bdSeq";
 fn bd_seq_metric(bd_seq: u64) -> Metric {
     Metric {
         name: BD_SEQ_METRIC_NAME.to_string(),
+        alias: None,
         data_type: DataType::UInt64,
         value: MetricValue::Long(bd_seq),
     }
@@ -65,6 +66,7 @@ mod tests {
             payload.metrics,
             vec![Metric {
                 name: "bdSeq".to_string(),
+                alias: None,
                 data_type: DataType::UInt64,
                 value: MetricValue::Long(7),
             }]
@@ -81,6 +83,7 @@ mod tests {
             payload.metrics,
             vec![Metric {
                 name: "bdSeq".to_string(),
+                alias: None,
                 data_type: DataType::UInt64,
                 value: MetricValue::Long(7),
             }]

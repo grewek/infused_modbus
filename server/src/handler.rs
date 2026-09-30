@@ -34,10 +34,10 @@ use crate::server_options::ServerOptions;
 use datafs::register_encoding::{register_value_from_words, register_value_to_words};
 use datafs::{
     CoilStore, CoilValue, DiscreteInputStore, FileRecordStore, InputRegisterStore, RegisterStore,
-    RegisterValue,
+    RegisterValue, default_register_value,
 };
 use protocol::device_description::{
-    AccessRight, CoilDescription, DataType, DiscreteInputDescription, FileRecordDescription,
+    AccessRight, CoilDescription, DiscreteInputDescription, FileRecordDescription,
     InputRegisterDescription, MemLayout, RegisterDescription,
 };
 use protocol::pdu::{
@@ -364,24 +364,9 @@ fn handle_write_file_record(
     )
 }
 
-// Zero (or 0.0) for every DataType — what an unset register reads back as,
-// same meaning "no value staged/confirmed yet" as U16's old bare `0` did.
-fn default_register_value(data_type: DataType) -> RegisterValue {
-    match data_type {
-        DataType::U8 => RegisterValue::U8(0),
-        DataType::I8 => RegisterValue::I8(0),
-        DataType::U16 => RegisterValue::U16(0),
-        DataType::I16 => RegisterValue::I16(0),
-        DataType::U24 => RegisterValue::U24(0),
-        DataType::I24 => RegisterValue::I24(0),
-        DataType::U32 => RegisterValue::U32(0),
-        DataType::I32 => RegisterValue::I32(0),
-        DataType::U64 => RegisterValue::U64(0),
-        DataType::I64 => RegisterValue::I64(0),
-        DataType::F32 => RegisterValue::F32(0.0),
-        DataType::F64 => RegisterValue::F64(0.0),
-    }
-}
+// default_register_value moved to datafs (M5 of the MQTT/Sparkplug design)
+// once client::sparkplug_translator needed the same behavior — see its own
+// doc comment there. Imported at the top of this file now.
 
 fn handle_read(
     pdu: &[u8],
@@ -969,6 +954,7 @@ fn handle_write_multiple_coils(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::device_description::DataType;
     use protocol::pdu::{FileRecordSubRequest, WriteFileRecordSubRequest};
 
     const TEST_UNIT_ID: u8 = 0x01;
