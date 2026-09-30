@@ -35,7 +35,8 @@ Nothing here shipped without a human decision behind it, but essentially all of 
 - **A `transactions/<name>` file can stage a Mask Write Register instead of a plain value**, atomically setting/clearing specific bits in a real device's register without needing to know its current contents first — client-only, see [Interacting with the filesystem](#interacting-with-the-filesystem).
 - **Client TLS certificates require server-side approval.** Over `tls+tcp://`, the server requires every connecting client to present a certificate, and only ones an operator has explicitly approved are allowed through — via a local admin channel kept separate from the FUSE mount itself, not through the filesystem. Approvals are persisted to disk, bounded by an optional `--max-clients` limit, and revoking one immediately disconnects it if it's already connected, not just future attempts. See [Connecting over TLS](#connecting-over-tls).
 - **Directory permissions are configurable.** An optional `fuse-permissions.toml` sets `mode`/`uid`/`gid` per top-level directory, enforced by the kernel (`fuse` layer) or via real `chmod`/`chown` (`files` layer) rather than just displayed — see [Directory permissions](#directory-permissions).
-- **Two interchangeable data-representation layers.** `--data-representation-layer files` (the default) exposes the exact same directory tree as plain files on disk, kept current via `inotify` and atomic `rename()` — no FUSE driver involved at all. `--data-representation-layer fuse` mounts it as a synthetic FUSE filesystem instead, this project's original mechanism. Every path/command in this README works identically under either — see `CLAUDE.md`'s "Pluggable data-representation layer" section for the full design rationale.
+- **Three interchangeable data-representation layers.** `--data-representation-layer files` (the default) exposes the exact same directory tree as plain files on disk, kept current via `inotify` and atomic `rename()` — no FUSE driver involved at all. `--data-representation-layer fuse` mounts it as a synthetic FUSE filesystem instead, this project's original mechanism. `--data-representation-layer mqtt` replaces the filesystem entirely with an MQTT/Sparkplug B interface — see [MQTT (Sparkplug B) layer](#mqtt-sparkplug-b-layer) below. `fuse`/`files` present the identical directory shape and every path/command in this README involving them works identically under either — see `CLAUDE.md`'s "Pluggable data-representation layer" section for the full design rationale.
+- **MQTT (Sparkplug B) layer, as an alternative to the filesystem.** `client` can embed its own MQTT broker and expose every machine's data as a Sparkplug B Edge Node/Device instead of building a `fuse`/`files` tree — a host application (Node-RED, an MES, a SCADA system) subscribes to it directly rather than reading files. Values change on `DDATA`, a write is a `DCMD`, and a `Node Control/Rebirth` request gets a fresh `NBIRTH`/`DBIRTH`. On `server`, the same layer replaces the filesystem with a small local Unix-socket daemon (`ServerHandle`) that a separate local process can use to read/update the server's own dataset directly — independent of, and not connected to, the client's MQTT side. See [MQTT (Sparkplug B) layer](#mqtt-sparkplug-b-layer) below.
 - **`client` reconnects automatically if the connection breaks.** A dedicated background task notices (via the polling loop, which runs continuously regardless of write activity) and redials with exponential backoff (1s, 2s, 4s, ... capped at 30s), retrying forever — no manual restart needed after a server restart, network blip, or unplugged serial adapter. Polling keeps logging failed attempts in the meantime rather than blocking; writes staged while disconnected simply report `FAILED` via `report/<name>` until the connection heals.
 - **One device description can describe several machines sharing one link.** A TOML file's `[[machines]]` array describes multiple devices — e.g. several PLCs on one RTU multi-drop bus, or several TCP targets — each dispatched by its own Modbus Unit ID and mounted under its own top-level FUSE directory (`/PumpA/holding-registers/`, `/PumpB/holding-registers/`, ...). `client` mounts every machine in its device description by default; `server` answers each machine's own Unit ID and stays silent for any Unit ID it wasn't told about, matching how a real unaddressed device on an RTU bus behaves. See [Device description TOML format](#device-description-toml-format).
 
@@ -105,7 +106,7 @@ Requires Linux (both `libfuse`, for the `fuse` representation layer, and `inotif
 ### Run the server
 
 ```sh
-cargo run -p server -- <root> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>] [--server-options <server-options.toml>] [--data-representation-layer fuse|files]
+cargo run -p server -- <root> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>] [--server-options <server-options.toml>] [--data-representation-layer fuse|files|mqtt]
 ```
 
 `<connection>` is one of:
@@ -114,7 +115,7 @@ cargo run -p server -- <root> <device-description.toml> <connection> [--fuse-per
 - `rtu://<serial-path>:<baud-rate>` — e.g. `rtu:///dev/ttyUSB0:9600`
 - `tls+tcp://<bind-address:port>` — see [Connecting over TLS](#connecting-over-tls) below.
 
-`--data-representation-layer` picks how `<root>` exposes the data: `files` (the **default**) writes real files under `<root>`, kept current via `inotify` and atomic `rename()` — no FUSE mount at all; `fuse` mounts `<root>` as a synthetic FUSE filesystem, this project's original mechanism. Both present the identical directory shape described in [Interacting with the filesystem](#interacting-with-the-filesystem) below — pick whichever fits your deployment, see `CLAUDE.md`'s "Pluggable data-representation layer" section for the full design rationale.
+`--data-representation-layer` picks how `<root>` exposes the data: `files` (the **default**) writes real files under `<root>`, kept current via `inotify` and atomic `rename()` — no FUSE mount at all; `fuse` mounts `<root>` as a synthetic FUSE filesystem, this project's original mechanism; `mqtt` ignores `<root>` entirely and serves a local socket instead — see [MQTT (Sparkplug B) layer](#mqtt-sparkplug-b-layer) below. `fuse`/`files` present the identical directory shape described in [Interacting with the filesystem](#interacting-with-the-filesystem) below — pick whichever fits your deployment, see `CLAUDE.md`'s "Pluggable data-representation layer" section for the full design rationale.
 
 `--fuse-permissions` is optional — see [Directory permissions](#directory-permissions). `--max-clients` is also optional (`tls+tcp://` only) and bounds how many client certificates can be approved at once — without it, there is no limit.
 
@@ -145,10 +146,10 @@ cargo run -p server -- admin list
 ### Run the client
 
 ```sh
-cargo run -p client -- <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files]
+cargo run -p client -- <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--mqtt-broker-config <path.toml>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>]
 ```
 
-`<connection>` uses the same `tcp://`/`rtu://`/`tls+tcp://` scheme as the server. `<device-description.toml>` is required as a fallback, but if the server it connects to supports FC 43 (see below), the client uses the server's own description instead. `--data-representation-layer` (default `files`) and `--fuse-permissions` (see [Directory permissions](#directory-permissions)) work identically to the server's own flags of the same name. `client` mounts/writes **every** machine described in the effective device description — see [Device description TOML format](#device-description-toml-format) — each under its own top-level directory.
+`<connection>` uses the same `tcp://`/`rtu://`/`tls+tcp://` scheme as the server. `<device-description.toml>` is required as a fallback, but if the server it connects to supports FC 43 (see below), the client uses the server's own description instead. `--data-representation-layer` (default `files`) and `--fuse-permissions` (see [Directory permissions](#directory-permissions)) work identically to the server's own flags of the same name; `<root>` is ignored under `mqtt`. The `--mqtt-*` flags only apply under `--data-representation-layer mqtt` — see [MQTT (Sparkplug B) layer](#mqtt-sparkplug-b-layer) below. `client` mounts/writes **every** machine described in the effective device description — see [Device description TOML format](#device-description-toml-format) — each under its own top-level directory (`fuse`/`files`) or as its own Sparkplug B Device (`mqtt`).
 
 `[unit-id]` is **only** used to address the initial FC 43 device-identification handshake — it's how the client asks *some* device on the link to introduce itself before it knows which Unit IDs are valid at all. Once the (possibly multi-machine) device description is known, each machine dispatches its own actual register/coil/etc. traffic via its own TOML-declared `unit_id`, not this CLI one. Defaults to `1` if omitted.
 
@@ -158,6 +159,32 @@ Example:
 mkdir -p /tmp/modbus-client
 cargo run -p client -- /tmp/modbus-client device.toml tcp://127.0.0.1:502 1 1000
 ```
+
+### MQTT (Sparkplug B) layer
+
+`--data-representation-layer mqtt` replaces the filesystem (`fuse`/`files`) with an MQTT interface using the [Sparkplug B](https://sparkplug.eclipse.org/) topic/payload conventions. The `client`↔`server` link itself is unchanged — still real Modbus over whatever `<connection>` was given; only how the data is presented to the outside world differs.
+
+**On `client`:** an MQTT broker is embedded directly in the process (no separate broker to run) and `client` connects to it as a Sparkplug B **Edge Node**, with each configured machine published as its own **Device** under that Edge Node:
+
+```sh
+cargo run -p client -- ignored device.toml tcp://127.0.0.1:502 --data-representation-layer mqtt --mqtt-group-id MyPlant --mqtt-edge-node-id Line1
+```
+
+- `NBIRTH`/`DBIRTH` are published once at startup (and again on a `Node Control/Rebirth` request) with every register/coil/discrete-input/input-register/file-record as a metric.
+- `NDATA`/`DDATA` publish only the metrics that actually changed since the last publish, checked on the same interval as `[poll-interval-ms]`.
+- `DCMD` is the write path — a metric write addressed to a Device is resolved against that machine's registers/coils/file-records (identified by alias once birth has established it, or by name) and applied over real Modbus, the same way a staged `transactions/` write would be. Discrete inputs and input registers stay read-only, since no Modbus function code lets a master write either.
+- `--mqtt-broker-config <path.toml>` overrides the embedded broker's tuning (`listen_address`, `max_connections`, `max_payload_size`, `connection_timeout_ms`, `max_inflight_count`, `max_segment_size`, `max_segment_count`) — every field is optional, unset ones keep their default.
+- `--mqtt-group-id`/`--mqtt-edge-node-id` set this Edge Node's Sparkplug identity (defaults: `infused_modbus`/`client`) — **override `--mqtt-edge-node-id`** if more than one `client` instance connects to the same broker/host application, since it must be unique.
+- `<root>` is ignored — there's no directory to mount or write to.
+
+**On `server`:** the filesystem is replaced by a local Unix domain socket (`server-data.sock`, created next to wherever the process was started) speaking a small line protocol — `SET <machine> <point> <value>` / `GET <machine> <point>`, e.g.:
+
+```sh
+echo "SET PumpA Tank_Temperature 55" | socat - UNIX-CONNECT:server-data.sock
+echo "GET PumpA Tank_Temperature" | socat - UNIX-CONNECT:server-data.sock
+```
+
+This is the server-side equivalent of `holding-registers/<name>` being directly writable under `fuse`/`files` — the socket enforces the same validation (unknown point, read-only point, or a value that doesn't parse for that point's type all come back as `ERROR ...`) and applies successful writes straight to the same in-memory state an external Modbus master reads/writes. It is independent of, and never talks to, the client's MQTT side — a technician wiring up an external system to feed the server's own dataset (rather than reading it back out over Modbus) uses this socket directly, or a future host-process integration built on the same underlying `ServerHandle` library.
 
 ### Connecting over TLS
 
@@ -446,7 +473,7 @@ record_length = 9
 
 ## Directory permissions
 
-By default every top-level directory (`holding-registers/`, `transactions/`, `report/`, `coils/`) is mode `0755`, owned by whoever made a given filesystem request (`fuse` layer) or by the process's own real user (`files` layer) — the same behavior as before this option existed. An optional `fuse-permissions.toml`, passed to either binary via `--fuse-permissions <path>` (see [Getting started](#getting-started)) and applying identically regardless of which `--data-representation-layer` is active, overrides `mode`/`uid`/`gid` per directory. Every field, and every directory section, is optional — only what actually needs restricting has to be spelled out:
+By default every top-level directory (`holding-registers/`, `transactions/`, `report/`, `coils/`) is mode `0755`, owned by whoever made a given filesystem request (`fuse` layer) or by the process's own real user (`files` layer) — the same behavior as before this option existed. An optional `fuse-permissions.toml`, passed to either binary via `--fuse-permissions <path>` (see [Getting started](#getting-started)) and applying identically under `fuse`/`files`, overrides `mode`/`uid`/`gid` per directory. Every field, and every directory section, is optional — only what actually needs restricting has to be spelled out. `--data-representation-layer mqtt` has no directories at all, so `--fuse-permissions` is accepted but ignored under it — its socket file (`server-data.sock`) is always mode `0600`, not configurable:
 
 ```toml
 [transactions]
@@ -504,6 +531,7 @@ This project is under active development. As of now:
 - RTU serial parameters beyond baud rate (data bits, parity, stop bits) aren't configurable yet; fixed defaults (8 data bits, no parity, 1 stop bit) are used.
 - `tls+tcp://`'s admin socket path, TLS identity directories, `approved-clients.toml`'s own path, and DoS-hardening limits (handshake timeout, connection caps — see [Connecting over TLS](#connecting-over-tls)) are all fixed constants, not yet configurable via a CLI flag. Protection against a flood from many different source addresses is explicitly out of scope for the application layer itself. RTU's serial link remains a separate, unauthenticated threat model that TLS does nothing to address.
 - `client` always mounts **every** machine in its device description — there's no way yet to mount only a subset (e.g. a `--machines PumpA,PumpB` allowlist), though this is a planned follow-up.
+- The MQTT/Sparkplug B layer has not been run against the official Sparkplug TCK (Technology Compatibility Kit) yet, so conformance beyond this project's own tests/manual verification is unverified. `server-data.sock`'s path, and the embedded broker's non-tuning defaults, are fixed constants, not yet CLI-configurable.
 
 ## Development
 
