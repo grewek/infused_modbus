@@ -146,7 +146,7 @@ cargo run -p server -- admin list
 ### Run the client
 
 ```sh
-cargo run -p client -- <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--mqtt-broker-config <path.toml>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>]
+cargo run -p client -- <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--mqtt-broker-config <path.toml>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>] [--mqtt-external-broker <host:port>]
 ```
 
 `<connection>` uses the same `tcp://`/`rtu://`/`tls+tcp://` scheme as the server. `<device-description.toml>` is required as a fallback, but if the server it connects to supports FC 43 (see below), the client uses the server's own description instead. `--data-representation-layer` (default `files`) and `--fuse-permissions` (see [Directory permissions](#directory-permissions)) work identically to the server's own flags of the same name; `<root>` is ignored under `mqtt`. The `--mqtt-*` flags only apply under `--data-representation-layer mqtt` — see [MQTT (Sparkplug B) layer](#mqtt-sparkplug-b-layer) below. `client` mounts/writes **every** machine described in the effective device description — see [Device description TOML format](#device-description-toml-format) — each under its own top-level directory (`fuse`/`files`) or as its own Sparkplug B Device (`mqtt`).
@@ -175,7 +175,9 @@ cargo run -p client -- ignored device.toml tcp://127.0.0.1:502 --data-representa
 - `DCMD` is the write path — a metric write addressed to a Device is resolved against that machine's registers/coils/file-records (identified by alias once birth has established it, or by name) and applied over real Modbus, the same way a staged `transactions/` write would be. Discrete inputs and input registers stay read-only, since no Modbus function code lets a master write either.
 - `--mqtt-broker-config <path.toml>` overrides the embedded broker's tuning (`listen_address`, `max_connections`, `max_payload_size`, `connection_timeout_ms`, `max_inflight_count`, `max_segment_size`, `max_segment_count`) — every field is optional, unset ones keep their default.
 - `--mqtt-group-id`/`--mqtt-edge-node-id` set this Edge Node's Sparkplug identity (defaults: `infused_modbus`/`client`) — **override `--mqtt-edge-node-id`** if more than one `client` instance connects to the same broker/host application, since it must be unique.
+- `--mqtt-external-broker <host:port>` connects to an already-running broker instead of starting the embedded one (`--mqtt-broker-config` is then ignored) — for targeting an external broker, e.g. a real Sparkplug conformance test kit's own instance.
 - `<root>` is ignored — there's no directory to mount or write to.
+- `bdSeq` (the Sparkplug session identifier distinguishing one connection from the next) is persisted across restarts in a small file, `client-mqtt-bdseq`, next to wherever `client` was started — this is required for spec conformance (a Host Application needs to tell a genuinely new session apart from a late-arriving death notice from an old one), not just an implementation detail.
 
 **On `server`:** the filesystem is replaced by a local Unix domain socket (`server-data.sock`, created next to wherever the process was started) speaking a small line protocol — `SET <machine> <point> <value>` / `GET <machine> <point>`, e.g.:
 
@@ -531,7 +533,7 @@ This project is under active development. As of now:
 - RTU serial parameters beyond baud rate (data bits, parity, stop bits) aren't configurable yet; fixed defaults (8 data bits, no parity, 1 stop bit) are used.
 - `tls+tcp://`'s admin socket path, TLS identity directories, `approved-clients.toml`'s own path, and DoS-hardening limits (handshake timeout, connection caps — see [Connecting over TLS](#connecting-over-tls)) are all fixed constants, not yet configurable via a CLI flag. Protection against a flood from many different source addresses is explicitly out of scope for the application layer itself. RTU's serial link remains a separate, unauthenticated threat model that TLS does nothing to address.
 - `client` always mounts **every** machine in its device description — there's no way yet to mount only a subset (e.g. a `--machines PumpA,PumpB` allowlist), though this is a planned follow-up.
-- The MQTT/Sparkplug B layer has not been run against the official Sparkplug TCK (Technology Compatibility Kit) yet, so conformance beyond this project's own tests/manual verification is unverified. `server-data.sock`'s path, and the embedded broker's non-tuning defaults, are fixed constants, not yet CLI-configurable.
+- The MQTT/Sparkplug B layer has been run against the official Sparkplug TCK (Technology Compatibility Kit) once, which caught and led to a fix for one real conformance bug (`bdSeq` not persisting across restarts — see `CLAUDE.md`'s MQTT section for details); a full, formally-reported conformance run has not been completed yet. `server-data.sock`'s path, and the embedded broker's non-tuning defaults, are fixed constants, not yet CLI-configurable.
 
 ## Development
 
