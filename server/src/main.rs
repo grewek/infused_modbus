@@ -86,6 +86,9 @@ const MAX_CONNECTIONS_PER_FINGERPRINT: usize = 5;
 const TLS_IDENTITY_DIRECTORY: &str = "server-tls-identity";
 const ADMIN_SOCKET_PATH: &str = "server-admin.sock";
 const APPROVED_CLIENTS_PATH: &str = "approved-clients.toml";
+// `--data-representation-layer mqtt` only — same "fixed, not yet
+// CLI-configurable" precedent as ADMIN_SOCKET_PATH above.
+const DATA_SOCKET_PATH: &str = "server-data.sock";
 
 fn usage() -> ! {
     eprintln!(
@@ -98,8 +101,11 @@ fn usage() -> ! {
          --server-options explicitly enables function codes this server will answer — \
          without it (or with an empty file), every function code is disabled and every \
          request gets ILLEGAL_FUNCTION.\n\
-         --data-representation-layer picks fuse (a synthetic FUSE mount) or files \
-         (real files, the default) — see CLAUDE.md's \"Planned: pluggable data-representation layer\".\n\
+         --data-representation-layer picks fuse (a synthetic FUSE mount), files \
+         (real files, the default), or mqtt (no filesystem at all — a local Unix socket, \
+         server-data.sock, speaking ServerHandle's SET/GET line protocol; see CLAUDE.md's \
+         \"Option C\" design). <root> is ignored under mqtt, which has nothing to mount or \
+         write to disk.\n\
          \n\
          Usage: server admin approve|revoke <fingerprint>\n\
          Usage: server admin list"
@@ -122,16 +128,17 @@ fn extract_representation_layer(args: &mut Vec<String>) -> RepresentationLayer {
         return RepresentationLayer::Files;
     };
     if flag_index + 1 >= args.len() {
-        panic!("--data-representation-layer requires a value (fuse or files)");
+        panic!("--data-representation-layer requires a value (fuse, files, or mqtt)");
     }
     args.remove(flag_index);
     let value = args.remove(flag_index);
     match value.as_str() {
         "fuse" => RepresentationLayer::Fuse,
         "files" => RepresentationLayer::Files,
-        other => {
-            panic!("invalid --data-representation-layer value {other:?}: expected fuse or files")
-        }
+        "mqtt" => RepresentationLayer::Mqtt,
+        other => panic!(
+            "invalid --data-representation-layer value {other:?}: expected fuse, files, or mqtt"
+        ),
     }
 }
 
@@ -139,6 +146,7 @@ fn extract_representation_layer(args: &mut Vec<String>) -> RepresentationLayer {
 enum RepresentationLayer {
     Fuse,
     Files,
+    Mqtt,
 }
 
 /// Pulls `--fuse-permissions <path>` out of `args` if present
@@ -625,16 +633,19 @@ fn main() {
         live_connections,
     );
 
-    std::fs::create_dir_all(&root).ok();
     let machine_names: Vec<&str> = description
         .machines
         .iter()
         .map(|machine| machine.name.as_str())
         .collect();
     println!(
-        "Mounting infused_modbus server ({representation_layer:?}) at {root}, serving via {connection_string} — machines: {}",
+        "Starting infused_modbus server ({representation_layer:?}), serving via {connection_string} — machines: {}",
         machine_names.join(", ")
     );
+    if representation_layer != RepresentationLayer::Mqtt {
+        std::fs::create_dir_all(&root).ok();
+        println!("Data root: {root}");
+    }
 
     match representation_layer {
         RepresentationLayer::Fuse => {
@@ -753,6 +764,36 @@ fn main() {
             // does, so this has to remove it explicitly.
             std::fs::remove_dir_all(&root)
                 .unwrap_or_else(|error| eprintln!("warning: failed to clean up {root}: {error}"));
+        }
+        RepresentationLayer::Mqtt => {
+            // The "Option C" design from CLAUDE.md's MQTT/Sparkplug B
+            // section: no filesystem tree at all, just ServerHandle behind
+            // a local Unix socket — see server::server_handle/data_daemon.
+            // Reads the same machine_stores every other layer would have
+            // (and the wire-facing Modbus handler in handler.rs already
+            // always writes into, regardless of representation layer), so
+            // an external Modbus master's write and a SET over this socket
+            // are always looking at the same data.
+            let server_handle = Arc::new(server::server_handle::ServerHandle::new(
+                &description.machines,
+                &machine_stores,
+            ));
+            runtime.spawn({
+                let server_handle = Arc::clone(&server_handle);
+                async move {
+                    if let Err(error) = server::data_daemon::run_data_socket(
+                        Path::new(DATA_SOCKET_PATH),
+                        server_handle,
+                    )
+                    .await
+                    {
+                        eprintln!("data socket at {DATA_SOCKET_PATH} failed: {error}");
+                    }
+                }
+            });
+            println!("Data socket listening at {DATA_SOCKET_PATH}");
+
+            wait_for_shutdown_signal(&runtime);
         }
     }
 }
