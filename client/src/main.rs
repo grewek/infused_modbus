@@ -64,10 +64,16 @@
 // stop bits) aren't configurable yet — this uses tokio-serial's defaults (8
 // data bits, no parity, 1 stop bit).
 
+use client::broker::BrokerConfig;
 use client::connection::Connection;
 use client::device_identification::fetch_device_description;
+use client::edge_node::connect_edge_node;
 use client::polling::run_polling_loop;
 use client::reconnect::{ReconnectSignal, run_reconnect_loop};
+use client::sparkplug_alias::AliasAllocator;
+use client::sparkplug_change_tracker::ChangeTracker;
+use client::sparkplug_command::{run_dcmd_forwarder, run_rebirth_handler};
+use client::sparkplug_translator::build_machine_metrics;
 use client::transaction_consumer::{MachineTransactionConfig, run_transaction_consumer};
 use datafs::filesystem::{InfusedFilesystem, WriteMode};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
@@ -84,22 +90,48 @@ const CLIENT_TLS_IDENTITY_DIRECTORY: &str = "client-tls-identity";
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEVICE_DESCRIPTION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+// A technician deploying more than one `client` instance against the same
+// broker/host application must override this — left as a plain, obviously-
+// generic default rather than something that looks unique (e.g. a random
+// suffix), so it's not mistaken for something already made unique for them.
+const DEFAULT_MQTT_GROUP_ID: &str = "infused_modbus";
+const DEFAULT_MQTT_EDGE_NODE_ID: &str = "client";
+// How long to wait after starting the embedded broker before connecting to
+// it as the Edge Node's own loopback client — `start_embedded_broker`
+// returns as soon as the listener thread is spawned, not once it's actually
+// accepting connections (see client::broker's own doc comment), so without
+// this the very first connection attempt can race a broker that isn't
+// listening yet. Mirrors the same wait every `client::edge_node`/
+// `client::sparkplug_command` test already uses against a freshly started
+// embedded broker.
+const BROKER_STARTUP_GRACE_PERIOD: Duration = Duration::from_millis(300);
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: client <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files]\n\
+        "Usage: client <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--mqtt-broker-config <path.toml>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>]\n\
          <connection> is tcp://<address:port>, tls+tcp://<address:port>, or rtu://<serial-path>:<baud-rate>\n\
          --expect-server-fingerprint pins the server's TLS identity (tls+tcp:// only) — \
          without it, the server's identity is not verified at all (see CLAUDE.md's TLS design).\n\
          --fuse-permissions sets custom mode/uid/gid per top-level directory — \
-         without it, every directory keeps its historical hardcoded behavior.\n\
-         --data-representation-layer picks fuse (a synthetic FUSE mount) or files \
-         (real files, the default) — see CLAUDE.md's \"Planned: pluggable data-representation layer\"."
+         without it, every directory keeps its historical hardcoded behavior. Ignored under \
+         --data-representation-layer mqtt, which has no directories to permission.\n\
+         --data-representation-layer picks fuse (a synthetic FUSE mount), files \
+         (real files, the default), or mqtt (a Sparkplug B Edge Node over an embedded MQTT \
+         broker — see CLAUDE.md's \"Planned: MQTT (Sparkplug B) representation layer\"). \
+         <root> is ignored under mqtt, which has nothing to mount/write to disk.\n\
+         --mqtt-broker-config sets the embedded broker's tuning (listen address, connection \
+         limits, ...) — without it, every setting keeps client::broker::BrokerConfig's own \
+         defaults. mqtt layer only.\n\
+         --mqtt-group-id/--mqtt-edge-node-id set this Edge Node's Sparkplug B identity \
+         (defaults: {DEFAULT_MQTT_GROUP_ID:?}/{DEFAULT_MQTT_EDGE_NODE_ID:?} — override \
+         --mqtt-edge-node-id for any deployment running more than one client instance against \
+         the same broker/host application, since it must be unique per Edge Node). mqtt layer \
+         only."
     );
     std::process::exit(1);
 }
 
-/// Pulls `--data-representation-layer <fuse|files>` out of `args` if
+/// Pulls `--data-representation-layer <fuse|files|mqtt>` out of `args` if
 /// present (order-independent, same shape as `--fuse-permissions`), leaving
 /// the rest of `args` untouched. Absent entirely, defaults to `Files` — a
 /// deliberate breaking change to this project's original all-FUSE default,
@@ -113,16 +145,17 @@ fn extract_representation_layer(args: &mut Vec<String>) -> RepresentationLayer {
         return RepresentationLayer::Files;
     };
     if flag_index + 1 >= args.len() {
-        panic!("--data-representation-layer requires a value (fuse or files)");
+        panic!("--data-representation-layer requires a value (fuse, files, or mqtt)");
     }
     args.remove(flag_index);
     let value = args.remove(flag_index);
     match value.as_str() {
         "fuse" => RepresentationLayer::Fuse,
         "files" => RepresentationLayer::Files,
-        other => {
-            panic!("invalid --data-representation-layer value {other:?}: expected fuse or files")
-        }
+        "mqtt" => RepresentationLayer::Mqtt,
+        other => panic!(
+            "invalid --data-representation-layer value {other:?}: expected fuse, files, or mqtt"
+        ),
     }
 }
 
@@ -130,6 +163,40 @@ fn extract_representation_layer(args: &mut Vec<String>) -> RepresentationLayer {
 enum RepresentationLayer {
     Fuse,
     Files,
+    Mqtt,
+}
+
+/// Pulls `--mqtt-broker-config <path.toml>` out of `args` if present (same
+/// shape as `--fuse-permissions`), leaving the rest of `args` untouched.
+/// Absent entirely, every broker setting keeps `BrokerConfig::default()`.
+fn extract_mqtt_broker_config(args: &mut Vec<String>) -> BrokerConfig {
+    let Some(flag_index) = args.iter().position(|arg| arg == "--mqtt-broker-config") else {
+        return BrokerConfig::default();
+    };
+    if flag_index + 1 >= args.len() {
+        panic!("--mqtt-broker-config requires a path");
+    }
+    args.remove(flag_index);
+    let path = args.remove(flag_index);
+    let toml_source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
+    BrokerConfig::parse(&toml_source)
+        .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
+}
+
+/// Pulls a single-value flag (e.g. `--mqtt-group-id <id>`) out of `args` if
+/// present, leaving the rest of `args` untouched. Shared by
+/// `--mqtt-group-id`/`--mqtt-edge-node-id` — both are a bare required string
+/// with no parsing beyond "is it present at all".
+fn extract_string_flag(args: &mut Vec<String>, flag: &str, default: &str) -> String {
+    let Some(flag_index) = args.iter().position(|arg| arg == flag) else {
+        return default.to_string();
+    };
+    if flag_index + 1 >= args.len() {
+        panic!("{flag} requires a value");
+    }
+    args.remove(flag_index);
+    args.remove(flag_index)
 }
 
 /// Pulls `--expect-server-fingerprint <value>` out of `args` if present
@@ -208,6 +275,14 @@ fn main() {
     let expected_server_fingerprint = extract_expected_server_fingerprint(&mut raw_args);
     let fuse_permissions = extract_fuse_permissions(&mut raw_args);
     let representation_layer = extract_representation_layer(&mut raw_args);
+    let mqtt_broker_config = extract_mqtt_broker_config(&mut raw_args);
+    let mqtt_group_id =
+        extract_string_flag(&mut raw_args, "--mqtt-group-id", DEFAULT_MQTT_GROUP_ID);
+    let mqtt_edge_node_id = extract_string_flag(
+        &mut raw_args,
+        "--mqtt-edge-node-id",
+        DEFAULT_MQTT_EDGE_NODE_ID,
+    );
     let mut args = raw_args.into_iter();
     let Some(root) = args.next() else {
         usage();
@@ -379,16 +454,19 @@ fn main() {
         });
     }
 
-    std::fs::create_dir_all(&root).ok();
     let machine_names: Vec<&str> = description
         .machines
         .iter()
         .map(|machine| machine.name.as_str())
         .collect();
     println!(
-        "Mounting infused_modbus ({representation_layer:?}) at {root}, connected via {connection_string} — machines: {}",
+        "Starting infused_modbus ({representation_layer:?}), connected via {connection_string} — machines: {}",
         machine_names.join(", ")
     );
+    if representation_layer != RepresentationLayer::Mqtt {
+        std::fs::create_dir_all(&root).ok();
+        println!("Data root: {root}");
+    }
 
     match representation_layer {
         RepresentationLayer::Fuse => {
@@ -518,6 +596,121 @@ fn main() {
             // does, so this has to remove it explicitly.
             std::fs::remove_dir_all(&root)
                 .unwrap_or_else(|error| eprintln!("warning: failed to clean up {root}: {error}"));
+        }
+        RepresentationLayer::Mqtt => {
+            // The Edge Node always connects to its own embedded broker via
+            // loopback, regardless of what listen_address it was configured
+            // to bind (e.g. "0.0.0.0:1883" for external/network consumers) —
+            // only the port is shared between the two.
+            let broker_port: u16 = mqtt_broker_config
+                .listen_address
+                .rsplit(':')
+                .next()
+                .and_then(|port| port.parse().ok())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "invalid --mqtt-broker-config listen_address {:?}: expected host:port",
+                        mqtt_broker_config.listen_address
+                    )
+                });
+
+            client::broker::start_embedded_broker(mqtt_broker_config);
+            std::thread::sleep(BROKER_STARTUP_GRACE_PERIOD);
+
+            let edge_node = Arc::new(runtime.block_on(connect_edge_node(
+                "127.0.0.1",
+                broker_port,
+                &mqtt_group_id,
+                &mqtt_edge_node_id,
+            )));
+            println!(
+                "Sparkplug B Edge Node connected (group_id={mqtt_group_id:?}, edge_node_id={mqtt_edge_node_id:?}), broker listening on {}",
+                broker_port
+            );
+
+            let aliases = Arc::new(AliasAllocator::build(&description.machines));
+
+            runtime
+                .block_on(edge_node.subscribe_ncmd())
+                .unwrap_or_else(|error| panic!("failed to subscribe to NCMD: {error}"));
+
+            // Initial DBIRTH per machine. Each machine's ChangeTracker is
+            // seeded with this same metric list right away, so the first
+            // periodic tick below only republishes as DDATA whatever
+            // actually changed since birth, not everything all over again.
+            let mut change_trackers: HashMap<String, ChangeTracker> = HashMap::new();
+            for machine in &description.machines {
+                runtime
+                    .block_on(edge_node.subscribe_dcmd(&machine.name))
+                    .unwrap_or_else(|error| {
+                        panic!("failed to subscribe to DCMD for {}: {error}", machine.name)
+                    });
+
+                let stores = &machine_stores[&machine.name];
+                let metrics = build_machine_metrics(machine, stores, &aliases);
+                let mut tracker = ChangeTracker::new();
+                tracker.changed_metrics(&metrics);
+                change_trackers.insert(machine.name.clone(), tracker);
+
+                runtime
+                    .block_on(edge_node.publish_dbirth(&machine.name, metrics))
+                    .unwrap_or_else(|error| {
+                        panic!("failed to publish DBIRTH for {}: {error}", machine.name)
+                    });
+            }
+
+            // DCMD write path — forwards resolved writes into the exact
+            // same transaction_sender/transaction_consumer every other
+            // representation layer already uses.
+            {
+                let edge_node = Arc::clone(&edge_node);
+                let machines = description.machines.clone();
+                let aliases = Arc::clone(&aliases);
+                let transaction_sender = transaction_sender.clone();
+                runtime.spawn(async move {
+                    run_dcmd_forwarder(&edge_node, &machines, &aliases, &transaction_sender).await;
+                });
+            }
+
+            // Node Control/Rebirth handling.
+            {
+                let edge_node = Arc::clone(&edge_node);
+                let machines = description.machines.clone();
+                let stores_by_machine = machine_stores.clone();
+                let aliases = Arc::clone(&aliases);
+                runtime.spawn(async move {
+                    run_rebirth_handler(&edge_node, &machines, &stores_by_machine, &aliases).await;
+                });
+            }
+
+            // Periodic DDATA publishing per machine, tied to the same
+            // poll_interval the Modbus polling loop above already uses —
+            // there is no point checking for changes to publish faster than
+            // the stores themselves can actually change.
+            for machine in description.machines.clone() {
+                let edge_node = Arc::clone(&edge_node);
+                let stores = machine_stores[&machine.name].clone();
+                let aliases = Arc::clone(&aliases);
+                let mut tracker = change_trackers
+                    .remove(&machine.name)
+                    .expect("seeded above for every configured machine");
+                runtime.spawn(async move {
+                    let mut ticker = tokio::time::interval(poll_interval);
+                    loop {
+                        ticker.tick().await;
+                        let metrics = build_machine_metrics(&machine, &stores, &aliases);
+                        let changed = tracker.changed_metrics(&metrics);
+                        if changed.is_empty() {
+                            continue;
+                        }
+                        if let Err(error) = edge_node.publish_ddata(&machine.name, changed).await {
+                            eprintln!("failed to publish DDATA for {}: {error}", machine.name);
+                        }
+                    }
+                });
+            }
+
+            wait_for_shutdown_signal(&runtime);
         }
     }
 }

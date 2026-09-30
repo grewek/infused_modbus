@@ -17,6 +17,8 @@
 //! *this* module can leave a technician stuck once M9 wires it up.
 
 use rumqttd::{Broker, Config};
+use serde::Deserialize;
+use std::fmt;
 
 /// The subset of `rumqttd`'s configuration a technician needs to control.
 /// Every field here is something a real deployment could plausibly be
@@ -58,6 +60,62 @@ impl Default for BrokerConfig {
             max_segment_size: 104_857_600,
             max_segment_count: 10,
         }
+    }
+}
+
+/// Mirrors `BrokerConfig`, but with every field optional — parsed from an
+/// operator-supplied `--mqtt-broker-config <path.toml>` (M9), where an
+/// absent field keeps `BrokerConfig::default()`'s value. Same
+/// `deny_unknown_fields` discipline as `datafs::permissions::
+/// FusePermissions`'s own `RawFusePermissions`, so a typo'd key is a hard
+/// parse error rather than a silently-ignored setting.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBrokerConfig {
+    listen_address: Option<String>,
+    max_connections: Option<u64>,
+    max_payload_size: Option<u32>,
+    connection_timeout_ms: Option<u32>,
+    max_inflight_count: Option<u16>,
+    max_segment_size: Option<u64>,
+    max_segment_count: Option<u32>,
+}
+
+#[derive(Debug)]
+pub struct BrokerConfigError(toml::de::Error);
+
+impl fmt::Display for BrokerConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl std::error::Error for BrokerConfigError {}
+
+impl From<toml::de::Error> for BrokerConfigError {
+    fn from(error: toml::de::Error) -> Self {
+        BrokerConfigError(error)
+    }
+}
+
+impl BrokerConfig {
+    /// Parses a `BrokerConfig` from TOML, defaulting every field
+    /// `toml_source` doesn't set. An empty source is equivalent to
+    /// `BrokerConfig::default()` entirely.
+    pub fn parse(toml_source: &str) -> Result<Self, BrokerConfigError> {
+        let raw: RawBrokerConfig = toml::from_str(toml_source)?;
+        let default = BrokerConfig::default();
+        Ok(BrokerConfig {
+            listen_address: raw.listen_address.unwrap_or(default.listen_address),
+            max_connections: raw.max_connections.unwrap_or(default.max_connections),
+            max_payload_size: raw.max_payload_size.unwrap_or(default.max_payload_size),
+            connection_timeout_ms: raw
+                .connection_timeout_ms
+                .unwrap_or(default.connection_timeout_ms),
+            max_inflight_count: raw.max_inflight_count.unwrap_or(default.max_inflight_count),
+            max_segment_size: raw.max_segment_size.unwrap_or(default.max_segment_size),
+            max_segment_count: raw.max_segment_count.unwrap_or(default.max_segment_count),
+        })
     }
 }
 
@@ -167,5 +225,61 @@ mod tests {
         assert_eq!(default.max_inflight_count, 100);
         assert_eq!(default.max_segment_size, 104_857_600);
         assert_eq!(default.max_segment_count, 10);
+    }
+
+    #[test]
+    fn parse_of_empty_source_uses_defaults_for_every_field() {
+        let parsed = BrokerConfig::parse("").unwrap();
+        let default = BrokerConfig::default();
+        assert_eq!(parsed.listen_address, default.listen_address);
+        assert_eq!(parsed.max_connections, default.max_connections);
+        assert_eq!(parsed.max_payload_size, default.max_payload_size);
+        assert_eq!(parsed.connection_timeout_ms, default.connection_timeout_ms);
+        assert_eq!(parsed.max_inflight_count, default.max_inflight_count);
+        assert_eq!(parsed.max_segment_size, default.max_segment_size);
+        assert_eq!(parsed.max_segment_count, default.max_segment_count);
+    }
+
+    #[test]
+    fn parse_reads_a_fully_specified_config() {
+        let parsed = BrokerConfig::parse(
+            r#"
+            listen_address = "127.0.0.1:9999"
+            max_connections = 42
+            max_payload_size = 12345
+            connection_timeout_ms = 7000
+            max_inflight_count = 9
+            max_segment_size = 1000000
+            max_segment_count = 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(parsed.listen_address, "127.0.0.1:9999");
+        assert_eq!(parsed.max_connections, 42);
+        assert_eq!(parsed.max_payload_size, 12_345);
+        assert_eq!(parsed.connection_timeout_ms, 7_000);
+        assert_eq!(parsed.max_inflight_count, 9);
+        assert_eq!(parsed.max_segment_size, 1_000_000);
+        assert_eq!(parsed.max_segment_count, 3);
+    }
+
+    #[test]
+    fn parse_supports_a_partial_override() {
+        let parsed = BrokerConfig::parse(r#"listen_address = "127.0.0.1:1884""#).unwrap();
+        assert_eq!(parsed.listen_address, "127.0.0.1:1884");
+        assert_eq!(
+            parsed.max_connections,
+            BrokerConfig::default().max_connections
+        );
+    }
+
+    #[test]
+    fn parse_rejects_an_unknown_field() {
+        assert!(BrokerConfig::parse("not_a_real_field = 1").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_invalid_toml_syntax() {
+        assert!(BrokerConfig::parse("not valid toml [[[").is_err());
     }
 }

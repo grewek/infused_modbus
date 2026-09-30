@@ -24,6 +24,8 @@ rustls-webpki = "0.103.15"
 rumqttd = "0.20"
 rumqttc = "0.25"
 config = "0.14"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

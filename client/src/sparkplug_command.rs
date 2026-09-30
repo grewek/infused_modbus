@@ -14,7 +14,6 @@ use protocol::device_description::MachineDescription;
 use sparkplug::metric_value::MetricValue;
 use sparkplug::payload::{Payload, decode_payload};
 use std::collections::HashMap;
-use tokio::sync::mpsc;
 
 /// The well-known Sparkplug B metric name a host application sends (as an
 /// `NCMD`, `Boolean(true)`) to request that an Edge Node republish its full
@@ -90,8 +89,13 @@ pub fn decode_dcmd_metrics(
 }
 
 /// Drives `edge_node.dcmd_receiver` forever, decoding every incoming `DCMD`
-/// and forwarding resolved writes into `transaction_sender`. Returns once
-/// `dcmd_receiver` closes (the Edge Node connection is gone) or
+/// and forwarding resolved writes into `transaction_sender`. `std::sync::
+/// mpsc`, not `tokio::sync::mpsc` — matches the real, deliberate channel
+/// type `client::transaction_consumer` already uses everywhere else (see
+/// its own module doc comment referencing H2's blocking-receive design);
+/// its `Sender::send` is non-blocking regardless (the channel is unbounded),
+/// so calling it directly from this async loop never stalls the runtime.
+/// Returns once `dcmd_receiver` closes (the Edge Node connection is gone) or
 /// `transaction_sender`'s receiving end has been dropped (the transaction
 /// consumer shut down) — both are treated as "nothing left to do", not
 /// errors worth panicking over.
@@ -99,7 +103,7 @@ pub async fn run_dcmd_forwarder(
     edge_node: &EdgeNodeConnection,
     machines: &[MachineDescription],
     aliases: &AliasAllocator,
-    transaction_sender: &mpsc::Sender<(String, HashMap<String, StagedValue>)>,
+    transaction_sender: &std::sync::mpsc::Sender<(String, HashMap<String, StagedValue>)>,
 ) {
     loop {
         let received = edge_node.dcmd_receiver.lock().await.recv().await;
@@ -125,7 +129,7 @@ pub async fn run_dcmd_forwarder(
             continue;
         }
 
-        if transaction_sender.send((device_id, staged)).await.is_err() {
+        if transaction_sender.send((device_id, staged)).is_err() {
             return;
         }
     }
@@ -375,7 +379,7 @@ mod tests {
             let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge").await;
             edge_node.subscribe_dcmd("PumpA").await.unwrap();
 
-            let (transaction_sender, mut transaction_receiver) = mpsc::channel(4);
+            let (transaction_sender, transaction_receiver) = std::sync::mpsc::channel();
             let machines = vec![machine];
             tokio::spawn(async move {
                 run_dcmd_forwarder(&edge_node, &machines, &aliases, &transaction_sender).await;
@@ -415,7 +419,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            let (machine_name, staged) = transaction_receiver.recv().await.unwrap();
+            let (machine_name, staged) =
+                tokio::task::spawn_blocking(move || transaction_receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert_eq!(machine_name, "PumpA");
             assert_eq!(
                 staged.get("Tank_Temperature"),
