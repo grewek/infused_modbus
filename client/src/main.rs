@@ -105,10 +105,14 @@ const DEFAULT_MQTT_EDGE_NODE_ID: &str = "client";
 // `client::sparkplug_command` test already uses against a freshly started
 // embedded broker.
 const BROKER_STARTUP_GRACE_PERIOD: Duration = Duration::from_millis(300);
+// Persists this Edge Node's next bdSeq across process restarts — see
+// client::bd_seq_persistence's own module doc comment for why this is
+// required for real Sparkplug B conformance, not just a nice-to-have.
+const MQTT_BD_SEQ_PATH: &str = "client-mqtt-bdseq";
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: client <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--mqtt-broker-config <path.toml>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>]\n\
+        "Usage: client <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--mqtt-broker-config <path.toml>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>] [--mqtt-external-broker <host:port>]\n\
          <connection> is tcp://<address:port>, tls+tcp://<address:port>, or rtu://<serial-path>:<baud-rate>\n\
          --expect-server-fingerprint pins the server's TLS identity (tls+tcp:// only) — \
          without it, the server's identity is not verified at all (see CLAUDE.md's TLS design).\n\
@@ -126,7 +130,11 @@ fn usage() -> ! {
          (defaults: {DEFAULT_MQTT_GROUP_ID:?}/{DEFAULT_MQTT_EDGE_NODE_ID:?} — override \
          --mqtt-edge-node-id for any deployment running more than one client instance against \
          the same broker/host application, since it must be unique per Edge Node). mqtt layer \
-         only."
+         only.\n\
+         --mqtt-external-broker <host:port> connects the Edge Node to an already-running \
+         broker instead of starting the embedded one (--mqtt-broker-config is then ignored) — \
+         for targeting an external broker such as the Sparkplug TCK's own HiveMQ instance. \
+         mqtt layer only."
     );
     std::process::exit(1);
 }
@@ -182,6 +190,32 @@ fn extract_mqtt_broker_config(args: &mut Vec<String>) -> BrokerConfig {
         .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
     BrokerConfig::parse(&toml_source)
         .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
+}
+
+/// Pulls `--mqtt-external-broker <host:port>` out of `args` if present,
+/// leaving the rest of `args` untouched. Absent entirely, `None` means "use
+/// the embedded broker" (the normal case). Exists for situations where the
+/// Edge Node must connect to a broker this process doesn't own itself —
+/// concretely, the Eclipse Sparkplug TCK's own HiveMQ instance, which the
+/// conformance test drives directly rather than observing traffic through
+/// our own embedded `rumqttd`. `--mqtt-broker-config` is silently ignored
+/// when this is set, since there is no embedded broker left to configure.
+fn extract_mqtt_external_broker(args: &mut Vec<String>) -> Option<(String, u16)> {
+    let flag_index = args
+        .iter()
+        .position(|arg| arg == "--mqtt-external-broker")?;
+    if flag_index + 1 >= args.len() {
+        panic!("--mqtt-external-broker requires a value (host:port)");
+    }
+    args.remove(flag_index);
+    let value = args.remove(flag_index);
+    let (host, port) = value.rsplit_once(':').unwrap_or_else(|| {
+        panic!("invalid --mqtt-external-broker value {value:?}: expected host:port")
+    });
+    let port: u16 = port
+        .parse()
+        .unwrap_or_else(|error| panic!("invalid --mqtt-external-broker port {port:?}: {error}"));
+    Some((host.to_string(), port))
 }
 
 /// Pulls a single-value flag (e.g. `--mqtt-group-id <id>`) out of `args` if
@@ -276,6 +310,7 @@ fn main() {
     let fuse_permissions = extract_fuse_permissions(&mut raw_args);
     let representation_layer = extract_representation_layer(&mut raw_args);
     let mqtt_broker_config = extract_mqtt_broker_config(&mut raw_args);
+    let mqtt_external_broker = extract_mqtt_external_broker(&mut raw_args);
     let mqtt_group_id =
         extract_string_flag(&mut raw_args, "--mqtt-group-id", DEFAULT_MQTT_GROUP_ID);
     let mqtt_edge_node_id = extract_string_flag(
@@ -598,34 +633,44 @@ fn main() {
                 .unwrap_or_else(|error| eprintln!("warning: failed to clean up {root}: {error}"));
         }
         RepresentationLayer::Mqtt => {
-            // The Edge Node always connects to its own embedded broker via
-            // loopback, regardless of what listen_address it was configured
-            // to bind (e.g. "0.0.0.0:1883" for external/network consumers) —
-            // only the port is shared between the two.
-            let broker_port: u16 = mqtt_broker_config
-                .listen_address
-                .rsplit(':')
-                .next()
-                .and_then(|port| port.parse().ok())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "invalid --mqtt-broker-config listen_address {:?}: expected host:port",
-                        mqtt_broker_config.listen_address
-                    )
-                });
+            // Either dial an already-running external broker (e.g. the
+            // Sparkplug TCK's own HiveMQ instance — see
+            // extract_mqtt_external_broker's doc comment) or start and
+            // connect to our own embedded one, loopback-only, via
+            // 127.0.0.1 regardless of what listen_address it was configured
+            // to bind (e.g. "0.0.0.0:1883" for external/network consumers)
+            // — only the port is shared between the two in that case.
+            let (broker_host, broker_port): (String, u16) = match mqtt_external_broker {
+                Some((host, port)) => (host, port),
+                None => {
+                    let broker_port: u16 = mqtt_broker_config
+                        .listen_address
+                        .rsplit(':')
+                        .next()
+                        .and_then(|port| port.parse().ok())
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "invalid --mqtt-broker-config listen_address {:?}: expected host:port",
+                                mqtt_broker_config.listen_address
+                            )
+                        });
+                    client::broker::start_embedded_broker(mqtt_broker_config);
+                    std::thread::sleep(BROKER_STARTUP_GRACE_PERIOD);
+                    ("127.0.0.1".to_string(), broker_port)
+                }
+            };
 
-            client::broker::start_embedded_broker(mqtt_broker_config);
-            std::thread::sleep(BROKER_STARTUP_GRACE_PERIOD);
-
+            let bd_seq =
+                client::bd_seq_persistence::next_bd_seq(std::path::Path::new(MQTT_BD_SEQ_PATH));
             let edge_node = Arc::new(runtime.block_on(connect_edge_node(
-                "127.0.0.1",
+                &broker_host,
                 broker_port,
                 &mqtt_group_id,
                 &mqtt_edge_node_id,
+                bd_seq,
             )));
             println!(
-                "Sparkplug B Edge Node connected (group_id={mqtt_group_id:?}, edge_node_id={mqtt_edge_node_id:?}), broker listening on {}",
-                broker_port
+                "Sparkplug B Edge Node connected (group_id={mqtt_group_id:?}, edge_node_id={mqtt_edge_node_id:?}), broker at {broker_host}:{broker_port}"
             );
 
             let aliases = Arc::new(AliasAllocator::build(&description.machines));

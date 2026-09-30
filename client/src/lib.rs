@@ -1,4 +1,5 @@
 pub mod batching;
+pub mod bd_seq_persistence;
 pub mod broker;
 pub mod connection;
 pub mod device_identification;

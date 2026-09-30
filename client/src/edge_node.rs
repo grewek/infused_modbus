@@ -21,7 +21,7 @@
 use rumqttc::{AsyncClient, ClientError, Event, Incoming, LastWill, MqttOptions, QoS};
 use sparkplug::metric::Metric;
 use sparkplug::payload::encode_payload;
-use sparkplug::seq_counter::{BdSeqCounter, SeqCounter};
+use sparkplug::seq_counter::SeqCounter;
 use sparkplug::session::{
     build_dbirth_payload, build_ddata_payload, build_ddeath_payload, build_nbirth_payload,
     build_ndata_payload, build_ndeath_payload,
@@ -75,14 +75,20 @@ fn current_timestamp_millis() -> u64 {
 /// fails — connecting to our own just-started embedded broker is a startup
 /// precondition, the same "first connection failing is fatal" stance already
 /// used for the Modbus connection in `client::main`.
+///
+/// `bd_seq` is supplied by the caller rather than generated here — it must
+/// be genuinely higher than every previous session's value (see
+/// `client::bd_seq_persistence`, added after the Eclipse Sparkplug TCK
+/// caught this project generating the same `bdSeq` on every process
+/// restart), which requires cross-process persistence this module has no
+/// business owning itself.
 pub async fn connect_edge_node(
     broker_host: &str,
     broker_port: u16,
     group_id: &str,
     edge_node_id: &str,
+    bd_seq: u64,
 ) -> EdgeNodeConnection {
-    let bd_seq = BdSeqCounter::new().next_bd_seq();
-
     let ndeath_topic = build_topic(group_id, MessageType::NDeath, edge_node_id, None)
         .expect("NDEATH is a node-scoped message type and never needs a device_id");
     let mut ndeath_bytes = Vec::new();
@@ -340,7 +346,7 @@ mod tests {
                 }
             }
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge").await;
+            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
             assert_eq!(edge_node.group_id, "TestGroup");
             assert_eq!(edge_node.edge_node_id, "TestEdge");
 
@@ -390,7 +396,7 @@ mod tests {
                 }
             }
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge").await;
+            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
 
             let metrics = vec![Metric {
                 name: "Tank_Temperature".to_string(),
@@ -452,7 +458,7 @@ mod tests {
                 }
             }
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge").await;
+            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
 
             // An empty diff must not publish anything or consume a seq value.
             edge_node.publish_ddata("PumpA", Vec::new()).await.unwrap();
@@ -504,7 +510,7 @@ mod tests {
             });
             tokio::time::sleep(Duration::from_millis(300)).await;
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge").await;
+            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
             edge_node.subscribe_dcmd("PumpA").await.unwrap();
             // No subscribe_dcmd("PumpB") — its DCMD publishes must never
             // show up on dcmd_receiver.
@@ -568,7 +574,7 @@ mod tests {
             });
             tokio::time::sleep(Duration::from_millis(300)).await;
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge").await;
+            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
             edge_node.subscribe_ncmd().await.unwrap();
 
             let mut host_options = MqttOptions::new("host-application-3", "127.0.0.1", port);
@@ -641,7 +647,7 @@ mod tests {
                 }
             }
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge").await;
+            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
             // advance seq past 0 before the "rebirth"
             {
                 let mut seq_counter = edge_node.seq_counter.lock().await;
