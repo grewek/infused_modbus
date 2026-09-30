@@ -35,7 +35,13 @@ pub struct Metric {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
     Wire(wire::DecodeError),
-    MissingName,
+    /// Neither `name` nor `alias` was present — per spec a metric always
+    /// carries at least one of the two (a `BIRTH` message always has `name`;
+    /// a `DATA`/`CMD` message from a real host application may carry only
+    /// `alias`, per spec's own bandwidth-saving convention, once the alias
+    /// was established by an earlier `BIRTH`). A metric with neither can't
+    /// be identified at all.
+    MissingIdentifier,
     MissingDataType,
     MissingValue,
     UnknownDataTypeCode(u32),
@@ -232,8 +238,12 @@ pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
         }
     }
 
+    if name.is_none() && alias.is_none() {
+        return Err(DecodeError::MissingIdentifier);
+    }
+
     Ok(Metric {
-        name: name.ok_or(DecodeError::MissingName)?,
+        name: name.unwrap_or_default(),
         alias,
         data_type: data_type.ok_or(DecodeError::MissingDataType)?,
         value: value.ok_or(DecodeError::MissingValue)?,
@@ -331,35 +341,75 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_missing_name() {
-        let metric = Metric {
-            name: String::new(),
-            alias: None,
-            data_type: DataType::Boolean,
-            value: MetricValue::Boolean(true),
-        };
-        let mut buffer = Vec::new();
-        encode_metric(&metric, &mut buffer);
-        // Manually built (rather than via encode_metric) so the name field is
-        // genuinely absent, not just empty.
-        let mut without_name = Vec::new();
+    fn decode_rejects_metric_missing_both_name_and_alias() {
+        // Manually built (rather than via encode_metric) so both the name
+        // and alias fields are genuinely absent, not just empty/None.
+        let mut without_identifier = Vec::new();
         wire::encode_tag(
             Tag {
                 field_number: FIELD_DATATYPE,
                 wire_type: WireType::Varint,
             },
-            &mut without_name,
+            &mut without_identifier,
         );
-        wire::encode_varint(u64::from(u32::from(DataType::Boolean)), &mut without_name);
+        wire::encode_varint(
+            u64::from(u32::from(DataType::Boolean)),
+            &mut without_identifier,
+        );
         wire::encode_tag(
             Tag {
                 field_number: FIELD_BOOLEAN_VALUE,
                 wire_type: WireType::Varint,
             },
-            &mut without_name,
+            &mut without_identifier,
         );
-        wire::encode_varint(1, &mut without_name);
-        assert_eq!(decode_metric(&without_name), Err(DecodeError::MissingName));
+        wire::encode_varint(1, &mut without_identifier);
+        assert_eq!(
+            decode_metric(&without_identifier),
+            Err(DecodeError::MissingIdentifier)
+        );
+    }
+
+    #[test]
+    fn decode_accepts_a_metric_identified_by_alias_alone() {
+        // The real shape of an incoming DCMD/DDATA from a spec-conformant
+        // host application, which stops re-sending `name` once a BIRTH has
+        // established the alias — see CLAUDE.md's M7 notes.
+        let mut alias_only = Vec::new();
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_ALIAS,
+                wire_type: WireType::Varint,
+            },
+            &mut alias_only,
+        );
+        wire::encode_varint(7, &mut alias_only);
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_DATATYPE,
+                wire_type: WireType::Varint,
+            },
+            &mut alias_only,
+        );
+        wire::encode_varint(u64::from(u32::from(DataType::UInt16)), &mut alias_only);
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_INT_VALUE,
+                wire_type: WireType::Varint,
+            },
+            &mut alias_only,
+        );
+        wire::encode_varint(21, &mut alias_only);
+
+        assert_eq!(
+            decode_metric(&alias_only),
+            Ok(Metric {
+                name: String::new(),
+                alias: Some(7),
+                data_type: DataType::UInt16,
+                value: MetricValue::Int(21),
+            })
+        );
     }
 
     #[test]

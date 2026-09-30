@@ -19,6 +19,7 @@ pub fn file_record_metric_name(file_number: u16, record_number: u16) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct AliasAllocator {
     aliases: HashMap<(String, String), u64>,
+    reverse: HashMap<u64, (String, String)>,
 }
 
 impl AliasAllocator {
@@ -62,7 +63,11 @@ impl AliasAllocator {
             }
         }
 
-        Self { aliases }
+        let reverse = aliases
+            .iter()
+            .map(|(key, alias)| (*alias, key.clone()))
+            .collect();
+        Self { aliases, reverse }
     }
 
     /// Looks up the alias assigned to `metric_name` on `machine_name`. `None`
@@ -74,6 +79,19 @@ impl AliasAllocator {
         self.aliases
             .get(&(machine_name.to_string(), metric_name.to_string()))
             .copied()
+    }
+
+    /// The reverse of `alias_for` — looks up which `(machine_name,
+    /// metric_name)` an incoming alias refers to. Needed for M7's DCMD write
+    /// path: a real host application's write command identifies its target
+    /// metric by alias alone (see `sparkplug::metric::decode_metric`'s
+    /// alias-only decoding), so resolving it back to a name this project's
+    /// own stores understand requires this direction too, not just the
+    /// forward one BIRTH/DATA construction has needed so far.
+    pub fn metric_for_alias(&self, alias: u64) -> Option<(&str, &str)> {
+        self.reverse
+            .get(&alias)
+            .map(|(machine_name, metric_name)| (machine_name.as_str(), metric_name.as_str()))
     }
 }
 
@@ -175,6 +193,29 @@ mod tests {
 
         assert_eq!(allocator.alias_for("PumpA", "Nonexistent"), None);
         assert_eq!(allocator.alias_for("Nonexistent", "Motor_Running"), None);
+    }
+
+    #[test]
+    fn metric_for_alias_is_the_reverse_of_alias_for() {
+        let machines = vec![
+            machine("PumpA", "Tank_Temperature", "Motor_Running"),
+            machine("PumpB", "Other_Register", "Motor_Running"),
+        ];
+        let allocator = AliasAllocator::build(&machines);
+
+        let alias = allocator.alias_for("PumpB", "Motor_Running").unwrap();
+        assert_eq!(
+            allocator.metric_for_alias(alias),
+            Some(("PumpB", "Motor_Running"))
+        );
+    }
+
+    #[test]
+    fn metric_for_alias_returns_none_for_an_unassigned_alias() {
+        let machines = vec![machine("PumpA", "Tank_Temperature", "Motor_Running")];
+        let allocator = AliasAllocator::build(&machines);
+
+        assert_eq!(allocator.metric_for_alias(9999), None);
     }
 
     #[test]

@@ -221,7 +221,7 @@ mod tests {
 
         assert_eq!(
             decode_payload(&buffer),
-            Err(DecodeError::Metric(metric::DecodeError::MissingName))
+            Err(DecodeError::Metric(metric::DecodeError::MissingIdentifier))
         );
     }
 

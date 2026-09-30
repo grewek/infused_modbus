@@ -28,7 +28,7 @@ use sparkplug::session::{
 };
 use sparkplug::topic::{MessageType, build_topic};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 /// An Edge Node's live connection to its own embedded broker, plus the
 /// session state later Sparkplug messages (`NDATA` in particular) need to
@@ -38,6 +38,12 @@ pub struct EdgeNodeConnection {
     pub group_id: String,
     pub edge_node_id: String,
     pub seq_counter: Mutex<SeqCounter>,
+    /// Every `DCMD` publish this Edge Node has subscribed to (see
+    /// `subscribe_dcmd`), as `(device_id, raw_payload_bytes)` — decoding and
+    /// resolving these into a real write belongs to `client::
+    /// sparkplug_command`, which has the Modbus knowledge this module
+    /// deliberately doesn't.
+    pub dcmd_receiver: Mutex<mpsc::UnboundedReceiver<(String, Vec<u8>)>>,
 }
 
 fn current_timestamp_millis() -> u64 {
@@ -89,11 +95,23 @@ pub async fn connect_edge_node(
     }
 
     // rumqttc only makes progress (keepalive pings, acks, automatic
-    // reconnection) while something keeps polling the event loop.
+    // reconnection) while something keeps polling the event loop. Piggybacks
+    // on that same loop to also pick out DCMD publishes for any device this
+    // Edge Node has subscribed to (see `subscribe_dcmd`) and forward them
+    // into `dcmd_sender`, rather than running a second, competing consumer
+    // of the one `AsyncClient`/`EventLoop` pair.
+    let dcmd_topic_prefix = format!("spBv1.0/{group_id}/DCMD/{edge_node_id}/");
+    let (dcmd_sender, dcmd_receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         loop {
-            if let Err(error) = eventloop.poll().await {
-                eprintln!("edge node MQTT event loop error: {error}");
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Incoming::Publish(publish))) => {
+                    if let Some(device_id) = publish.topic.strip_prefix(&dcmd_topic_prefix) {
+                        let _ = dcmd_sender.send((device_id.to_string(), publish.payload.to_vec()));
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("edge node MQTT event loop error: {error}"),
             }
         }
     });
@@ -114,10 +132,26 @@ pub async fn connect_edge_node(
         group_id: group_id.to_string(),
         edge_node_id: edge_node_id.to_string(),
         seq_counter: Mutex::new(seq_counter),
+        dcmd_receiver: Mutex::new(dcmd_receiver),
     }
 }
 
 impl EdgeNodeConnection {
+    /// Subscribes to the `DCMD` topic for the Device identified by
+    /// `device_id`, so incoming write commands for it start showing up on
+    /// `dcmd_receiver`. Must be called once per machine this `client`
+    /// instance manages — nothing here subscribes on a caller's behalf.
+    pub async fn subscribe_dcmd(&self, device_id: &str) -> Result<(), ClientError> {
+        let topic = build_topic(
+            &self.group_id,
+            MessageType::DCmd,
+            &self.edge_node_id,
+            Some(device_id),
+        )
+        .expect("DCMD is a device-scoped message type and always carries a device_id");
+        self.client.subscribe(topic, QoS::AtLeastOnce).await
+    }
+
     /// Publishes a `DBIRTH` for the Device identified by `device_id`,
     /// carrying `metrics` (built by `client::sparkplug_translator::
     /// build_machine_metrics`, outside this module — kept Modbus-agnostic
@@ -406,6 +440,70 @@ mod tests {
             // calls consumed no seq value at all.
             assert_eq!(ddata.seq, Some(1));
             assert_eq!(ddata.metrics, metrics);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn edge_node_forwards_dcmd_publishes_for_a_subscribed_device_only() {
+        timeout(Duration::from_secs(10), async {
+            let port = 18835;
+            start_embedded_broker(BrokerConfig {
+                listen_address: format!("127.0.0.1:{port}"),
+                ..BrokerConfig::default()
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge").await;
+            edge_node.subscribe_dcmd("PumpA").await.unwrap();
+            // No subscribe_dcmd("PumpB") — its DCMD publishes must never
+            // show up on dcmd_receiver.
+
+            // Stands in for a real host application (e.g. Node-RED, SCADA)
+            // issuing a write command over the network.
+            let mut host_options = MqttOptions::new("host-application", "127.0.0.1", port);
+            host_options.set_keep_alive(Duration::from_secs(30));
+            let (host_client, mut host_eventloop) = AsyncClient::new(host_options, 10);
+            tokio::spawn(async move {
+                loop {
+                    if host_eventloop.poll().await.is_err() {
+                        break;
+                    }
+                }
+            });
+            // Give the subscription time to actually land at the broker
+            // before either publish, so neither is missed.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            host_client
+                .publish(
+                    "spBv1.0/TestGroup/DCMD/TestEdge/PumpB",
+                    QoS::AtLeastOnce,
+                    false,
+                    vec![9, 9],
+                )
+                .await
+                .unwrap();
+            host_client
+                .publish(
+                    "spBv1.0/TestGroup/DCMD/TestEdge/PumpA",
+                    QoS::AtLeastOnce,
+                    false,
+                    vec![1, 2, 3],
+                )
+                .await
+                .unwrap();
+
+            let (device_id, payload_bytes) = edge_node
+                .dcmd_receiver
+                .lock()
+                .await
+                .recv()
+                .await
+                .expect("dcmd_receiver closed unexpectedly");
+            assert_eq!(device_id, "PumpA");
+            assert_eq!(payload_bytes, vec![1, 2, 3]);
         })
         .await
         .expect("test timed out");

@@ -6,7 +6,10 @@
 //! Modbus, and this translation is Modbus-specific glue code.
 
 use crate::sparkplug_alias::{AliasAllocator, file_record_metric_name};
-use datafs::{CoilValue, MachineStores, RegisterValue, default_register_value};
+use datafs::{
+    CoilValue, MachineStores, RegisterValue, StagedValue, default_register_value,
+    parse_file_record_name,
+};
 use protocol::device_description::{DataType as ModbusDataType, MachineDescription};
 use sparkplug::data_type::DataType as SparkplugDataType;
 use sparkplug::metric::Metric;
@@ -68,6 +71,100 @@ pub fn map_register_value(value: RegisterValue) -> MetricValue {
 /// — no width/sign concerns, unlike registers.
 pub fn map_coil_value(value: CoilValue) -> MetricValue {
     MetricValue::Boolean(value.0)
+}
+
+/// Inverts `map_register_value`: given a `MetricValue` received from a
+/// `DCMD` write and the target register's declared `data_type`, recovers the
+/// original `RegisterValue`. The narrowing back down from `Int`/`Long`'s
+/// wide `u32`/`u64` slot is the exact mirror of `map_register_value`'s own
+/// "widen then bit-reinterpret" convention: truncating to the narrower
+/// type's bit width and reinterpreting as signed reproduces the original
+/// value bit-for-bit, since two's complement truncation and sign-extension
+/// are inverses of each other. Rejects a `MetricValue` whose shape doesn't
+/// match `data_type` at all (e.g. a `Boolean` sent for a `U16` register) —
+/// a real host application error, not something to silently coerce.
+pub fn metric_value_to_register_value(
+    value: &MetricValue,
+    data_type: ModbusDataType,
+) -> Result<RegisterValue, String> {
+    match (data_type, value) {
+        (ModbusDataType::U8, MetricValue::Int(raw)) => Ok(RegisterValue::U8(*raw as u8)),
+        (ModbusDataType::I8, MetricValue::Int(raw)) => Ok(RegisterValue::I8(*raw as u8 as i8)),
+        (ModbusDataType::U16, MetricValue::Int(raw)) => Ok(RegisterValue::U16(*raw as u16)),
+        (ModbusDataType::I16, MetricValue::Int(raw)) => Ok(RegisterValue::I16(*raw as u16 as i16)),
+        (ModbusDataType::U24, MetricValue::Int(raw)) => Ok(RegisterValue::U24(*raw)),
+        (ModbusDataType::I24, MetricValue::Int(raw)) => Ok(RegisterValue::I24(*raw as i32)),
+        (ModbusDataType::U32, MetricValue::Int(raw)) => Ok(RegisterValue::U32(*raw)),
+        (ModbusDataType::I32, MetricValue::Int(raw)) => Ok(RegisterValue::I32(*raw as i32)),
+        (ModbusDataType::U64, MetricValue::Long(raw)) => Ok(RegisterValue::U64(*raw)),
+        (ModbusDataType::I64, MetricValue::Long(raw)) => Ok(RegisterValue::I64(*raw as i64)),
+        (ModbusDataType::F32, MetricValue::Float(raw)) => Ok(RegisterValue::F32(*raw)),
+        (ModbusDataType::F64, MetricValue::Double(raw)) => Ok(RegisterValue::F64(*raw)),
+        _ => Err(format!(
+            "value shape does not match declared data type {data_type:?}"
+        )),
+    }
+}
+
+/// Resolves an incoming `DCMD` write (a metric name local to one machine,
+/// already resolved from its alias by the caller via `AliasAllocator::
+/// metric_for_alias`, plus the value it carries) into a `StagedValue` ready
+/// to hand to the same `transaction_consumer` infrastructure every other
+/// write path already feeds. Mirrors `transactions/`'s own resolution order
+/// (registers, then coils, then file records) — discrete inputs/input
+/// registers are never writable on the client at all (see CLAUDE.md), so a
+/// `DCMD` naming one of those is rejected exactly like every other write
+/// path already rejects it, not silently accepted.
+pub fn metric_value_to_staged_value(
+    machine: &MachineDescription,
+    metric_name: &str,
+    value: &MetricValue,
+) -> Result<StagedValue, String> {
+    if let Some(register) = machine.registers.iter().find(|r| r.name == metric_name) {
+        return metric_value_to_register_value(value, register.data_type)
+            .map(StagedValue::Register);
+    }
+
+    if machine.coils.iter().any(|coil| coil.name == metric_name) {
+        return match value {
+            MetricValue::Boolean(flag) => Ok(StagedValue::Coil(CoilValue(*flag))),
+            _ => Err(format!("coil {metric_name} needs a boolean value")),
+        };
+    }
+
+    if machine
+        .discrete_inputs
+        .iter()
+        .any(|entry| entry.name == metric_name)
+        || machine
+            .input_registers
+            .iter()
+            .any(|entry| entry.name == metric_name)
+    {
+        return Err(format!("{metric_name} is read-only and cannot be written"));
+    }
+
+    if let Some((file_number, record_number)) = parse_file_record_name(metric_name) {
+        let is_known_file_record = machine
+            .file_records
+            .iter()
+            .any(|entry| entry.file_number == file_number && entry.record_number == record_number);
+        if is_known_file_record {
+            return match value {
+                MetricValue::Bytes(bytes) => Ok(StagedValue::FileRecord {
+                    file_number,
+                    record_number,
+                    value: bytes.clone(),
+                }),
+                _ => Err(format!("file record {metric_name} needs a bytes value")),
+            };
+        }
+    }
+
+    Err(format!(
+        "unknown metric {metric_name} on machine {}",
+        machine.name
+    ))
 }
 
 /// Builds the full metric list for one machine — every register, coil,
@@ -434,6 +531,89 @@ mod tests {
         assert_eq!(
             file_record.value,
             MetricValue::Bytes(vec![0x0D, 0xFE, 0x00, 0x20])
+        );
+    }
+
+    #[test]
+    fn metric_value_to_register_value_inverts_every_type_round_trip() {
+        for (data_type, register_value) in [
+            (ModbusDataType::U8, RegisterValue::U8(200)),
+            (ModbusDataType::I8, RegisterValue::I8(-1)),
+            (ModbusDataType::U16, RegisterValue::U16(60_000)),
+            (ModbusDataType::I16, RegisterValue::I16(-1)),
+            (ModbusDataType::U24, RegisterValue::U24(16_000_000)),
+            (ModbusDataType::I24, RegisterValue::I24(-1)),
+            (ModbusDataType::U32, RegisterValue::U32(4_000_000_000)),
+            (ModbusDataType::I32, RegisterValue::I32(-1)),
+            (ModbusDataType::U64, RegisterValue::U64(10_000_000_000)),
+            (ModbusDataType::I64, RegisterValue::I64(-1)),
+            (ModbusDataType::F32, RegisterValue::F32(1.5)),
+            (ModbusDataType::F64, RegisterValue::F64(2.5)),
+        ] {
+            let metric_value = map_register_value(register_value);
+            assert_eq!(
+                metric_value_to_register_value(&metric_value, data_type),
+                Ok(register_value)
+            );
+        }
+    }
+
+    #[test]
+    fn metric_value_to_register_value_rejects_a_mismatched_shape() {
+        assert!(
+            metric_value_to_register_value(&MetricValue::Boolean(true), ModbusDataType::U16)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn metric_value_to_staged_value_resolves_a_register_write() {
+        let machine = test_machine();
+        assert_eq!(
+            metric_value_to_staged_value(&machine, "Tank_Temperature", &MetricValue::Int(30)),
+            Ok(StagedValue::Register(RegisterValue::U16(30)))
+        );
+    }
+
+    #[test]
+    fn metric_value_to_staged_value_resolves_a_coil_write() {
+        let machine = test_machine();
+        assert_eq!(
+            metric_value_to_staged_value(&machine, "Motor_Running", &MetricValue::Boolean(true)),
+            Ok(StagedValue::Coil(CoilValue(true)))
+        );
+    }
+
+    #[test]
+    fn metric_value_to_staged_value_resolves_a_file_record_write() {
+        let machine = test_machine();
+        assert_eq!(
+            metric_value_to_staged_value(&machine, "4:1", &MetricValue::Bytes(vec![1, 2])),
+            Ok(StagedValue::FileRecord {
+                file_number: 4,
+                record_number: 1,
+                value: vec![1, 2],
+            })
+        );
+    }
+
+    #[test]
+    fn metric_value_to_staged_value_rejects_read_only_metrics() {
+        let machine = test_machine();
+        assert!(
+            metric_value_to_staged_value(&machine, "Door_Open", &MetricValue::Boolean(true))
+                .is_err()
+        );
+        assert!(
+            metric_value_to_staged_value(&machine, "Flow_Rate", &MetricValue::Float(1.0)).is_err()
+        );
+    }
+
+    #[test]
+    fn metric_value_to_staged_value_rejects_an_unknown_metric_name() {
+        let machine = test_machine();
+        assert!(
+            metric_value_to_staged_value(&machine, "Nonexistent", &MetricValue::Int(1)).is_err()
         );
     }
 }
