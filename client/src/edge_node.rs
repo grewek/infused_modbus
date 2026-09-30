@@ -23,7 +23,8 @@ use sparkplug::metric::Metric;
 use sparkplug::payload::encode_payload;
 use sparkplug::seq_counter::{BdSeqCounter, SeqCounter};
 use sparkplug::session::{
-    build_dbirth_payload, build_ddeath_payload, build_nbirth_payload, build_ndeath_payload,
+    build_dbirth_payload, build_ddata_payload, build_ddeath_payload, build_nbirth_payload,
+    build_ndata_payload, build_ndeath_payload,
 };
 use sparkplug::topic::{MessageType, build_topic};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -168,6 +169,58 @@ impl EdgeNodeConnection {
             .publish(topic, QoS::AtLeastOnce, false, payload_bytes)
             .await
     }
+
+    /// Publishes a `DDATA` for the Device identified by `device_id`, carrying
+    /// only the metrics `client::sparkplug_change_tracker::ChangeTracker`
+    /// determined actually changed. A no-op (not even consuming a `seq`
+    /// value) when `metrics` is empty — there is nothing worth publishing,
+    /// and every poll tick with no changed values would otherwise burn a
+    /// `seq` number for an empty message.
+    pub async fn publish_ddata(
+        &self,
+        device_id: &str,
+        metrics: Vec<Metric>,
+    ) -> Result<(), ClientError> {
+        if metrics.is_empty() {
+            return Ok(());
+        }
+        let payload = {
+            let mut seq_counter = self.seq_counter.lock().await;
+            build_ddata_payload(metrics, current_timestamp_millis(), &mut seq_counter)
+        };
+        let mut payload_bytes = Vec::new();
+        encode_payload(&payload, &mut payload_bytes);
+        let topic = build_topic(
+            &self.group_id,
+            MessageType::DData,
+            &self.edge_node_id,
+            Some(device_id),
+        )
+        .expect("DDATA is a device-scoped message type and always carries a device_id");
+        self.client
+            .publish(topic, QoS::AtLeastOnce, false, payload_bytes)
+            .await
+    }
+
+    /// Publishes an `NDATA` for the Edge Node itself — see
+    /// `sparkplug::session::build_ndata_payload` for why this is expected to
+    /// be rare in practice today. Same empty-metrics no-op as `publish_ddata`.
+    pub async fn publish_ndata(&self, metrics: Vec<Metric>) -> Result<(), ClientError> {
+        if metrics.is_empty() {
+            return Ok(());
+        }
+        let payload = {
+            let mut seq_counter = self.seq_counter.lock().await;
+            build_ndata_payload(metrics, current_timestamp_millis(), &mut seq_counter)
+        };
+        let mut payload_bytes = Vec::new();
+        encode_payload(&payload, &mut payload_bytes);
+        let topic = build_topic(&self.group_id, MessageType::NData, &self.edge_node_id, None)
+            .expect("NDATA is a node-scoped message type and never needs a device_id");
+        self.client
+            .publish(topic, QoS::AtLeastOnce, false, payload_bytes)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +340,72 @@ mod tests {
             let ddeath = decode_payload(&ddeath_bytes).unwrap();
             assert_eq!(ddeath.seq, Some(2));
             assert!(ddeath.metrics.is_empty());
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn edge_node_publishes_ddata_and_ndata_but_skips_empty_metric_lists() {
+        timeout(Duration::from_secs(10), async {
+            let port = 18834;
+            start_embedded_broker(BrokerConfig {
+                listen_address: format!("127.0.0.1:{port}"),
+                ..BrokerConfig::default()
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let mut external_options = MqttOptions::new("external-subscriber-3", "127.0.0.1", port);
+            external_options.set_keep_alive(Duration::from_secs(30));
+            let (external_client, mut external_eventloop) = AsyncClient::new(external_options, 10);
+            external_client
+                .subscribe("spBv1.0/TestGroup/#", QoS::AtLeastOnce)
+                .await
+                .unwrap();
+            loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::SubAck(_)) => break,
+                    _ => continue,
+                }
+            }
+
+            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge").await;
+
+            // An empty diff must not publish anything or consume a seq value.
+            edge_node.publish_ddata("PumpA", Vec::new()).await.unwrap();
+            edge_node.publish_ndata(Vec::new()).await.unwrap();
+
+            let metrics = vec![Metric {
+                name: "Tank_Temperature".to_string(),
+                alias: Some(0),
+                data_type: sparkplug::data_type::DataType::UInt16,
+                value: MetricValue::Int(23),
+            }];
+            edge_node
+                .publish_ddata("PumpA", metrics.clone())
+                .await
+                .unwrap();
+
+            // Drain the NBIRTH first (always published by connect_edge_node).
+            let nbirth_bytes = loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::Publish(publish)) => break publish.payload,
+                    _ => continue,
+                }
+            };
+            assert_eq!(decode_payload(&nbirth_bytes).unwrap().seq, Some(0));
+
+            let ddata_bytes = loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::Publish(publish)) => break publish.payload,
+                    _ => continue,
+                }
+            };
+            let ddata = decode_payload(&ddata_bytes).unwrap();
+            // seq is 1, not higher, proving the two earlier empty-metric
+            // calls consumed no seq value at all.
+            assert_eq!(ddata.seq, Some(1));
+            assert_eq!(ddata.metrics, metrics);
         })
         .await
         .expect("test timed out");

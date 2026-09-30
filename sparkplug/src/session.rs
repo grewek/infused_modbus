@@ -53,6 +53,27 @@ pub fn build_nbirth_payload(
     }
 }
 
+/// Shared shape behind every "carry these metrics, continue the running
+/// `seq`" payload (`DBIRTH`/`DDATA`/`NDATA`) — only `NBIRTH` ever resets
+/// `seq`, and only `NDEATH` carries `seq: None` at all (it's delivered via
+/// the MQTT Will, not actively published). Kept as one private helper with
+/// distinct public names per message type for spec clarity, even though
+/// their bodies are currently identical — mirrors this project's existing
+/// "one shared codec, several named types" precedent (e.g.
+/// `WriteSingleRegisterRequest`/`Response`).
+fn build_metrics_payload(
+    metrics: Vec<Metric>,
+    timestamp_millis: u64,
+    seq_counter: &mut SeqCounter,
+) -> Payload {
+    let seq = seq_counter.next_seq();
+    Payload {
+        timestamp: Some(timestamp_millis),
+        metrics,
+        seq: Some(u64::from(seq)),
+    }
+}
+
 /// Builds the `DBIRTH` payload for one Device under this Edge Node, carrying
 /// its full current metric list (built by `client::sparkplug_translator`,
 /// outside this crate — `sparkplug` itself has no Modbus knowledge). Unlike
@@ -65,12 +86,34 @@ pub fn build_dbirth_payload(
     timestamp_millis: u64,
     seq_counter: &mut SeqCounter,
 ) -> Payload {
-    let seq = seq_counter.next_seq();
-    Payload {
-        timestamp: Some(timestamp_millis),
-        metrics,
-        seq: Some(u64::from(seq)),
-    }
+    build_metrics_payload(metrics, timestamp_millis, seq_counter)
+}
+
+/// Builds a `DDATA` payload carrying only the metrics that changed since the
+/// last publish for one Device (diffing is `client`'s job — see
+/// `client::sparkplug_change_tracker` — this crate just wraps whatever
+/// metric list it's given). Continues the running `seq`, same as `DBIRTH`.
+pub fn build_ddata_payload(
+    metrics: Vec<Metric>,
+    timestamp_millis: u64,
+    seq_counter: &mut SeqCounter,
+) -> Payload {
+    build_metrics_payload(metrics, timestamp_millis, seq_counter)
+}
+
+/// Builds an `NDATA` payload carrying changed Edge-Node-level metrics (as
+/// opposed to `DDATA`'s Device-level ones). In this project the Edge Node
+/// itself owns no data metrics beyond `bdSeq` (which only ever appears in
+/// `NBIRTH`/`NDEATH`, never republished via `NDATA`), so this is expected to
+/// carry an empty metric list in practice today — modeled anyway for spec
+/// completeness and because `client`'s own future node-level metrics (e.g. a
+/// connection-health indicator) would need exactly this.
+pub fn build_ndata_payload(
+    metrics: Vec<Metric>,
+    timestamp_millis: u64,
+    seq_counter: &mut SeqCounter,
+) -> Payload {
+    build_metrics_payload(metrics, timestamp_millis, seq_counter)
 }
 
 /// Builds the `DDEATH` payload for one Device. Unlike `NDEATH` (delivered via
@@ -187,5 +230,41 @@ mod tests {
 
         let dbirth = build_dbirth_payload(Vec::new(), 0, &mut seq_counter);
         assert_eq!(dbirth.seq, Some(3));
+    }
+
+    #[test]
+    fn ddata_payload_carries_the_given_metrics_and_continues_the_running_seq() {
+        let mut seq_counter = SeqCounter::new();
+        let _nbirth = build_nbirth_payload(0, 0, &mut seq_counter);
+        let _dbirth = build_dbirth_payload(Vec::new(), 0, &mut seq_counter);
+
+        let metrics = vec![Metric {
+            name: "Tank_Temperature".to_string(),
+            alias: Some(0),
+            data_type: DataType::UInt16,
+            value: MetricValue::Int(22),
+        }];
+        let ddata = build_ddata_payload(metrics.clone(), 1_700_000_000_000, &mut seq_counter);
+
+        assert_eq!(ddata.timestamp, Some(1_700_000_000_000));
+        assert_eq!(ddata.seq, Some(2));
+        assert_eq!(ddata.metrics, metrics);
+    }
+
+    #[test]
+    fn ndata_payload_carries_the_given_metrics_and_continues_the_running_seq() {
+        let mut seq_counter = SeqCounter::new();
+        let _nbirth = build_nbirth_payload(0, 0, &mut seq_counter);
+
+        let metrics = vec![Metric {
+            name: "Connection_Healthy".to_string(),
+            alias: None,
+            data_type: DataType::Boolean,
+            value: MetricValue::Boolean(true),
+        }];
+        let ndata = build_ndata_payload(metrics.clone(), 0, &mut seq_counter);
+
+        assert_eq!(ndata.seq, Some(1));
+        assert_eq!(ndata.metrics, metrics);
     }
 }
