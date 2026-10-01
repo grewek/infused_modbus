@@ -1,0 +1,212 @@
+[
+    {
+        "id": "sp-tab-5308214e",
+        "type": "tab",
+        "label": "infused_modbus Sparkplug test",
+        "disabled": false,
+        "info": "Listens to and controls an infused_modbus `client` instance (--data-representation-layer mqtt) over Sparkplug B. See the comment nodes on the canvas for setup and pitfalls, and this repo's examples/nodered/README.md for the full writeup.",
+        "env": []
+    },
+    {
+        "id": "sp-broker-d1e66f9a",
+        "type": "mqtt-sparkplug-broker",
+        "name": "infused_modbus client broker",
+        "deviceGroup": "",
+        "eonName": "",
+        "broker": "127.0.0.1",
+        "port": "1883",
+        "clientid": "",
+        "usetls": false,
+        "verifyservercert": false,
+        "protocolVersion": "4",
+        "userProps": "",
+        "keepalive": "60",
+        "cleansession": true,
+        "enableStoreForward": false,
+        "compressAlgorithm": false,
+        "aliasMetrics": false,
+        "useTemplates": true,
+        "templates": [],
+        "manualEoNBirth": false,
+        "primaryScada": ""
+    },
+    {
+        "id": "sp-comment-overview",
+        "type": "comment",
+        "z": "sp-tab-5308214e",
+        "name": "OVERVIEW\n--------\nThis flow talks Sparkplug B to infused_modbus's `client` (--data-representation-layer mqtt). Start it with:\n  cargo run -p client -- ignored device.toml tcp://<plc> --data-representation-layer mqtt --mqtt-group-id MyPlant --mqtt-edge-node-id Line1\n\nclient's embedded broker listens on 0.0.0.0:1883 by default, reachable here as 127.0.0.1:1883 because this container runs with --network host.\n\nTopic shape: spBv1.0/<group>/<message-type>/<edge-node>/[<device>]\nNBIRTH/DBIRTH = the data's self-description (name/type/alias per metric), published once at connect. NDATA/DDATA = changed values. NCMD/DCMD = commands going the other way (what the two flows below send).\n\nPITFALL - broker deviceGroup/eonName fields (in the config node below): only used by the 'mqtt sparkplug device' node type (Node-RED simulating ITS OWN device). Left blank here on purpose - setting them makes this broker node auto-publish its own synthetic birth ('Sparkplug Devices/Node-Red'), easy to mistake for a real device in the debug output.\n\nPITFALL - every flow redeploy drops and re-establishes the MQTT connection, which takes a few seconds (sometimes with retry backoff). Expect a brief gap right after clicking Deploy.",
+        "info": "",
+        "x": 150,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "sp-in-dcf40caa",
+        "type": "mqtt sparkplug in",
+        "z": "sp-tab-5308214e",
+        "name": "every Sparkplug message",
+        "topic": "spBv1.0/#",
+        "qos": "0",
+        "broker": "sp-broker-d1e66f9a",
+        "x": 220,
+        "y": 160,
+        "wires": [
+            [
+                "sp-debug-98d70cbc"
+            ]
+        ]
+    },
+    {
+        "id": "sp-debug-98d70cbc",
+        "type": "debug",
+        "z": "sp-tab-5308214e",
+        "name": "decoded Sparkplug payload",
+        "active": true,
+        "tosidebar": true,
+        "console": true,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 490,
+        "y": 160,
+        "wires": []
+    },
+    {
+        "id": "sp-comment-rebirth",
+        "type": "comment",
+        "z": "sp-tab-5308214e",
+        "name": "REQUEST REBIRTH\n---------------\nNBIRTH/DBIRTH are published ONCE at connect and are NOT retained - if you weren't subscribed yet (e.g. you just redeployed), you permanently missed them. Click the inject button below instead of restarting `client` - it sends an NCMD asking client to republish NBIRTH+DBIRTH right now, with whatever the CURRENT live values are (not stale defaults).\n\nPITFALL - GROUP_ID/EDGE_NODE_ID are hardcoded in the function node below, not auto-discovered. Edit them there to match whatever --mqtt-group-id/--mqtt-edge-node-id your `client` instance actually uses, or this silently goes nowhere (a wrong topic is not an error, nothing happens).",
+        "info": "",
+        "x": 170,
+        "y": 260,
+        "wires": []
+    },
+    {
+        "id": "sp-rebirth-inject-ffba9cd8",
+        "type": "inject",
+        "z": "sp-tab-5308214e",
+        "name": "Request Rebirth",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 180,
+        "y": 340,
+        "wires": [
+            [
+                "sp-rebirth-fn-3b828224"
+            ]
+        ]
+    },
+    {
+        "id": "sp-rebirth-fn-3b828224",
+        "type": "function",
+        "z": "sp-tab-5308214e",
+        "name": "build Rebirth NCMD",
+        "info": "Edit GROUP_ID/EDGE_NODE_ID to match your running `client`.",
+        "func": "const GROUP_ID = \"NodeRedTest\";\nconst EDGE_NODE_ID = \"ClaudeClient\";\n\nmsg.topic = `spBv1.0/${GROUP_ID}/NCMD/${EDGE_NODE_ID}`;\nmsg.payload = {\n    metrics: [\n        { name: \"Node Control/Rebirth\", value: true, type: \"boolean\" }\n    ]\n};\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 430,
+        "y": 340,
+        "wires": [
+            [
+                "sp-rebirth-out-bbe2b6b6"
+            ]
+        ]
+    },
+    {
+        "id": "sp-rebirth-out-bbe2b6b6",
+        "type": "mqtt sparkplug out",
+        "z": "sp-tab-5308214e",
+        "name": "send NCMD (Rebirth)",
+        "topic": "",
+        "qos": "0",
+        "retain": "false",
+        "broker": "sp-broker-d1e66f9a",
+        "x": 680,
+        "y": 340,
+        "wires": []
+    },
+    {
+        "id": "sp-comment-dcmd",
+        "type": "comment",
+        "z": "sp-tab-5308214e",
+        "name": "SEND DATA (DCMD = write a value)\n---------------------------------\nDouble-click the inject node below to edit its JSON payload - add/remove metrics there, no code needed. client resolves each metric by name against the real register/coil, applies it over real Modbus, and (if it's a register write) you'll see it come back as a DDATA on its next poll.\n\nPITFALL - every metric MUST include a \"type\" field (Sparkplug type name, case-insensitive: uint16, boolean, float, ...). Missing it makes the plugin throw and refuse to send anything.\n\nPITFALL - GROUP_ID/EDGE_NODE_ID/DEVICE_ID are hardcoded in the function node below (same caveat as the Rebirth section above) - DEVICE_ID is the machine name from device-description.toml (here: PumpA).\n\nPITFALL - the 'mqtt sparkplug out' node's own Topic field must stay BLANK in its edit dialog. If you ever set it there, it silently overrides msg.topic from the function node and your write goes to the wrong (fixed) topic instead (confirmed from the plugin's own source: a non-empty node-level topic always wins over msg.topic).\n\nPITFALL - a real strict Sparkplug device may send DATA messages identified only by a numeric alias, not by name, once a BIRTH has established the mapping (bandwidth optimization). infused_modbus's own `client` always sends both for easier debugging, but don't assume every real device will.",
+        "info": "",
+        "x": 170,
+        "y": 440,
+        "wires": []
+    },
+    {
+        "id": "sp-dcmd-inject",
+        "type": "inject",
+        "z": "sp-tab-5308214e",
+        "name": "Send Data (DCMD)",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "{\"metrics\":[{\"name\":\"Tank_Temperature\",\"value\":42,\"type\":\"uint16\"},{\"name\":\"Motor_Running\",\"value\":true,\"type\":\"boolean\"}]}",
+        "payloadType": "json",
+        "x": 180,
+        "y": 520,
+        "wires": [
+            [
+                "sp-dcmd-fn"
+            ]
+        ]
+    },
+    {
+        "id": "sp-dcmd-fn",
+        "type": "function",
+        "z": "sp-tab-5308214e",
+        "name": "set DCMD topic",
+        "info": "Edit GROUP_ID/EDGE_NODE_ID/DEVICE_ID to match your running `client` and target machine.",
+        "func": "const GROUP_ID = \"NodeRedTest\";\nconst EDGE_NODE_ID = \"ClaudeClient\";\nconst DEVICE_ID = \"PumpA\";\n\nmsg.topic = `spBv1.0/${GROUP_ID}/DCMD/${EDGE_NODE_ID}/${DEVICE_ID}`;\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 430,
+        "y": 520,
+        "wires": [
+            [
+                "sp-dcmd-out"
+            ]
+        ]
+    },
+    {
+        "id": "sp-dcmd-out",
+        "type": "mqtt sparkplug out",
+        "z": "sp-tab-5308214e",
+        "name": "send DCMD",
+        "topic": "",
+        "qos": "0",
+        "retain": "false",
+        "broker": "sp-broker-d1e66f9a",
+        "x": 650,
+        "y": 520,
+        "wires": []
+    }
+]

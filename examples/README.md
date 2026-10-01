@@ -106,3 +106,10 @@ works identically regardless of transport. See
 [Connecting over TLS](../README.md#connecting-over-tls) for the details
 (TLS additionally needs an approval step before the client's first
 connection succeeds).
+
+## Trying the MQTT/Sparkplug B layer instead
+
+See [`nodered/`](nodered/README.md) for a Docker-based Node-RED test rig —
+swap `--data-representation-layer mqtt` into the `client` command above and
+watch/send Sparkplug B traffic from a real, independent Sparkplug
+implementation.
