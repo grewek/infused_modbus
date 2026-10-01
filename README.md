@@ -16,13 +16,6 @@ This codebase was designed and implemented in collaboration with **Claude Code**
 
 This project is under active development and has **not** had a security review. Neither `client` nor `server` should be considered hardened, and `server` in particular accepts Modbus connections from any master that can reach it, with no authentication outside of `tls+tcp://` (see [Connecting over TLS](docs/tls.md)) — plain `tcp://`/`rtu://` have none at all. Some individual inputs read from the wire are checked before use, but that describes isolated pieces of the implementation, not an overall security guarantee. Do not expose either binary to an untrusted network, and do not use this project anywhere a security failure would have real consequences.
 
-## How this project came to be
-
-- **grewek** is the project owner and architect: every design decision — the FUSE filesystem layout, the transaction/confirmation semantics, the choice of Modbus function codes, protocol framing tradeoffs, scope boundaries, naming — was made or explicitly approved by him. Development proceeded in small, reviewable increments, with a deliberate house style (extraction-based programming: write the concrete solution first, only generalize once a real second case shows its actual shape; no speculative abstraction).
-- **Claude** implemented each increment against that direction: wrote the Rust code, the test suites, ran manual verification, and iterated based on review feedback after every step.
-
-Nothing here shipped without a human decision behind it, but essentially all of the code was written by an AI. See the point above if that matters to you.
-
 ## What this is
 
 - **Data is exposed over MQTT, using Sparkplug B.** `client` embeds its own MQTT broker and publishes each machine as a Sparkplug B Device under its own Edge Node (`NBIRTH`/`DBIRTH` once at startup, `NDATA`/`DDATA` on change); a write arrives as a `DCMD`. `server` exposes a small local socket an external system can use to read/update its own dataset directly. See [MQTT (Sparkplug B) layer](docs/mqtt-sparkplug.md).
