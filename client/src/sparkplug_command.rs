@@ -382,7 +382,8 @@ mod tests {
             let aliases = AliasAllocator::build(std::slice::from_ref(&machine));
             let alias = aliases.alias_for("PumpA", "Tank_Temperature").unwrap();
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
+            let edge_node =
+                connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0, None).await;
             edge_node.subscribe_dcmd("PumpA").await.unwrap();
 
             let (transaction_sender, transaction_receiver) = std::sync::mpsc::channel();
@@ -527,7 +528,8 @@ mod tests {
                 }
             }
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
+            let edge_node =
+                connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0, None).await;
             edge_node.subscribe_ncmd().await.unwrap();
 
             // Drain the initial NBIRTH from connect_edge_node itself.

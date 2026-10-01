@@ -5,6 +5,7 @@ pub mod connection;
 pub mod device_identification;
 pub mod edge_node;
 pub mod polling;
+pub mod primary_host_state;
 pub mod reconnect;
 pub mod sparkplug_alias;
 pub mod sparkplug_change_tracker;

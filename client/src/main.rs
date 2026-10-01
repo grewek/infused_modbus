@@ -112,7 +112,7 @@ const MQTT_BD_SEQ_PATH: &str = "client-mqtt-bdseq";
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: client <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--mqtt-broker-config <path.toml>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>] [--mqtt-external-broker <host:port>]\n\
+        "Usage: client <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--mqtt-broker-config <path.toml>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>] [--mqtt-external-broker <host:port>] [--mqtt-primary-host-id <id>]\n\
          <connection> is tcp://<address:port>, tls+tcp://<address:port>, or rtu://<serial-path>:<baud-rate>\n\
          --expect-server-fingerprint pins the server's TLS identity (tls+tcp:// only) — \
          without it, the server's identity is not verified at all (see CLAUDE.md's TLS design).\n\
@@ -134,7 +134,11 @@ fn usage() -> ! {
          --mqtt-external-broker <host:port> connects the Edge Node to an already-running \
          broker instead of starting the embedded one (--mqtt-broker-config is then ignored) — \
          for targeting an external broker such as the Sparkplug TCK's own HiveMQ instance. \
-         mqtt layer only."
+         mqtt layer only.\n\
+         --mqtt-primary-host-id <id> makes this Edge Node wait for the named Primary Host \
+         Application to come online (via its retained spBv1.0/STATE/<id> message) before \
+         publishing NBIRTH — without it, NBIRTH is published immediately, with no Primary Host \
+         awareness at all (the common case). mqtt layer only."
     );
     std::process::exit(1);
 }
@@ -233,6 +237,22 @@ fn extract_string_flag(args: &mut Vec<String>, flag: &str, default: &str) -> Str
     args.remove(flag_index)
 }
 
+/// Pulls `--mqtt-primary-host-id <id>` out of `args` if present, leaving the
+/// rest of `args` untouched. Absent entirely (the common case — most
+/// deployments have no Primary Host Application at all), `None` means this
+/// Edge Node publishes `NBIRTH` immediately with no Primary Host awareness,
+/// exactly as before this flag existed.
+fn extract_mqtt_primary_host_id(args: &mut Vec<String>) -> Option<String> {
+    let flag_index = args
+        .iter()
+        .position(|arg| arg == "--mqtt-primary-host-id")?;
+    if flag_index + 1 >= args.len() {
+        panic!("--mqtt-primary-host-id requires a value");
+    }
+    args.remove(flag_index);
+    Some(args.remove(flag_index))
+}
+
 /// Pulls `--expect-server-fingerprint <value>` out of `args` if present
 /// (order-independent relative to the positional arguments), leaving the
 /// rest of `args` untouched.
@@ -318,6 +338,7 @@ fn main() {
         "--mqtt-edge-node-id",
         DEFAULT_MQTT_EDGE_NODE_ID,
     );
+    let mqtt_primary_host_id = extract_mqtt_primary_host_id(&mut raw_args);
     let mut args = raw_args.into_iter();
     let Some(root) = args.next() else {
         usage();
@@ -662,12 +683,18 @@ fn main() {
 
             let bd_seq =
                 client::bd_seq_persistence::next_bd_seq(std::path::Path::new(MQTT_BD_SEQ_PATH));
+            if let Some(host_id) = &mqtt_primary_host_id {
+                println!(
+                    "Waiting for Primary Host Application {host_id:?} to come online before publishing NBIRTH..."
+                );
+            }
             let edge_node = Arc::new(runtime.block_on(connect_edge_node(
                 &broker_host,
                 broker_port,
                 &mqtt_group_id,
                 &mqtt_edge_node_id,
                 bd_seq,
+                mqtt_primary_host_id.as_deref(),
             )));
             println!(
                 "Sparkplug B Edge Node connected (group_id={mqtt_group_id:?}, edge_node_id={mqtt_edge_node_id:?}), broker at {broker_host}:{broker_port}"

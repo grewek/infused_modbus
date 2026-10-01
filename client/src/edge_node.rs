@@ -82,12 +82,25 @@ pub(crate) fn current_timestamp_millis() -> u64 {
 /// caught this project generating the same `bdSeq` on every process
 /// restart), which requires cross-process persistence this module has no
 /// business owning itself.
+///
+/// `primary_host_id`, if given, names a Sparkplug B Primary Host
+/// Application this Edge Node must wait for before publishing `NBIRTH` —
+/// per spec, an Edge Node configured for a specific Primary Host MUST verify
+/// it's online (via its retained `spBv1.0/STATE/<host_id>` message) first,
+/// rather than publishing blind. This blocks indefinitely until an
+/// `online: true` `STATE` message arrives; there is no spec-mandated
+/// timeout, and giving up after some made-up duration would just mean
+/// publishing `NBIRTH` without the verification this parameter exists to
+/// provide. `None` (the default — most deployments have no Primary Host at
+/// all) skips this entirely, matching this project's existing stance of
+/// every optional capability being strictly opt-in.
 pub async fn connect_edge_node(
     broker_host: &str,
     broker_port: u16,
     group_id: &str,
     edge_node_id: &str,
     bd_seq: u64,
+    primary_host_id: Option<&str>,
 ) -> EdgeNodeConnection {
     let ndeath_topic = build_topic(group_id, MessageType::NDeath, edge_node_id, None)
         .expect("NDEATH is a node-scoped message type and never needs a device_id");
@@ -109,6 +122,27 @@ pub async fn connect_edge_node(
             Ok(Event::Incoming(Incoming::ConnAck(_))) => break,
             Ok(_) => continue,
             Err(error) => panic!("failed to connect edge node to embedded broker: {error}"),
+        }
+    }
+
+    if let Some(host_id) = primary_host_id {
+        let state_topic = sparkplug::topic::build_state_topic(host_id);
+        client
+            .subscribe(&state_topic, QoS::AtLeastOnce)
+            .await
+            .unwrap_or_else(|error| panic!("failed to subscribe to {state_topic}: {error}"));
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Incoming::Publish(publish))) if publish.topic == state_topic => {
+                    if crate::primary_host_state::parse_online(&publish.payload) == Some(true) {
+                        break;
+                    }
+                }
+                Ok(_) => continue,
+                Err(error) => panic!(
+                    "edge node MQTT event loop error while waiting for primary host {host_id:?}: {error}"
+                ),
+            }
         }
     }
 
@@ -346,7 +380,8 @@ mod tests {
                 }
             }
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
+            let edge_node =
+                connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0, None).await;
             assert_eq!(edge_node.group_id, "TestGroup");
             assert_eq!(edge_node.edge_node_id, "TestEdge");
 
@@ -398,7 +433,8 @@ mod tests {
                 }
             }
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
+            let edge_node =
+                connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0, None).await;
 
             let metrics = vec![Metric {
                 name: "Tank_Temperature".to_string(),
@@ -461,7 +497,8 @@ mod tests {
                 }
             }
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
+            let edge_node =
+                connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0, None).await;
 
             // An empty diff must not publish anything or consume a seq value.
             edge_node.publish_ddata("PumpA", Vec::new()).await.unwrap();
@@ -514,7 +551,8 @@ mod tests {
             });
             tokio::time::sleep(Duration::from_millis(300)).await;
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
+            let edge_node =
+                connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0, None).await;
             edge_node.subscribe_dcmd("PumpA").await.unwrap();
             // No subscribe_dcmd("PumpB") — its DCMD publishes must never
             // show up on dcmd_receiver.
@@ -578,7 +616,8 @@ mod tests {
             });
             tokio::time::sleep(Duration::from_millis(300)).await;
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
+            let edge_node =
+                connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0, None).await;
             edge_node.subscribe_ncmd().await.unwrap();
 
             let mut host_options = MqttOptions::new("host-application-3", "127.0.0.1", port);
@@ -651,7 +690,8 @@ mod tests {
                 }
             }
 
-            let edge_node = connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0).await;
+            let edge_node =
+                connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0, None).await;
             // advance seq past 0 before the "rebirth"
             {
                 let mut seq_counter = edge_node.seq_counter.lock().await;
@@ -680,6 +720,86 @@ mod tests {
             let second_nbirth = decode_payload(&second_nbirth_bytes).unwrap();
             assert_eq!(second_nbirth.seq, Some(0));
             assert_eq!(second_nbirth.metrics[0].value, first_bd_seq);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn edge_node_waits_for_primary_host_online_before_publishing_nbirth() {
+        timeout(Duration::from_secs(10), async {
+            let port = 18840;
+            start_embedded_broker(BrokerConfig {
+                listen_address: format!("127.0.0.1:{port}"),
+                ..BrokerConfig::default()
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let mut external_options = MqttOptions::new("external-subscriber-6", "127.0.0.1", port);
+            external_options.set_keep_alive(Duration::from_secs(30));
+            let (external_client, mut external_eventloop) = AsyncClient::new(external_options, 10);
+            external_client
+                .subscribe("spBv1.0/TestGroup/NBIRTH/TestEdge", QoS::AtLeastOnce)
+                .await
+                .unwrap();
+            loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::SubAck(_)) => break,
+                    _ => continue,
+                }
+            }
+
+            let connect_task = tokio::spawn(connect_edge_node(
+                "127.0.0.1",
+                port,
+                "TestGroup",
+                "TestEdge",
+                0,
+                Some("TestHost"),
+            ));
+
+            // No NBIRTH must appear while the Primary Host hasn't been
+            // reported online yet.
+            let saw_early_nbirth =
+                tokio::time::timeout(Duration::from_millis(300), external_eventloop.poll())
+                    .await
+                    .is_ok();
+            assert!(
+                !saw_early_nbirth,
+                "NBIRTH must not be published before the Primary Host is online"
+            );
+
+            // Stands in for the Primary Host Application itself publishing
+            // its retained online STATE message.
+            let mut host_options = MqttOptions::new("primary-host-6", "127.0.0.1", port);
+            host_options.set_keep_alive(Duration::from_secs(30));
+            let (host_client, mut host_eventloop) = AsyncClient::new(host_options, 10);
+            tokio::spawn(async move {
+                loop {
+                    if host_eventloop.poll().await.is_err() {
+                        break;
+                    }
+                }
+            });
+            host_client
+                .publish(
+                    "spBv1.0/STATE/TestHost",
+                    QoS::AtLeastOnce,
+                    true,
+                    br#"{"online":true,"timestamp":0}"#.to_vec(),
+                )
+                .await
+                .unwrap();
+
+            let nbirth_bytes = loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::Publish(publish)) => break publish.payload,
+                    _ => continue,
+                }
+            };
+            assert!(decode_payload(&nbirth_bytes).is_ok());
+
+            connect_task.await.unwrap();
         })
         .await
         .expect("test timed out");

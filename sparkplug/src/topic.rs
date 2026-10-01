@@ -1,8 +1,12 @@
 //! Sparkplug B's MQTT topic namespace: `spBv1.0/<group_id>/<message_type>/
-//! <edge_node_id>/[<device_id>]`. Only the Edge Node/Device message types are
-//! modeled here — this project builds an Edge Node, never a Sparkplug Host
-//! Application, so the separate `spBv1.0/STATE/<host_id>` topic form isn't
-//! needed and isn't modeled.
+//! <edge_node_id>/[<device_id>]`, plus the separate `spBv1.0/STATE/<host_id>`
+//! form (`build_state_topic`) a Primary Host Application publishes its own
+//! online/offline status to. This project builds an Edge Node, never a Host
+//! Application, so it never *publishes* a `STATE` message itself — but an
+//! Edge Node configured to wait for a specific Primary Host (see
+//! `client::edge_node::connect_edge_node`'s `primary_host_id` parameter)
+//! needs to *subscribe* to that host's own `STATE` topic, which is why this
+//! is modeled here after all.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
@@ -75,6 +79,14 @@ pub fn build_topic(
     }
 }
 
+/// Builds the fixed-shape `spBv1.0/STATE/<host_id>` topic a Primary Host
+/// Application publishes its own online/offline status to — no group or
+/// Edge Node scoping, unlike every other Sparkplug B topic, since a Host
+/// Application's identity is independent of any one Edge Node's group.
+pub fn build_state_topic(host_id: &str) -> String {
+    format!("spBv1.0/STATE/{host_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +150,14 @@ mod tests {
         assert_eq!(
             build_topic("Plant1", MessageType::NData, "EdgeA", Some("PumpA")),
             Err(TopicError::UnexpectedDeviceId)
+        );
+    }
+
+    #[test]
+    fn builds_state_topic_without_any_group_or_edge_node_scoping() {
+        assert_eq!(
+            build_state_topic("InfusedModbusHost"),
+            "spBv1.0/STATE/InfusedModbusHost"
         );
     }
 }

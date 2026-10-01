@@ -4,3 +4,7 @@
 # generated key material, even throwaway/test-generated.
 /server-tls-identity/
 /client-tls-identity/
+
+# Persisted Sparkplug B bdSeq counter (client::bd_seq_persistence) — runtime
+# state, not source; defaults to the current working directory.
+/client-mqtt-bdseq
