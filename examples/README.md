@@ -23,7 +23,7 @@ Run from the repository root. Both commands below default to
 `--data-representation-layer files` — the same commands work identically
 with `--data-representation-layer fuse` appended, mounting a real FUSE
 filesystem instead of writing plain files; see [Directory
-permissions](../README.md#directory-permissions) and `CLAUDE.md`'s
+permissions](../docs/directory-permissions.md) and `CLAUDE.md`'s
 "Pluggable data-representation layer" section for the difference.
 
 ## 1. Start the server
@@ -47,12 +47,12 @@ cargo run -p client -- /tmp/infused-modbus-client examples/device-description.to
 The client fetches the device description from the server itself over FC 43
 (printing progress as it does), so it ends up with the identical two-machine
 setup without needing to trust its own local copy of the TOML stayed in
-sync — see [Device description discovery](../README.md#device-description-discovery-fc-43).
+sync — see [Device description discovery](../docs/filesystem.md#device-description-discovery-fc-43).
 
 ## 3. Poke at it, in a third terminal
 
 Every machine gets its own top-level directory — `PumpA/`, `PumpB/` — see
-[Interacting with the filesystem](../README.md#interacting-with-the-filesystem)
+[Interacting with the filesystem](../docs/filesystem.md)
 for the full picture. A few things to try:
 
 ```sh
@@ -103,7 +103,7 @@ Swap the `tcp://127.0.0.1:15020` above for `rtu://<serial-path>:<baud-rate>`
 or `tls+tcp://<bind-address:port>` on both commands — everything else here
 works identically regardless of transport. See
 [Supported connection types](../README.md#supported-connection-types) and
-[Connecting over TLS](../README.md#connecting-over-tls) for the details
+[Connecting over TLS](../docs/tls.md) for the details
 (TLS additionally needs an approval step before the client's first
 connection succeeds).
 

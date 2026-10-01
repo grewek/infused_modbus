@@ -2,7 +2,7 @@
 
 A Modbus **client** (master) and Modbus **server** (slave) that expose the Modbus data they handle through a **FUSE filesystem** instead of — or in addition to — a conventional API. "Infused" refers to this live-updating FUSE projection of Modbus data: register values show up as readable files, and writes happen by writing to files, no client library required.
 
-Both **Modbus TCP** and **Modbus RTU** (serial) are supported, symmetrically, for both the client and the server. A TLS-secured TCP transport (`tls+tcp://`) is also supported, with mutual TLS, a client-approval workflow, and DoS-hardening limits — see [Supported connection types](#supported-connection-types) and [Connecting over TLS](#connecting-over-tls) below for the full picture, including what's still fixed rather than configurable.
+Both **Modbus TCP** and **Modbus RTU** (serial) are supported, symmetrically, for both the client and the server, plus a TLS-secured TCP transport with mutual TLS and a client-approval workflow. An alternative MQTT/Sparkplug B representation is also available, for integrating with Node-RED/SCADA-style tooling instead of a filesystem. See [Documentation](#documentation) below for the details on all of this.
 
 ## ⚠️ This project was built entirely with AI assistance
 
@@ -10,7 +10,7 @@ This codebase was designed and implemented in collaboration with **Claude Code**
 
 ## ⚠️ Early-stage software — do not treat this as secure
 
-This project is under active development and has **not** had a security review. Neither `client` nor `server` should be considered hardened, and `server` in particular accepts Modbus connections from any master that can reach it, with no authentication outside of `tls+tcp://` (see [Connecting over TLS](#connecting-over-tls) below) — plain `tcp://`/`rtu://` have none at all. Some individual inputs read from the wire are checked before use (see below), but that describes isolated pieces of the implementation, not an overall security guarantee. Do not expose either binary to an untrusted network, and do not use this project anywhere a security failure would have real consequences.
+This project is under active development and has **not** had a security review. Neither `client` nor `server` should be considered hardened, and `server` in particular accepts Modbus connections from any master that can reach it, with no authentication outside of `tls+tcp://` (see [Connecting over TLS](docs/tls.md)) — plain `tcp://`/`rtu://` have none at all. Some individual inputs read from the wire are checked before use, but that describes isolated pieces of the implementation, not an overall security guarantee. Do not expose either binary to an untrusted network, and do not use this project anywhere a security failure would have real consequences.
 
 ## How this project came to be
 
@@ -19,522 +19,55 @@ This project is under active development and has **not** had a security review. 
 
 Nothing here shipped without a human decision behind it, but essentially all of the code was written by an AI. See the point above if that matters to you.
 
-## Design overview
+## What this is
 
 - **No separate client API — the filesystem is the interface.** Reading a register's current value is `cat holding-registers/Tank_Temperature`. Writing one is `echo 55 > transactions/Stop_Process`.
-- **Transactions are filesystem-native, multi-value commits.** Stage register writes as files under `transactions/`, then create a sentinel file `TRANSACTION_END` to commit them all as one batch. `ls`, `cat`, and `rm` work for inspecting or un-staging what's pending.
-- **Writes are not applied optimistically.** On the client, `report/<name>` confirms a write immediately, but `holding-registers/<name>` only updates on the *next poll* of the connected device — polling is deliberately the client's only writer of its own mirror, to avoid a race where an in-flight poll response could otherwise land after a commit and overwrite the freshly-confirmed value with a stale one. On the server, its own in-memory state *is* the data an external Modbus master reads, so a write applies immediately with no separate device to wait on.
-- **Client and server write differently — staged vs. direct.** The client stages writes in `transactions/`, committed together via `TRANSACTION_END` (see below). The server has no `transactions/` at all: `holding-registers/`, `coils/`, `discrete-inputs/`, and `input-registers/` are directly writable there — `echo 5 > holding-registers/Setpoint` applies immediately, since the server's own state doesn't need staging or round-tripping to a separate device.
-- **Per-register write status.** `report/<register-name>` shows the outcome of that register's most recent write attempt (`OK` or `FAILED: <reason>`), independent of every other register. Client-only, and scoped to registers/coils (not discrete-inputs/input-registers, whose only failure signal is the direct write's own return code).
-- **Discrete inputs and input registers are read-only mirrors of FC 2/FC 4 data.** `discrete-inputs/` and `input-registers/` sit alongside `holding-registers/`/`coils/`, populated by the client's polling loop or the server's own direct writes — never writable on the client, since no Modbus function code lets a master write either kind.
-- **TCP and RTU use the same code paths.** Both `client` and `server` accept a connection string in the form `tcp://<address:port>` or `rtu://<serial-path>:<baud-rate>`; transactions, polling, and device-description discovery are implemented once and dispatch to whichever transport was chosen.
-- **The server can advertise its own register description.** Instead of the client needing a hand-maintained copy of the server's register description, the client can fetch it at startup over Modbus function code 43 (Read Device Identification) — see [Device description discovery](#device-description-discovery-fc-43) below. A local fallback file is still required in case the server doesn't support this.
-- **Modbus implemented from scratch.** The `protocol` crate implements Modbus TCP/RTU framing, CRC16, and PDU encode/decode directly, rather than wrapping an existing crate like `tokio-modbus`. Some individual inputs read from the wire (declared lengths/counts) are checked against the actual remaining buffer before being used for allocation or indexing — this reduces a few specific classes of bugs, but is not a substitute for a real security review, which this project has not had (see the warning above).
-- **Polling batches register reads.** The client keeps its local mirror fresh by polling, grouping contiguous register addresses into a single `Read Holding Registers` request (up to Modbus's 125-register limit) instead of one request per register. Standard Modbus has no mechanism for a device to push updates on its own — polling is the only option the protocol allows.
-- **Every register data type is read and written over the wire**, including ones spanning more than one 16-bit Modbus register (`u32`, `f64`, ...) — see [Device description TOML format](#device-description-toml-format) for the full type list and how `mem-layout` controls their byte order.
-- **A `transactions/<name>` file can stage a Mask Write Register instead of a plain value**, atomically setting/clearing specific bits in a real device's register without needing to know its current contents first — client-only, see [Interacting with the filesystem](#interacting-with-the-filesystem).
-- **Client TLS certificates require server-side approval.** Over `tls+tcp://`, the server requires every connecting client to present a certificate, and only ones an operator has explicitly approved are allowed through — via a local admin channel kept separate from the FUSE mount itself, not through the filesystem. Approvals are persisted to disk, bounded by an optional `--max-clients` limit, and revoking one immediately disconnects it if it's already connected, not just future attempts. See [Connecting over TLS](#connecting-over-tls).
-- **Directory permissions are configurable.** An optional `fuse-permissions.toml` sets `mode`/`uid`/`gid` per top-level directory, enforced by the kernel (`fuse` layer) or via real `chmod`/`chown` (`files` layer) rather than just displayed — see [Directory permissions](#directory-permissions).
-- **Three interchangeable data-representation layers.** `--data-representation-layer files` (the default) exposes the exact same directory tree as plain files on disk, kept current via `inotify` and atomic `rename()` — no FUSE driver involved at all. `--data-representation-layer fuse` mounts it as a synthetic FUSE filesystem instead, this project's original mechanism. `--data-representation-layer mqtt` replaces the filesystem entirely with an MQTT/Sparkplug B interface — see [MQTT (Sparkplug B) layer](#mqtt-sparkplug-b-layer) below. `fuse`/`files` present the identical directory shape and every path/command in this README involving them works identically under either — see `CLAUDE.md`'s "Pluggable data-representation layer" section for the full design rationale.
-- **MQTT (Sparkplug B) layer, as an alternative to the filesystem.** `client` can embed its own MQTT broker and expose every machine's data as a Sparkplug B Edge Node/Device instead of building a `fuse`/`files` tree — a host application (Node-RED, an MES, a SCADA system) subscribes to it directly rather than reading files. Values change on `DDATA`, a write is a `DCMD`, and a `Node Control/Rebirth` request gets a fresh `NBIRTH`/`DBIRTH`. On `server`, the same layer replaces the filesystem with a small local Unix-socket daemon (`ServerHandle`) that a separate local process can use to read/update the server's own dataset directly — independent of, and not connected to, the client's MQTT side. See [MQTT (Sparkplug B) layer](#mqtt-sparkplug-b-layer) below.
-- **`client` reconnects automatically if the connection breaks.** A dedicated background task notices (via the polling loop, which runs continuously regardless of write activity) and redials with exponential backoff (1s, 2s, 4s, ... capped at 30s), retrying forever — no manual restart needed after a server restart, network blip, or unplugged serial adapter. Polling keeps logging failed attempts in the meantime rather than blocking; writes staged while disconnected simply report `FAILED` via `report/<name>` until the connection heals.
-- **One device description can describe several machines sharing one link.** A TOML file's `[[machines]]` array describes multiple devices — e.g. several PLCs on one RTU multi-drop bus, or several TCP targets — each dispatched by its own Modbus Unit ID and mounted under its own top-level FUSE directory (`/PumpA/holding-registers/`, `/PumpB/holding-registers/`, ...). `client` mounts every machine in its device description by default; `server` answers each machine's own Unit ID and stays silent for any Unit ID it wasn't told about, matching how a real unaddressed device on an RTU bus behaves. See [Device description TOML format](#device-description-toml-format).
+- **Three interchangeable data-representation layers.** Real files on disk (the default), a synthetic FUSE mount, or an MQTT/Sparkplug B interface — same underlying data either way. See [Getting started](docs/getting-started.md).
+- **Writes are staged and confirmed, not optimistic.** The client only updates its local mirror once a write is actually confirmed by the device; the server, having no separate device to confirm against, applies writes to its own directly-writable files immediately. See [Interacting with the filesystem](docs/filesystem.md).
+- **TCP and RTU use the same code paths**, and the server can advertise its own register description to the client over the wire (FC 43) instead of relying on a hand-kept copy staying in sync.
+- **Modbus implemented from scratch** — the `protocol` crate implements TCP/RTU framing, CRC16, and PDU encode/decode directly, rather than wrapping an existing crate.
+- **One device description can describe several machines sharing one link** — e.g. several PLCs on one RTU multi-drop bus — each mounted under its own top-level directory. See [Device description TOML format](docs/device-description.md).
+- **`client` reconnects automatically** with exponential backoff if the connection breaks, retrying forever — no manual restart needed.
+
+See [Documentation](#documentation) below for the full picture, and `CLAUDE.md` for the design rationale behind all of it.
 
 ## Client vs. server
 
-- **`client`** acts as a Modbus master against a connected device. It polls the device to keep `holding-registers/`/`discrete-inputs/`/`input-registers/` fresh, and turns `transactions/` commits into Modbus writes, updating the local mirror only once the device confirms them.
-- **`server`** acts as a Modbus slave that external Modbus masters query and write against. Its own in-memory state is what's being served: an external write applies immediately and is reflected into `holding-registers/`/`coils/`/`discrete-inputs/`/`input-registers/`, and a direct local write to any of those same files is visible to external masters on their very next read — no `transactions/` staging on the server at all (see [Design overview](#design-overview)). `server`'s root also has a `client-trust/` directory that `client`'s never has — see [Connecting over TLS](#connecting-over-tls).
+- **`client`** acts as a Modbus master against a connected device. It polls the device to keep its local mirror fresh, and turns staged writes into Modbus writes, updating the mirror only once the device confirms them.
+- **`server`** acts as a Modbus slave that external Modbus masters query and write against. Its own in-memory state is what's being served — an external write applies immediately and is reflected locally, and a local write is visible to external masters on their very next read.
 
 This has been tested against this project's own client/server implementations and against virtual serial ports, not against third-party PLC or SCADA hardware or software — whether it interoperates with a specific real-world device or system has not been verified.
 
 ## Supported connection types
 
-`client` and `server` both take a scheme-prefixed connection string on the command line (see [Getting started](#getting-started)). Everything built on top of the transport — transactions, polling, FC 43 device-description discovery — works identically regardless of which one is chosen.
-
 | Scheme | Transport | Status |
 | ------ | --------- | ------ |
 | `tcp://<address:port>` | Plain Modbus TCP | Supported |
-| `rtu://<serial-path>:<baud-rate>` | Modbus RTU over a serial link | Supported (secondary — TCP gets the primary design/testing attention; see `CLAUDE.md`) |
-| `tls+tcp://<address:port>` | Modbus TCP over TLS (self-signed identities, fingerprint pinning, mutual TLS) | Supported. Client certificate approvals persist across restarts, are bounded by an optional `--max-clients` limit, and revoking one disconnects it immediately — see [Connecting over TLS](#connecting-over-tls) for the full workflow and the DoS-hardening limits (handshake timeout, connection caps) that come with it. A few paths (admin socket, TLS identity directories) are still fixed rather than CLI-configurable. |
+| `rtu://<serial-path>:<baud-rate>` | Modbus RTU over a serial link | Supported (secondary — TCP gets the primary design/testing attention) |
+| `tls+tcp://<address:port>` | Modbus TCP over TLS (mutual TLS, fingerprint pinning, client approval) | Supported — see [Connecting over TLS](docs/tls.md) |
 
 A given `client`/`server` instance uses exactly one of these at a time — they are never combined on the same instance.
 
-## Supported Modbus function codes
-
-This lists every public function code defined by the Modbus Application Protocol specification, not just the ones this project implements — so the gaps are visible rather than silently omitted. "Not implemented yet" will be added later. "Out of scope" means this project has decided not to implement it at all — see the notes below the table. "Supported" here means `server` is *capable* of answering it — whether it actually does on a given deployment additionally depends on [`server-options.toml`](#server-optionstoml): every function code defaults to disabled until a technician explicitly enables it, so a "Supported" code still gets `ILLEGAL_FUNCTION` if its key isn't set to `true`.
-
-| Code | Name | `server-options.toml` key | Status |
-| ---- | ---- | -------------------------- | ------ |
-| 0x01 | Read Coils | `read_coils` | Supported |
-| 0x02 | Read Discrete Inputs | `read_discrete_inputs` | Supported |
-| 0x03 | Read Holding Registers | `read_holding_registers` | Supported |
-| 0x04 | Read Input Registers | `read_input_registers` | Supported |
-| 0x05 | Write Single Coil | `write_single_coil` | Supported |
-| 0x06 | Write Single Register | `write_single_register` | Supported |
-| 0x07 | Read Exception Status | — | Out of scope |
-| 0x08 | Diagnostics | — | Out of scope |
-| 0x0B | Get Comm Event Counter | — | Out of scope |
-| 0x0C | Get Comm Event Log | — | Out of scope |
-| 0x0F | Write Multiple Coils | `write_multiple_coils` | Supported |
-| 0x10 | Write Multiple Registers | `write_multiple_registers` | Supported |
-| 0x11 | Report Server ID | `report_server_id` | Supported |
-| 0x14 | Read File Record | `read_file_record` | Supported — see note below the table |
-| 0x15 | Write File Record | `write_file_record` | Supported — see note below the table |
-| 0x16 | Mask Write Register | `mask_write_register` | Supported |
-| 0x17 | Read/Write Multiple Registers | `read_write_multiple_registers` | Supported (server only — see note below the table) |
-| 0x18 | Read FIFO Queue | `read_fifo_queue` | Not implemented yet |
-| 0x2B / MEI 0x0E | Encapsulated Interface Transport — Read Device Identification | `read_device_identification` | Supported (Extended access only — see [Device description discovery](#device-description-discovery-fc-43)) |
-
-**0x07, 0x08, 0x0B, 0x0C are deliberately out of scope.** All four are marked "(Serial Line only)" in the spec itself and exist to diagnose the physical RS-485/RTU link (CRC error counts, character overrun counts, a Listen Only Mode to silence a malfunctioning node on a multidrop bus, a rolling event log of send/receive activity). None of them read or write register/coil data, they have no equivalent over TCP, and implementing them would mean tracking link-level counters/state that serve no purpose for this project while adding attack surface to `server`. Not planned to be revisited.
-
-**0x17 (Read/Write Multiple Registers) is server-only, deliberately.** It combines a write and a read into one request/response round trip (write applied first, then read) — real external Modbus masters can use it against `server` like any other read/write, and the write half applies exactly like Write Multiple Registers (atomically, no partial apply if either half is invalid). `client` never sends it: everything it could express — write via `transactions/`+`TRANSACTION_END`, read via `holding-registers/` — is already covered by the two separate mechanisms this project already has, so a wire-level round-trip optimization here wouldn't unlock anything new through the filesystem.
-
-**0x14/0x15 (Read/Write File Record) are deliberately minimal: raw bytes only, no field-level interpretation.** What a "file"/"record" means is entirely vendor-specific — real devices use it for things like event logs or historical trend data, and this project has no way to know a given device's own field layout without being told. `[[file-records]]` entries in the device description TOML (see below) declare which `(file_number, record_number)` combinations exist and how many words each holds; `server` answers real requests for them straight from `file-records/<file_number>/<record_number>`, directly writable there like every other server-side data type (a technician can stage test data by hand). `client` shows the same path as a plain hex dump, refreshed by polling, and — unlike FC17 — can also *write* one back to the real device: stage `transactions/<file_number>:<record_number>` with hex content and commit it via `TRANSACTION_END`, same as any other write, confirmed via `report/<file_number>:<record_number>`. Nothing decodes the bytes into named fields on either side (yet; that's planned as part of a future custom-function-codes feature, not built alongside this one).
-
 ## Getting started
-
-Want to skip straight to running something real? [`examples/`](examples/) has a ready-to-use, two-machine `device-description.toml` (plus a matching `server-options.toml`) and a full copy-pasteable walkthrough — no edits needed.
-
-### Build
 
 ```sh
 cargo build --workspace
 ```
 
-Requires Linux (both `libfuse`, for the `fuse` representation layer, and `inotify`, for the `files` one, are Linux-specific).
-
-### Run the server
-
-```sh
-cargo run -p server -- <root> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>] [--server-options <server-options.toml>] [--data-representation-layer fuse|files|mqtt]
-```
-
-`<connection>` is one of:
-
-- `tcp://<bind-address:port>` — e.g. `tcp://0.0.0.0:502`
-- `rtu://<serial-path>:<baud-rate>` — e.g. `rtu:///dev/ttyUSB0:9600`
-- `tls+tcp://<bind-address:port>` — see [Connecting over TLS](#connecting-over-tls) below.
-
-`--data-representation-layer` picks how `<root>` exposes the data: `files` (the **default**) writes real files under `<root>`, kept current via `inotify` and atomic `rename()` — no FUSE mount at all; `fuse` mounts `<root>` as a synthetic FUSE filesystem, this project's original mechanism; `mqtt` ignores `<root>` entirely and serves a local socket instead — see [MQTT (Sparkplug B) layer](#mqtt-sparkplug-b-layer) below. `fuse`/`files` present the identical directory shape described in [Interacting with the filesystem](#interacting-with-the-filesystem) below — pick whichever fits your deployment, see `CLAUDE.md`'s "Pluggable data-representation layer" section for the full design rationale.
-
-`--fuse-permissions` is optional — see [Directory permissions](#directory-permissions). `--max-clients` is also optional (`tls+tcp://` only) and bounds how many client certificates can be approved at once — without it, there is no limit.
-
-**`--server-options` controls which function codes this server will actually answer on the wire — and it's strict default-deny.** Without it (or with a present-but-empty file), *every* function code is disabled and every incoming request gets an `ILLEGAL_FUNCTION` exception, no matter how many function codes this project implements — `server` prints a loud startup warning if this ends up being the case, since "starts fine but answers nothing" is an easy flag to forget. Every function code this server can serve — including already-implemented ones like Read/Write Holding Registers — is attack surface exposed to any reachable Modbus master, so enabling one is an explicit technician choice, not an on-by-default assumption. Point it at a TOML file with a `[function-codes]` table, one boolean per function code, named after the operation:
-
-```toml
-[function-codes]
-read_holding_registers = true
-write_single_register = true
-```
-
-See the [function code table](#supported-modbus-function-codes) above for every available key name.
-
-Example:
-
-```sh
-mkdir -p /tmp/modbus-server
-cargo run -p server -- /tmp/modbus-server device.toml tcp://0.0.0.0:502 --server-options server-options.toml
-```
-
-`server` also has a second, unrelated invocation form for managing TLS client approvals — see [Connecting over TLS](#connecting-over-tls):
-
-```sh
-cargo run -p server -- admin approve|revoke <fingerprint>
-cargo run -p server -- admin list
-```
-
-### Run the client
-
-```sh
-cargo run -p client -- <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--mqtt-broker-config <path.toml>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>] [--mqtt-external-broker <host:port>]
-```
-
-`<connection>` uses the same `tcp://`/`rtu://`/`tls+tcp://` scheme as the server. `<device-description.toml>` is required as a fallback, but if the server it connects to supports FC 43 (see below), the client uses the server's own description instead. `--data-representation-layer` (default `files`) and `--fuse-permissions` (see [Directory permissions](#directory-permissions)) work identically to the server's own flags of the same name; `<root>` is ignored under `mqtt`. The `--mqtt-*` flags only apply under `--data-representation-layer mqtt` — see [MQTT (Sparkplug B) layer](#mqtt-sparkplug-b-layer) below. `client` mounts/writes **every** machine described in the effective device description — see [Device description TOML format](#device-description-toml-format) — each under its own top-level directory (`fuse`/`files`) or as its own Sparkplug B Device (`mqtt`).
-
-`[unit-id]` is **only** used to address the initial FC 43 device-identification handshake — it's how the client asks *some* device on the link to introduce itself before it knows which Unit IDs are valid at all. Once the (possibly multi-machine) device description is known, each machine dispatches its own actual register/coil/etc. traffic via its own TOML-declared `unit_id`, not this CLI one. Defaults to `1` if omitted.
-
-Example:
-
-```sh
-mkdir -p /tmp/modbus-client
-cargo run -p client -- /tmp/modbus-client device.toml tcp://127.0.0.1:502 1 1000
-```
-
-### MQTT (Sparkplug B) layer
-
-`--data-representation-layer mqtt` replaces the filesystem (`fuse`/`files`) with an MQTT interface using the [Sparkplug B](https://sparkplug.eclipse.org/) topic/payload conventions. The `client`↔`server` link itself is unchanged — still real Modbus over whatever `<connection>` was given; only how the data is presented to the outside world differs.
-
-**On `client`:** an MQTT broker is embedded directly in the process (no separate broker to run) and `client` connects to it as a Sparkplug B **Edge Node**, with each configured machine published as its own **Device** under that Edge Node:
-
-```sh
-cargo run -p client -- ignored device.toml tcp://127.0.0.1:502 --data-representation-layer mqtt --mqtt-group-id MyPlant --mqtt-edge-node-id Line1
-```
-
-- `NBIRTH`/`DBIRTH` are published once at startup (and again on a `Node Control/Rebirth` request) with every register/coil/discrete-input/input-register/file-record as a metric.
-- `NDATA`/`DDATA` publish only the metrics that actually changed since the last publish, checked on the same interval as `[poll-interval-ms]`.
-- `DCMD` is the write path — a metric write addressed to a Device is resolved against that machine's registers/coils/file-records (identified by alias once birth has established it, or by name) and applied over real Modbus, the same way a staged `transactions/` write would be. Discrete inputs and input registers stay read-only, since no Modbus function code lets a master write either.
-- `--mqtt-broker-config <path.toml>` overrides the embedded broker's tuning (`listen_address`, `max_connections`, `max_payload_size`, `connection_timeout_ms`, `max_inflight_count`, `max_segment_size`, `max_segment_count`) — every field is optional, unset ones keep their default.
-- `--mqtt-group-id`/`--mqtt-edge-node-id` set this Edge Node's Sparkplug identity (defaults: `infused_modbus`/`client`) — **override `--mqtt-edge-node-id`** if more than one `client` instance connects to the same broker/host application, since it must be unique.
-- `--mqtt-external-broker <host:port>` connects to an already-running broker instead of starting the embedded one (`--mqtt-broker-config` is then ignored) — for targeting an external broker, e.g. a real Sparkplug conformance test kit's own instance.
-- `--mqtt-primary-host-id <id>` makes this Edge Node wait for the named Primary Host Application to report itself online (via its retained `spBv1.0/STATE/<id>` message) before publishing `NBIRTH`/`DBIRTH`, per spec. Omit it (the default) for the common case of no Primary Host Application at all — `NBIRTH` then publishes immediately, unchanged from before this flag existed.
-- `<root>` is ignored — there's no directory to mount or write to.
-- `bdSeq` (the Sparkplug session identifier distinguishing one connection from the next) is persisted across restarts in a small file, `client-mqtt-bdseq`, next to wherever `client` was started — this is required for spec conformance (a Host Application needs to tell a genuinely new session apart from a late-arriving death notice from an old one), not just an implementation detail.
-
-**On `server`:** the filesystem is replaced by a local Unix domain socket (`server-data.sock`, created next to wherever the process was started) speaking a small line protocol — `SET <machine> <point> <value>` / `GET <machine> <point>`, e.g.:
-
-```sh
-echo "SET PumpA Tank_Temperature 55" | socat - UNIX-CONNECT:server-data.sock
-echo "GET PumpA Tank_Temperature" | socat - UNIX-CONNECT:server-data.sock
-```
-
-This is the server-side equivalent of `holding-registers/<name>` being directly writable under `fuse`/`files` — the socket enforces the same validation (unknown point, read-only point, or a value that doesn't parse for that point's type all come back as `ERROR ...`) and applies successful writes straight to the same in-memory state an external Modbus master reads/writes. It is independent of, and never talks to, the client's MQTT side — a technician wiring up an external system to feed the server's own dataset (rather than reading it back out over Modbus) uses this socket directly, or a future host-process integration built on the same underlying `ServerHandle` library.
-
-### Connecting over TLS
-
-`tls+tcp://` encrypts the Modbus TCP connection and authenticates both sides — but without a certificate authority: there's no CA to set up, no certificates to buy or issue. Instead, both `client` and `server` generate their own self-signed identity automatically the first time they run (persisted next to wherever the process was started: `server-tls-identity/` and `client-tls-identity/` respectively), and trust is based purely on comparing the raw public-key **fingerprint** a peer presents — the same idea as an SSH host key, not a PKI certificate chain. Read `CLAUDE.md`'s "TLS transport security & client trust" section for the full design this is built from.
-
-**1. Start the server.** It generates its identity on first run and prints its fingerprint:
-
-```sh
-cargo run -p server -- /tmp/modbus-server device.toml tls+tcp://0.0.0.0:502
-```
-
-```
-Server TLS fingerprint: 86:3f:7f:d5:06:06:0f:5e:26:8d:bd:a8:1e:15:14:38:39:f3:f4:ba:0a:a4:a9:6a:da:c6:9a:60:dd:7f:a4:74
-```
-
-Note this value down — in a real deployment, a technician commissioning the server would read it directly off the console/log and hand it to whoever sets up a client, out of band (there is no other channel this travels over).
-
-**2. Start the client, pinning that fingerprint:**
-
-```sh
-cargo run -p client -- /tmp/modbus-client device.toml tls+tcp://127.0.0.1:502 --expect-server-fingerprint 86:3f:7f:d5:06:06:0f:5e:26:8d:bd:a8:1e:15:14:38:39:f3:f4:ba:0a:a4:a9:6a:da:c6:9a:60:dd:7f:a4:74
-```
-
-Without `--expect-server-fingerprint`, the client accepts **any** server certificate unconditionally and prints a warning saying so — useful only for local testing, never for a real deployment. With it, the connection is rejected outright if the server presents a different certificate than expected.
-
-**3. The client also generates (and prints) its own identity** the first time it runs, and presents it to the server as part of a mutual TLS (mTLS) handshake — both sides authenticate to each other, not just the client authenticating the server. Until the client's fingerprint has been approved (next step), the server rejects the handshake — this first connection attempt is expected to fail.
-
-**4. Approve the client.** The server logs every connection attempt (approved, still-pending, or outright rejected) by fingerprint under its own root, in `client-trust/connection_attempts/{approved,pending,rejected}.log`. An unapproved-but-otherwise-valid certificate lands in `pending.log` — read the fingerprint from there (or from the client's own startup output, which prints the same value), then approve it from another terminal:
-
-```sh
-cargo run -p server -- admin approve <client-fingerprint>
-```
-
-This talks to a Unix domain socket the server always serves in the background, regardless of connection type (`server-admin.sock`, relative to wherever the server was started; mode `0600`, additionally checked against the server process's own UID via `SO_PEERCRED` — only the local user account actually running the server can approve/revoke/list). The currently approved set is also visible read-only under `client-trust/approved/` at the server's root (one file per fingerprint).
-
-**5. Reconnect the client** with the same command as step 2 — the identical certificate now completes the mTLS handshake, and the client mounts and polls normally.
-
-**6. Revoke a client** when it should no longer connect:
-
-```sh
-cargo run -p server -- admin revoke <client-fingerprint>
-```
-
-This disconnects any already-open connection using that fingerprint immediately, not just future handshake attempts.
-
-**Approvals persist automatically.** Every successful `approve`/`revoke` atomically rewrites `approved-clients.toml` (mode `0600`, in the directory the server was started from) — restarting the server re-reads it at startup, so a previously-approved client doesn't need to be re-approved by hand. `--max-clients <n>` (see [Run the server](#run-the-server)) bounds how many fingerprints can be approved at once; approving past that limit fails until an existing one is revoked.
-
-**DoS hardening.** The TLS handshake itself has a 10-second timeout, independent of the per-request Modbus timeout. The server also caps concurrent connections: at most 100 in total at once, and at most 5 per individual approved fingerprint, so one already-approved but compromised or buggy client can't exhaust the whole connection pool by itself. Either cap being exceeded drops the new connection outright rather than queuing it. Protection against a flood from many different source addresses is out of scope for `infused_modbus` itself — that's upstream infrastructure's job (firewall/rate-limiter), not something the application layer handles.
-
-**Still fixed, not yet configurable via a CLI flag:** the admin socket's path, the TLS identity directories, `approved-clients.toml`'s own path, and the DoS-hardening limits above. RTU's serial link also remains a separate, unauthenticated threat model that TLS does nothing to address.
-
-### Interacting with the filesystem
-
-Every configured machine gets its own top-level directory, named after that machine's `name` in the device description (see [Device description TOML format](#device-description-toml-format)) — the examples below use `PumpA`. Everything past that first path segment works exactly the same regardless of how many machines are mounted, and regardless of which `--data-representation-layer` was chosen — `files` and `fuse` present the identical directory shape.
-
-Once mounted:
-
-```sh
-ls PumpA/holding-registers/                       # see all known registers
-cat PumpA/holding-registers/Tank_Temperature      # read the current value
-
-echo 55 > PumpA/transactions/Stop_Process         # stage a write
-ls PumpA/transactions/                            # see what's staged
-rm PumpA/transactions/Stop_Process                # ...or un-stage it
-touch PumpA/transactions/TRANSACTION_END          # commit everything staged
-
-cat PumpA/report/Stop_Process                     # OK, or FAILED: <reason>
-```
-
-**This is the client's write path — `transactions/`, `TRANSACTION_END`, and `report/` don't exist on the server at all.** The server writes directly into `holding-registers/<name>` (or `coils/`/`discrete-inputs/`/`input-registers/`) instead — `echo 55 > PumpA/holding-registers/Stop_Process` applies immediately, since the server's own state doesn't need staging or a round trip to confirm:
-
-```sh
-echo 55 > PumpA/holding-registers/Stop_Process    # server only — applies immediately, no transactions/
-```
-
-`discrete-inputs/` and `input-registers/` (FC 2/FC 4 data) sit alongside `holding-registers/`, same `ls`/`cat` shape — read-only on the client (populated by polling), directly writable on the server exactly like `holding-registers/` above.
-
-Coils work the same way as holding registers, under `coils/` instead — `transactions/` and `report/` are shared across both on the client (one register and one coil can even be staged in the same commit). A coil's value is `0` or `1`:
-
-```sh
-cat PumpA/coils/Motor_Running                     # 0 or 1
-echo 1 > PumpA/transactions/Motor_Running         # stage turning it on
-touch PumpA/transactions/TRANSACTION_END
-```
-
-A `transactions/<name>` file can also stage a Mask Write Register (FC 0x16) instead of a plain value, by writing `MASK <and_mask> <or_mask>` as its content — sets/clears specific bits in a single-register-wide value atomically on the real device, without needing to know its current contents:
-
-```sh
-echo "MASK 0x00F2 0x0025" > PumpA/transactions/Stop_Process
-touch PumpA/transactions/TRANSACTION_END
-```
-
-This is client-only (the server has no local use for it — see the README's function-code table and `CLAUDE.md` for why) and, like every write, can only ever target a single-register-wide value (`u8`/`i8`/`u16`/`i16`).
-
-Declared `[[machines.file-records]]` (FC 0x14/0x15) show up under `file-records/<file_number>/<record_number>` — nested one level deeper than everything else, since file/record numbers are two-axis and there's no human-readable name for them. Content is a plain hex dump; nothing decodes it into fields:
-
-```sh
-ls PumpA/file-records/20/                         # e.g. "5"
-cat PumpA/file-records/20/5                       # e.g. "0D FE 00 20"
-
-echo "0D FE 00 20" > PumpA/file-records/20/5      # server only — applies immediately, like holding-registers/
-```
-
-Read-only on the client's own `file-records/` mount, populated by polling one `Read File Record` request per configured entry at a time. To *write* one to the real device instead, stage it through `transactions/` with the colon-separated `<file_number>:<record_number>` naming, same commit/confirm flow as everything else there:
-
-```sh
-echo "0D FE 00 20" > PumpA/transactions/20:5
-touch PumpA/transactions/TRANSACTION_END
-cat PumpA/report/20:5                             # OK, or FAILED: <reason>
-```
-
-If a machine's optional `server-id` field is set (see below), that machine's directory on the client's mount also has a read-only `server-id` file at its root, mirroring whatever the connected device (or its own local fallback) declared:
-
-```sh
-cat PumpA/server-id                               # e.g. infused_modbus-demo-plc
-```
-
-`server` never mirrors its own `server-id` into its FUSE tree this way — it only answers a real Modbus master's FC 0x11 (Report Server ID) request with it (the technician already set it in the TOML they own, so there's nothing new to show them locally). `client-trust/` (server-only, see [Connecting over TLS](#connecting-over-tls) below) is the one exception to the "everything lives under a machine directory" rule — it stays at the real filesystem root, since it's about which clients may connect at all, not about any one machine.
-
-Unmount with Ctrl+C or `SIGTERM` — both `client` and `server` unmount cleanly on shutdown.
-
-### Device description discovery (FC 43)
-
-The client always requires a local `device-description.toml` path on the command line, but at startup it first asks the server for its own description over Modbus function code 43 (Encapsulated Interface Transport, MEI type 0x0E, Read Device Identification). If the server has one, the client uses it instead of the local file — printing progress as it fetches, since this can take a few round trips. If the server has none, doesn't support FC 43, or the fetch fails for any reason, the client transparently falls back to the local file.
-
-## Device description TOML format
-
-A device description is a `[[machines]]` array — one entry per machine sharing the link this `client`/`server` instance connects to (a single-machine deployment is just an array with one entry). Each `[[machines]]` entry requires:
-
-- `name` — a unique (across the file), ASCII-alphanumeric-plus-`_`/`-` string, used directly as that machine's top-level FUSE directory name (`PumpA/`, `PumpB/`, ...) — a parse error if it collides with another machine's name or uses any other character.
-- `unit_id` — the Modbus Unit ID this machine answers to on the shared link. `client` dispatches each machine's register/coil/etc. traffic to its own `unit_id`; `server` resolves an incoming request's Unit ID back to the matching machine and stays silent (no response at all, mirroring how an unaddressed device on a real RTU bus behaves) if none matches.
-
-and optionally:
-
-- `server-id` — identifies this machine to a Modbus master asking via FC 0x11 (Report Server ID) — set once and not meant to be changed at runtime. `server` answers real FC 0x11 requests for this machine's Unit ID with it (and rejects the function code with `ILLEGAL_FUNCTION` if absent); `client` mirrors it read-only into that machine's own mount as `server-id` — see [Interacting with the filesystem](#interacting-with-the-filesystem).
-
-Every other section below is nested one level under `[[machines]]` (e.g. `[machines.registers]` instead of a top-level `[registers]`) and otherwise unchanged in shape.
-
-Registers live in a `[machines.registers]` table with a required `base_address`, a required `mem-layout` (see below), and one `[[machines.registers.entries]]` array entry per register:
-
-```toml
-[[machines]]
-name = "PumpA"
-unit_id = 1
-
-[machines.registers]
-base_address = 40000
-mem-layout = "abcd"
-
-[[machines.registers.entries]]
-name = "Tank_Temperature"
-offset = 1
-data_type = "u16"
-access = "read_only"
-
-[[machines.registers.entries]]
-name = "Stop_Process"
-offset = 2
-data_type = "u16"
-access = "read_write"
-```
-
-Each entry's actual Modbus address is `base_address + offset` — `Tank_Temperature` above lives at 40001.
-
-- `name` — the human-readable name used as the filename under `holding-registers/` and, on the client, `transactions/`/`report/` too.
-- `offset` — added to the section's `base_address` to get the register's real Modbus address.
-- `data_type` — one of `u8`, `i8`, `u16`, `i16`, `u24`, `i24`, `u32`, `i32`, `u64`, `i64`, `f32`, `f64`. Anything wider than one 16-bit register (`u24` and up) spans consecutive registers, in the byte order `mem-layout` describes. `u24`/`i24` have no native Modbus width — they occupy two registers (32 bits) with the top byte always zero (`u24`) or sign-extended (`i24`).
-- `access` — `"read_only"` or `"read_write"`.
-
-`mem-layout` describes how a device lays a multi-register value's bytes across the wire — real devices vary, and getting this wrong silently produces the wrong number rather than an error. It's one setting for the whole `[machines.registers]` section (a device doesn't mix conventions internally), using the industry-standard four-letter names for a value's bytes A (most significant) through D (least significant):
-
-| `mem-layout` | Byte order on the wire | Also known as |
-| ------------- | ----------------------- | -------------- |
-| `"abcd"` | A B C D | big-endian |
-| `"dcba"` | D C B A | little-endian |
-| `"badc"` | B A D C | byte-swapped |
-| `"cdab"` | C D A B | word-swapped (e.g. some Schneider/Modicon PLCs) |
-
-Coils use the same `base_address` + `offset` shape, but have no `data_type` or `access` (a coil is always exactly 1 bit and always read/write):
-
-```toml
-[machines.coils]
-base_address = 0
-
-[[machines.coils.entries]]
-name = "Motor_Running"
-offset = 1
-```
-
-Both `[machines.registers]` and `[machines.coils]` are optional — a machine with only one kind doesn't need to declare an empty section for the other.
-
-A complete example, two machines sharing one link, with a mix of types and access rights:
-
-```toml
-[[machines]]
-name = "PumpA"
-unit_id = 1
-
-[machines.registers]
-base_address = 40000
-mem-layout = "abcd"
-
-[[machines.registers.entries]]
-name = "Tank_Temperature"
-offset = 1
-data_type = "u16"
-access = "read_only"
-
-[[machines.registers.entries]]
-name = "Flow_Rate"
-offset = 2
-data_type = "f32"
-access = "read_only"
-
-[[machines.registers.entries]]
-name = "Stop_Process"
-offset = 4
-data_type = "u16"
-access = "read_write"
-
-[[machines.registers.entries]]
-name = "Setpoint"
-offset = 5
-data_type = "u16"
-access = "read_write"
-
-[machines.coils]
-base_address = 0
-
-[[machines.coils.entries]]
-name = "Motor_Running"
-offset = 1
-
-[[machines.coils.entries]]
-name = "Alarm_Reset"
-offset = 2
-
-[[machines]]
-name = "PumpB"
-unit_id = 2
-
-[machines.coils]
-base_address = 0
-
-[[machines.coils.entries]]
-name = "Motor_Running"
-offset = 1
-```
-
-Discrete inputs (FC 0x02) mirror coils — same `base_address`/`offset`/`name` shape, always exactly 1 bit — but are always read-only, since no Modbus function code ever lets a master write one:
-
-```toml
-[machines.discrete-inputs]
-base_address = 10000
-
-[[machines.discrete-inputs.entries]]
-name = "Door_Open_Sensor"
-offset = 1
-```
-
-Input registers (FC 0x04) mirror `[machines.registers]` minus `access` (always read-only) — they still need their own `mem-layout`, since a value can span multiple registers exactly like holding registers:
-
-```toml
-[machines.input-registers]
-base_address = 30000
-mem-layout = "abcd"
-
-[[machines.input-registers.entries]]
-name = "Flow_Rate"
-offset = 1
-data_type = "f32"
-```
-
-All four sections (`[machines.registers]`, `[machines.coils]`, `[machines.discrete-inputs]`, `[machines.input-registers]`) are independently optional per machine — a machine only declares the ones it actually has.
-
-File records (FC 0x14/0x15) are a different shape from every other section: no `base_address`/`offset` and no `name` — `file_number`/`record_number` *are* the address, and the FUSE path itself (`file-records/<file_number>/<record_number>`) is the identifier. `record_length` is in 16-bit words, matching the wire field's own unit:
-
-```toml
-[[machines.file-records]]
-file_number = 20
-record_number = 5
-record_length = 9
-```
-
-`[[machines.file-records]]` is a flat, independently-optional array per machine — no wrapping section. See the function code table above for how content is exposed (raw hex, no field decoding).
-
-## Directory permissions
-
-By default every top-level directory (`holding-registers/`, `transactions/`, `report/`, `coils/`) is mode `0755`, owned by whoever made a given filesystem request (`fuse` layer) or by the process's own real user (`files` layer) — the same behavior as before this option existed. An optional `fuse-permissions.toml`, passed to either binary via `--fuse-permissions <path>` (see [Getting started](#getting-started)) and applying identically under `fuse`/`files`, overrides `mode`/`uid`/`gid` per directory. Every field, and every directory section, is optional — only what actually needs restricting has to be spelled out. `--data-representation-layer mqtt` has no directories at all, so `--fuse-permissions` is accepted but ignored under it — its socket file (`server-data.sock`) is always mode `0600`, not configurable:
-
-```toml
-[transactions]
-mode = 0o700
-uid = 1000
-gid = 1000
-
-[report]
-mode = 0o444
-```
-
-Under `fuse`, both binaries mount with the kernel's `default_permissions` option, so these values are enforced by the kernel itself, not just displayed by `ls -l`. Under `files`, the same values are applied as real `chmod`/`chown` calls on the underlying directories — note that setting `uid`/`gid` to anything other than the server/client process's own real user requires the process to actually have `CAP_CHOWN` (root); an unprivileged process configuring a different owner will fail at startup with a permission error. Either way, the usual Unix rules apply, including that a directory needs its own execute bit to be enterable at all — a directory meant to stay "read-only but still browsable" needs e.g. `0o555`, not `0o444`, since `0o444` alone makes everything inside it completely unreachable, even to its own owner.
-
-One `fuse-permissions.toml` applies identically to *every* machine's own subtree — there's no per-machine override, `[transactions]` above means "every machine's `transactions/` directory", not one specific machine's.
-
-`client-trust/` (server-only, see [Connecting over TLS](#connecting-over-tls)) cannot be configured here at all — a `[client-trust]` section anywhere in this file is a hard parse error at startup, not a silently-ignored setting. It is always mode `0700` (its files `0400`), owned by the server process's own real user, regardless of `fuse-permissions.toml` — enforced for real under both representation layers.
-
-## server-options.toml
-
-`server` only answers the function codes a technician explicitly enables — **strict default-deny, no exceptions for already-implemented ones.** Without `--server-options <path>` (see [Run the server](#run-the-server)), or with a present-but-empty file, every function code is disabled and every incoming request gets an `ILLEGAL_FUNCTION` exception, regardless of what this project actually implements. `server` prints a loud startup warning if it ends up with zero function codes enabled, since "the server starts fine but answers nothing" is an easy flag to forget.
-
-This is a `server`-only concern: `client` only ever sends function codes it itself chooses to issue, so there's nothing to gate on that side. Every function code this server *can* serve is attack surface exposed to any reachable Modbus master, not just a trusted one — enabling one is a deliberate technician choice, not an on-by-default assumption.
-
-The file has one `[function-codes]` table, one boolean per function code, named after the operation rather than a raw code number:
-
-```toml
-[function-codes]
-read_coils = true                      # 0x01
-read_discrete_inputs = true            # 0x02
-read_holding_registers = true          # 0x03
-read_input_registers = true            # 0x04
-write_single_coil = true               # 0x05
-write_single_register = true           # 0x06
-write_multiple_coils = true            # 0x0F
-write_multiple_registers = true        # 0x10
-report_server_id = true                # 0x11
-read_file_record = true                # 0x14
-write_file_record = false              # 0x15
-mask_write_register = true             # 0x16
-read_write_multiple_registers = true   # 0x17
-read_fifo_queue = false                # 0x18 (not implemented yet — the key exists, but there's no handler to enable)
-read_device_identification = true      # 0x2B / MEI 0x0E
-```
-
-Every key is optional and defaults to `false` — only list what actually needs enabling. An unknown key anywhere under `[function-codes]` (or any other top-level key in the file) is a hard parse error at startup, not a silently-ignored setting, same discipline `fuse-permissions.toml` uses for an unrecognized `[client-trust]` section — a typo shouldn't leave a technician wrongly believing a function code is enabled.
-
-A disabled function code and one that was never implemented at all respond with the exact same `ILLEGAL_FUNCTION` exception — deliberately indistinguishable on the wire, so a remote peer can't tell "implemented but turned off" apart from "doesn't exist here" just from the response. This composes cleanly with [device description discovery](#device-description-discovery-fc-43): disabling `read_device_identification` needs no special handling on the client side, since its FC 43 fetch already falls back to the local TOML on any failure, `ILLEGAL_FUNCTION` included.
-
-## Current limitations
-
-This project is under active development. As of now:
-
-- `u8`/`i8` registers each occupy a whole 16-bit register (in the low byte) rather than two of them being packed into one — no real device was found that packs independent named values that way, so the simpler representation was kept.
-- FC 43 (device identification) only supports "Extended" access serving custom private objects (the mechanism used for description discovery above) — the standard VendorName/ProductCode/etc. objects and Basic/Regular/Individual access aren't implemented yet.
-- RTU serial parameters beyond baud rate (data bits, parity, stop bits) aren't configurable yet; fixed defaults (8 data bits, no parity, 1 stop bit) are used.
-- `tls+tcp://`'s admin socket path, TLS identity directories, `approved-clients.toml`'s own path, and DoS-hardening limits (handshake timeout, connection caps — see [Connecting over TLS](#connecting-over-tls)) are all fixed constants, not yet configurable via a CLI flag. Protection against a flood from many different source addresses is explicitly out of scope for the application layer itself. RTU's serial link remains a separate, unauthenticated threat model that TLS does nothing to address.
-- `client` always mounts **every** machine in its device description — there's no way yet to mount only a subset (e.g. a `--machines PumpA,PumpB` allowlist), though this is a planned follow-up.
-- The MQTT/Sparkplug B layer's Edge Node side has been run against the official Sparkplug TCK (Technology Compatibility Kit)'s `SessionEstablishmentTest`, which caught and led to fixes for four real conformance gaps (`bdSeq` not persisting across restarts, wrong publish QoS, a missing `Node Control/Rebirth` metric, a missing per-metric timestamp, and a missing Primary Host STATE-wait capability — see `CLAUDE.md`'s MQTT section for details); every assertion that test runs now passes. Only `SessionEstablishmentTest` has been exercised so far — other TCK test suites (e.g. Device profile) remain unrun, and the TCK has no formal written-report artifact from this project's testing (results were read directly from the TCK's own real-time log output via a direct-MQTT control script instead of its web console — equally valid evidence, just not the auto-generated file). `server-data.sock`'s path, and the embedded broker's non-tuning defaults, are fixed constants, not yet CLI-configurable.
+Requires Linux. [`examples/`](examples/) has a ready-to-use, two-machine setup with a full copy-pasteable walkthrough — no edits needed. See [Getting started](docs/getting-started.md) for the full command-line reference for both binaries.
+
+## Documentation
+
+- [Getting started](docs/getting-started.md) — build, run the server, run the client.
+- [Interacting with the filesystem](docs/filesystem.md) — the `ls`/`cat`/`echo` walkthrough, plus device description discovery (FC 43).
+- [Device description TOML format](docs/device-description.md) — the full schema for describing one or more machines.
+- [Supported Modbus function codes](docs/function-codes.md) — every function code in the spec, and this project's status on each.
+- [MQTT (Sparkplug B) layer](docs/mqtt-sparkplug.md) — an alternative to the filesystem, for Node-RED/SCADA-style integration.
+- [Connecting over TLS](docs/tls.md) — mutual TLS with client approval.
+- [Directory permissions](docs/directory-permissions.md) — configuring `mode`/`uid`/`gid` per directory.
+- [server-options.toml](docs/server-options.md) — explicitly enabling which function codes `server` answers.
+- [Current limitations](docs/limitations.md).
+- `CLAUDE.md` — full architecture and design-decision history.
 
 ## Development
 
@@ -545,5 +78,3 @@ cargo test -p <crate-name> <test_name>   # run a single test in one crate
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
-
-See `CLAUDE.md` for the full architecture and design-decision history.
