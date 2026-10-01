@@ -1,8 +1,12 @@
 # infused_modbus
 
-A Modbus **client** (master) and Modbus **server** (slave) that expose the Modbus data they handle through a **FUSE filesystem** instead of — or in addition to — a conventional API. "Infused" refers to this live-updating FUSE projection of Modbus data: register values show up as readable files, and writes happen by writing to files, no client library required.
+A Modbus **client** (master) and Modbus **server** (slave) that expose the Modbus data they handle over **MQTT**, using the **Sparkplug B** topic/payload conventions — register values are published as Sparkplug metrics, and writes arrive as Sparkplug `DCMD` commands, so any Sparkplug-aware consumer (Node-RED, an MES, a SCADA host) can integrate without a custom client library.
 
-Both **Modbus TCP** and **Modbus RTU** (serial) are supported, symmetrically, for both the client and the server, plus a TLS-secured TCP transport with mutual TLS and a client-approval workflow. An alternative MQTT/Sparkplug B representation is also available, for integrating with Node-RED/SCADA-style tooling instead of a filesystem. See [Documentation](#documentation) below for the details on all of this.
+Both **Modbus TCP** and **Modbus RTU** (serial) are supported, symmetrically, for both the client and the server, plus a TLS-secured TCP transport with mutual TLS and a client-approval workflow. See [Documentation](#documentation) below for the details on all of this.
+
+## Why "infused_modbus"?
+
+The name comes from this project's original design: a live-updating **FUSE** filesystem projection of Modbus data — register values as readable files, writes as file writes, no client library required ("infused" referring to Modbus data infused into the filesystem). Two representation layers were built on that idea, a real FUSE mount and later a plain-files-on-disk variant meant to avoid some of FUSE's own overhead — both worked, but in practice both still carried real races and round-trip overhead that proved hard to eliminate cleanly (see `CLAUDE.md`'s "Pluggable data-representation layer" section for the specifics). Rather than continuing to chase that, development now focuses entirely on the MQTT/Sparkplug B layer instead — the filesystem-based layers still exist in the codebase for now (bugfixes only, not under active development) but are no longer this project's primary interface or direction. The name stuck anyway.
 
 ## ⚠️ This project was built entirely with AI assistance
 
@@ -21,12 +25,11 @@ Nothing here shipped without a human decision behind it, but essentially all of 
 
 ## What this is
 
-- **No separate client API — the filesystem is the interface.** Reading a register's current value is `cat holding-registers/Tank_Temperature`. Writing one is `echo 55 > transactions/Stop_Process`.
-- **Three interchangeable data-representation layers.** Real files on disk (the default), a synthetic FUSE mount, or an MQTT/Sparkplug B interface — same underlying data either way. See [Getting started](docs/getting-started.md).
-- **Writes are staged and confirmed, not optimistic.** The client only updates its local mirror once a write is actually confirmed by the device; the server, having no separate device to confirm against, applies writes to its own directly-writable files immediately. See [Interacting with the filesystem](docs/filesystem.md).
+- **Data is exposed over MQTT, using Sparkplug B.** `client` embeds its own MQTT broker and publishes each machine as a Sparkplug B Device under its own Edge Node (`NBIRTH`/`DBIRTH` once at startup, `NDATA`/`DDATA` on change); a write arrives as a `DCMD`. `server` exposes a small local socket an external system can use to read/update its own dataset directly. See [MQTT (Sparkplug B) layer](docs/mqtt-sparkplug.md).
+- **Writes are confirmed, not optimistic.** The client only updates its own view of a register once a write is actually confirmed by the device; the server, having no separate device to confirm against, applies a direct write to its own state immediately.
 - **TCP and RTU use the same code paths**, and the server can advertise its own register description to the client over the wire (FC 43) instead of relying on a hand-kept copy staying in sync.
 - **Modbus implemented from scratch** — the `protocol` crate implements TCP/RTU framing, CRC16, and PDU encode/decode directly, rather than wrapping an existing crate.
-- **One device description can describe several machines sharing one link** — e.g. several PLCs on one RTU multi-drop bus — each mounted under its own top-level directory. See [Device description TOML format](docs/device-description.md).
+- **One device description can describe several machines sharing one link** — e.g. several PLCs on one RTU multi-drop bus — each published as its own Sparkplug B Device. See [Device description TOML format](docs/device-description.md).
 - **`client` reconnects automatically** with exponential backoff if the connection breaks, retrying forever — no manual restart needed.
 
 See [Documentation](#documentation) below for the full picture, and `CLAUDE.md` for the design rationale behind all of it.
@@ -58,16 +61,16 @@ Requires Linux. [`examples/`](examples/) has a ready-to-use, two-machine setup w
 
 ## Documentation
 
+- [MQTT (Sparkplug B) layer](docs/mqtt-sparkplug.md) — the primary data interface.
 - [Getting started](docs/getting-started.md) — build, run the server, run the client.
-- [Interacting with the filesystem](docs/filesystem.md) — the `ls`/`cat`/`echo` walkthrough, plus device description discovery (FC 43).
 - [Device description TOML format](docs/device-description.md) — the full schema for describing one or more machines.
 - [Supported Modbus function codes](docs/function-codes.md) — every function code in the spec, and this project's status on each.
-- [MQTT (Sparkplug B) layer](docs/mqtt-sparkplug.md) — an alternative to the filesystem, for Node-RED/SCADA-style integration.
 - [Connecting over TLS](docs/tls.md) — mutual TLS with client approval.
-- [Directory permissions](docs/directory-permissions.md) — configuring `mode`/`uid`/`gid` per directory.
 - [server-options.toml](docs/server-options.md) — explicitly enabling which function codes `server` answers.
 - [Current limitations](docs/limitations.md).
 - `CLAUDE.md` — full architecture and design-decision history.
+
+Legacy, bugfixes only (see [Why "infused_modbus"?](#why-infused_modbus) above): [Interacting with the filesystem](docs/filesystem.md), [Directory permissions](docs/directory-permissions.md).
 
 ## Development
 
