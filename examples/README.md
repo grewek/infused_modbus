@@ -113,3 +113,11 @@ See [`nodered/`](nodered/README.md) for a Docker-based Node-RED test rig —
 swap `--data-representation-layer mqtt` into the `client` command above and
 watch/send Sparkplug B traffic from a real, independent Sparkplug
 implementation.
+
+## A custom Modbus server built on `ServerHandle`
+
+See [`rolling_door/`](rolling_door/README.md) for a standalone Rust project
+— a roller shutter door (emergency stop, light barrier, motor, remote
+open/close) implemented as a real Modbus server whose own internal logic is
+driven entirely through `server::server_handle::ServerHandle`'s typed Rust
+API, not Modbus wire code.

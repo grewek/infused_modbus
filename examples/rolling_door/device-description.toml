@@ -1,0 +1,61 @@
+# A single roller shutter / industrial roll-up door ("Rolltor").
+#
+# Open_Command/Close_Command are real coils, writable by any Modbus master
+# (e.g. a building automation system) -- the door's remote control
+# interface.
+#
+# Everything else is local panel/safety I/O: hardwired physical switches a
+# real door controller would never expose as remotely *writable* (an
+# emergency stop you could trip over the network defeats its own purpose).
+# Modeled as discrete inputs/an input register -- read-only over the wire,
+# but directly writable *locally* on the server (see CLAUDE.md's "server
+# direct-write model"), which is exactly what this example's simulation
+# loop uses `ServerHandle` for.
+
+[[machines]]
+name = "RollingDoor"
+unit_id = 1
+server-id = "rolling-door-demo"
+
+[machines.coils]
+base_address = 0
+
+[[machines.coils.entries]]
+name = "Open_Command"
+offset = 1
+
+[[machines.coils.entries]]
+name = "Close_Command"
+offset = 2
+
+[machines.discrete-inputs]
+base_address = 0
+
+[[machines.discrete-inputs.entries]]
+name = "Emergency_Stop"
+offset = 1
+
+[[machines.discrete-inputs.entries]]
+name = "Light_Barrier"
+offset = 2
+
+[[machines.discrete-inputs.entries]]
+name = "Motor_Running"
+offset = 3
+
+[[machines.discrete-inputs.entries]]
+name = "Fully_Open"
+offset = 4
+
+[[machines.discrete-inputs.entries]]
+name = "Fully_Closed"
+offset = 5
+
+[machines.input-registers]
+base_address = 0
+mem-layout = "abcd"
+
+[[machines.input-registers.entries]]
+name = "Door_Position"
+offset = 1
+data_type = "u8"

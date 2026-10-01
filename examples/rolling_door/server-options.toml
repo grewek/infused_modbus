@@ -1,0 +1,7 @@
+[function-codes]
+read_coils = true
+write_single_coil = true
+write_multiple_coils = true
+read_discrete_inputs = true
+read_input_registers = true
+read_device_identification = true

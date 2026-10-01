@@ -1,0 +1,19 @@
+[package]
+name = "rolling_door_server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+protocol = { path = "../../protocol" }
+datafs = { path = "../../datafs" }
+server = { path = "../../server" }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "io-util",
+    "io-std",
+    "sync",
+    "signal",
+] }
