@@ -58,7 +58,7 @@ pub struct EdgeNodeConnection {
     pub ncmd_receiver: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
 }
 
-fn current_timestamp_millis() -> u64 {
+pub(crate) fn current_timestamp_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is before the Unix epoch")
@@ -203,7 +203,7 @@ impl EdgeNodeConnection {
         )
         .expect("NBIRTH is a node-scoped message type and never needs a device_id");
         self.client
-            .publish(topic, QoS::AtLeastOnce, false, payload_bytes)
+            .publish(topic, QoS::AtMostOnce, false, payload_bytes)
             .await
     }
 
@@ -232,7 +232,7 @@ impl EdgeNodeConnection {
         )
         .expect("DBIRTH is a device-scoped message type and always carries a device_id");
         self.client
-            .publish(topic, QoS::AtLeastOnce, false, payload_bytes)
+            .publish(topic, QoS::AtMostOnce, false, payload_bytes)
             .await
     }
 
@@ -255,7 +255,7 @@ impl EdgeNodeConnection {
         )
         .expect("DDEATH is a device-scoped message type and always carries a device_id");
         self.client
-            .publish(topic, QoS::AtLeastOnce, false, payload_bytes)
+            .publish(topic, QoS::AtMostOnce, false, payload_bytes)
             .await
     }
 
@@ -287,7 +287,7 @@ impl EdgeNodeConnection {
         )
         .expect("DDATA is a device-scoped message type and always carries a device_id");
         self.client
-            .publish(topic, QoS::AtLeastOnce, false, payload_bytes)
+            .publish(topic, QoS::AtMostOnce, false, payload_bytes)
             .await
     }
 
@@ -307,7 +307,7 @@ impl EdgeNodeConnection {
         let topic = build_topic(&self.group_id, MessageType::NData, &self.edge_node_id, None)
             .expect("NDATA is a node-scoped message type and never needs a device_id");
         self.client
-            .publish(topic, QoS::AtLeastOnce, false, payload_bytes)
+            .publish(topic, QoS::AtMostOnce, false, payload_bytes)
             .await
     }
 }
@@ -358,9 +358,11 @@ mod tests {
             };
             let nbirth = decode_payload(&nbirth_bytes).unwrap();
             assert_eq!(nbirth.seq, Some(0));
-            assert_eq!(nbirth.metrics.len(), 1);
+            assert_eq!(nbirth.metrics.len(), 2);
             assert_eq!(nbirth.metrics[0].name, "bdSeq");
             assert_eq!(nbirth.metrics[0].value, MetricValue::Long(0));
+            assert_eq!(nbirth.metrics[1].name, "Node Control/Rebirth");
+            assert_eq!(nbirth.metrics[1].value, MetricValue::Boolean(false));
 
             // the counter used to build NBIRTH is preserved, not discarded,
             // ready for the next message (NDATA, once M6 sends one) to
@@ -401,6 +403,7 @@ mod tests {
             let metrics = vec![Metric {
                 name: "Tank_Temperature".to_string(),
                 alias: Some(0),
+                timestamp: None,
                 data_type: sparkplug::data_type::DataType::UInt16,
                 value: MetricValue::Int(21),
             }];
@@ -467,6 +470,7 @@ mod tests {
             let metrics = vec![Metric {
                 name: "Tank_Temperature".to_string(),
                 alias: Some(0),
+                timestamp: None,
                 data_type: sparkplug::data_type::DataType::UInt16,
                 value: MetricValue::Int(23),
             }];

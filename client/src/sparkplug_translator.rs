@@ -179,6 +179,7 @@ pub fn build_machine_metrics(
     aliases: &AliasAllocator,
 ) -> Vec<Metric> {
     let mut metrics = Vec::new();
+    let timestamp_millis = Some(crate::edge_node::current_timestamp_millis());
 
     {
         let register_store = stores
@@ -192,6 +193,7 @@ pub fn build_machine_metrics(
             metrics.push(Metric {
                 name: register.name.clone(),
                 alias: aliases.alias_for(&machine.name, &register.name),
+                timestamp: timestamp_millis,
                 data_type: map_data_type(register.data_type),
                 value: map_register_value(value),
             });
@@ -205,6 +207,7 @@ pub fn build_machine_metrics(
             metrics.push(Metric {
                 name: coil.name.clone(),
                 alias: aliases.alias_for(&machine.name, &coil.name),
+                timestamp: timestamp_millis,
                 data_type: SparkplugDataType::Boolean,
                 value: map_coil_value(value),
             });
@@ -223,6 +226,7 @@ pub fn build_machine_metrics(
             metrics.push(Metric {
                 name: discrete_input.name.clone(),
                 alias: aliases.alias_for(&machine.name, &discrete_input.name),
+                timestamp: timestamp_millis,
                 data_type: SparkplugDataType::Boolean,
                 value: map_coil_value(value),
             });
@@ -241,6 +245,7 @@ pub fn build_machine_metrics(
             metrics.push(Metric {
                 name: input_register.name.clone(),
                 alias: aliases.alias_for(&machine.name, &input_register.name),
+                timestamp: timestamp_millis,
                 data_type: map_data_type(input_register.data_type),
                 value: map_register_value(value),
             });
@@ -261,6 +266,7 @@ pub fn build_machine_metrics(
             metrics.push(Metric {
                 name: name.clone(),
                 alias: aliases.alias_for(&machine.name, &name),
+                timestamp: timestamp_millis,
                 data_type: SparkplugDataType::Bytes,
                 value: MetricValue::Bytes(value),
             });

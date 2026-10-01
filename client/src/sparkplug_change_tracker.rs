@@ -53,6 +53,7 @@ mod tests {
         Metric {
             name: "Tank_Temperature".to_string(),
             alias: Some(alias),
+            timestamp: None,
             data_type: DataType::UInt16,
             value,
         }

@@ -148,6 +148,7 @@ mod tests {
             metrics: vec![Metric {
                 name: "bdSeq".to_string(),
                 alias: None,
+                timestamp: None,
                 data_type: DataType::UInt64,
                 value: MetricValue::Long(3),
             }],
@@ -163,18 +164,21 @@ mod tests {
                 Metric {
                     name: "Tank_Temperature".to_string(),
                     alias: None,
+                    timestamp: None,
                     data_type: DataType::UInt16,
                     value: MetricValue::Int(21),
                 },
                 Metric {
                     name: "Motor_Running".to_string(),
                     alias: None,
+                    timestamp: None,
                     data_type: DataType::Boolean,
                     value: MetricValue::Boolean(true),
                 },
                 Metric {
                     name: "Flow_Rate".to_string(),
                     alias: None,
+                    timestamp: None,
                     data_type: DataType::Float,
                     value: MetricValue::Float(12.5),
                 },

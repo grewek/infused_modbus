@@ -1,13 +1,17 @@
 //! Encode/decode for Sparkplug B's `Metric` message — the missing link between
 //! `wire`'s raw protobuf primitives and `data_type`/`metric_value`'s pure data
-//! types. Deliberately minimal: `name` (field 1), `alias` (field 2), `datatype`
-//! (field 4), and the scalar `value` oneof (fields 10-16, via `MetricValue`)
-//! are modeled. `timestamp`/`is_historical`/`is_transient`/`is_null`/
-//! `metadata`/`properties` aren't yet — no concrete need for them has shown
-//! up; add them once one does, per this project's Extraction-Based
-//! Programming convention. (`alias` itself was added in M5, once
-//! `client::sparkplug_alias`'s per-Edge-Node alias assignment became a real
-//! need — M4 had deliberately left it out for the same reason.)
+//! types. Deliberately minimal: `name` (field 1), `alias` (field 2),
+//! `timestamp` (field 3), `datatype` (field 4), and the scalar `value` oneof
+//! (fields 10-16, via `MetricValue`) are modeled. `is_historical`/
+//! `is_transient`/`is_null`/`metadata`/`properties` aren't yet — no concrete
+//! need for them has shown up; add them once one does, per this project's
+//! Extraction-Based Programming convention. (`alias` itself was added in M5,
+//! once `client::sparkplug_alias`'s per-Edge-Node alias assignment became a
+//! real need — M4 had deliberately left it out for the same reason.
+//! `timestamp` was added after the Eclipse Sparkplug TCK's
+//! `payloads-name-birth-data-requirement` assertion caught every metric in
+//! NBIRTH/DBIRTH/NDATA/DDATA missing it — a metric-level timestamp, distinct
+//! from `Payload`'s own top-level one.)
 
 use crate::data_type::DataType;
 use crate::metric_value::MetricValue;
@@ -15,6 +19,7 @@ use crate::wire::{self, Tag, WireType};
 
 const FIELD_NAME: u32 = 1;
 const FIELD_ALIAS: u32 = 2;
+const FIELD_TIMESTAMP: u32 = 3;
 const FIELD_DATATYPE: u32 = 4;
 const FIELD_INT_VALUE: u32 = 10;
 const FIELD_LONG_VALUE: u32 = 11;
@@ -28,6 +33,7 @@ const FIELD_BYTES_VALUE: u32 = 16;
 pub struct Metric {
     pub name: String,
     pub alias: Option<u64>,
+    pub timestamp: Option<u64>,
     pub data_type: DataType,
     pub value: MetricValue,
 }
@@ -72,6 +78,17 @@ pub fn encode_metric(metric: &Metric, buffer: &mut Vec<u8>) {
             buffer,
         );
         wire::encode_varint(alias, buffer);
+    }
+
+    if let Some(timestamp) = metric.timestamp {
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_TIMESTAMP,
+                wire_type: WireType::Varint,
+            },
+            buffer,
+        );
+        wire::encode_varint(timestamp, buffer);
     }
 
     wire::encode_tag(
@@ -166,6 +183,7 @@ pub fn encode_metric(metric: &Metric, buffer: &mut Vec<u8>) {
 pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
     let mut name: Option<String> = None;
     let mut alias: Option<u64> = None;
+    let mut timestamp: Option<u64> = None;
     let mut data_type: Option<DataType> = None;
     let mut value: Option<MetricValue> = None;
 
@@ -183,6 +201,11 @@ pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
             FIELD_ALIAS => {
                 let (value, consumed) = wire::decode_varint(&bytes[offset..])?;
                 alias = Some(value);
+                offset += consumed;
+            }
+            FIELD_TIMESTAMP => {
+                let (value, consumed) = wire::decode_varint(&bytes[offset..])?;
+                timestamp = Some(value);
                 offset += consumed;
             }
             FIELD_DATATYPE => {
@@ -245,6 +268,7 @@ pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
     Ok(Metric {
         name: name.unwrap_or_default(),
         alias,
+        timestamp,
         data_type: data_type.ok_or(DecodeError::MissingDataType)?,
         value: value.ok_or(DecodeError::MissingValue)?,
     })
@@ -265,6 +289,7 @@ mod tests {
         round_trip(Metric {
             name: "Status_Flags".to_string(),
             alias: None,
+            timestamp: None,
             data_type: DataType::UInt8,
             value: MetricValue::Int(42),
         });
@@ -275,6 +300,18 @@ mod tests {
         round_trip(Metric {
             name: "Tank_Temperature".to_string(),
             alias: Some(7),
+            timestamp: None,
+            data_type: DataType::UInt16,
+            value: MetricValue::Int(21),
+        });
+    }
+
+    #[test]
+    fn round_trips_with_a_timestamp_present() {
+        round_trip(Metric {
+            name: "Tank_Temperature".to_string(),
+            alias: None,
+            timestamp: Some(1_700_000_000_000),
             data_type: DataType::UInt16,
             value: MetricValue::Int(21),
         });
@@ -285,6 +322,7 @@ mod tests {
         round_trip(Metric {
             name: "bdSeq".to_string(),
             alias: None,
+            timestamp: None,
             data_type: DataType::UInt64,
             value: MetricValue::Long(7),
         });
@@ -295,6 +333,7 @@ mod tests {
         round_trip(Metric {
             name: "Frequency".to_string(),
             alias: None,
+            timestamp: None,
             data_type: DataType::Float,
             value: MetricValue::Float(50.05),
         });
@@ -305,6 +344,7 @@ mod tests {
         round_trip(Metric {
             name: "Flow_Rate".to_string(),
             alias: None,
+            timestamp: None,
             data_type: DataType::Double,
             value: MetricValue::Double(12.345_678_9),
         });
@@ -315,6 +355,7 @@ mod tests {
         round_trip(Metric {
             name: "Motor_Running".to_string(),
             alias: None,
+            timestamp: None,
             data_type: DataType::Boolean,
             value: MetricValue::Boolean(true),
         });
@@ -325,6 +366,7 @@ mod tests {
         round_trip(Metric {
             name: "server-id".to_string(),
             alias: None,
+            timestamp: None,
             data_type: DataType::String,
             value: MetricValue::String("pump-a-plc".to_string()),
         });
@@ -335,6 +377,7 @@ mod tests {
         round_trip(Metric {
             name: "file-record".to_string(),
             alias: None,
+            timestamp: None,
             data_type: DataType::Bytes,
             value: MetricValue::Bytes(vec![0x0D, 0xFE, 0x00, 0x20]),
         });
@@ -406,6 +449,7 @@ mod tests {
             Ok(Metric {
                 name: String::new(),
                 alias: Some(7),
+                timestamp: None,
                 data_type: DataType::UInt16,
                 value: MetricValue::Int(21),
             })
@@ -415,10 +459,11 @@ mod tests {
     #[test]
     fn decode_skips_unknown_field_and_still_parses_known_ones() {
         let mut buffer = Vec::new();
-        // An unmodeled field: timestamp (field 3), varint wire type.
+        // An unmodeled field: field number 50 (unused by any field this
+        // crate models), varint wire type.
         wire::encode_tag(
             Tag {
-                field_number: 3,
+                field_number: 50,
                 wire_type: WireType::Varint,
             },
             &mut buffer,
@@ -428,6 +473,7 @@ mod tests {
         let metric = Metric {
             name: "Tank_Temperature".to_string(),
             alias: None,
+            timestamp: None,
             data_type: DataType::UInt16,
             value: MetricValue::Int(21),
         };

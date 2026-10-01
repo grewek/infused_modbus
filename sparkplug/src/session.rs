@@ -10,13 +10,35 @@ use crate::payload::Payload;
 use crate::seq_counter::SeqCounter;
 
 const BD_SEQ_METRIC_NAME: &str = "bdSeq";
+const REBIRTH_METRIC_NAME: &str = "Node Control/Rebirth";
 
-fn bd_seq_metric(bd_seq: u64) -> Metric {
+fn bd_seq_metric(bd_seq: u64, timestamp_millis: Option<u64>) -> Metric {
     Metric {
         name: BD_SEQ_METRIC_NAME.to_string(),
         alias: None,
+        timestamp: timestamp_millis,
         data_type: DataType::UInt64,
         value: MetricValue::Long(bd_seq),
+    }
+}
+
+/// The spec-mandated `Node Control/Rebirth` metric every `NBIRTH` must
+/// include (`DataType::Boolean`, value `false`) — what a Host Application
+/// writes `true` to (as a `NCMD`) to request a rebirth, see
+/// `client::sparkplug_command::is_rebirth_request`. Deliberately never
+/// assigned an alias, unlike every Modbus-derived metric
+/// `client::sparkplug_alias::AliasAllocator` allocates one for — this is a
+/// fixed, spec-defined control metric outside that translated alias space,
+/// and the Eclipse Sparkplug TCK's own
+/// `operational-behavior-data-commands-rebirth-name-aliases` assertion
+/// checks for exactly that.
+fn rebirth_metric(timestamp_millis: Option<u64>) -> Metric {
+    Metric {
+        name: REBIRTH_METRIC_NAME.to_string(),
+        alias: None,
+        timestamp: timestamp_millis,
+        data_type: DataType::Boolean,
+        value: MetricValue::Boolean(false),
     }
 }
 
@@ -29,7 +51,7 @@ fn bd_seq_metric(bd_seq: u64) -> Metric {
 pub fn build_ndeath_payload(bd_seq: u64) -> Payload {
     Payload {
         timestamp: None,
-        metrics: vec![bd_seq_metric(bd_seq)],
+        metrics: vec![bd_seq_metric(bd_seq, None)],
         seq: None,
     }
 }
@@ -48,7 +70,10 @@ pub fn build_nbirth_payload(
     let seq = seq_counter.next_seq();
     Payload {
         timestamp: Some(timestamp_millis),
-        metrics: vec![bd_seq_metric(bd_seq)],
+        metrics: vec![
+            bd_seq_metric(bd_seq, Some(timestamp_millis)),
+            rebirth_metric(Some(timestamp_millis)),
+        ],
         seq: Some(u64::from(seq)),
     }
 }
@@ -145,6 +170,7 @@ mod tests {
             vec![Metric {
                 name: "bdSeq".to_string(),
                 alias: None,
+                timestamp: None,
                 data_type: DataType::UInt64,
                 value: MetricValue::Long(7),
             }]
@@ -159,13 +185,35 @@ mod tests {
         assert_eq!(payload.seq, Some(0));
         assert_eq!(
             payload.metrics,
-            vec![Metric {
-                name: "bdSeq".to_string(),
-                alias: None,
-                data_type: DataType::UInt64,
-                value: MetricValue::Long(7),
-            }]
+            vec![
+                Metric {
+                    name: "bdSeq".to_string(),
+                    alias: None,
+                    timestamp: Some(1_700_000_000_000),
+                    data_type: DataType::UInt64,
+                    value: MetricValue::Long(7),
+                },
+                Metric {
+                    name: "Node Control/Rebirth".to_string(),
+                    alias: None,
+                    timestamp: Some(1_700_000_000_000),
+                    data_type: DataType::Boolean,
+                    value: MetricValue::Boolean(false),
+                }
+            ]
         );
+    }
+
+    #[test]
+    fn nbirth_payload_rebirth_metric_never_carries_an_alias() {
+        let mut seq_counter = SeqCounter::new();
+        let payload = build_nbirth_payload(0, 0, &mut seq_counter);
+        let rebirth = payload
+            .metrics
+            .iter()
+            .find(|metric| metric.name == "Node Control/Rebirth")
+            .expect("NBIRTH must include the Node Control/Rebirth metric");
+        assert_eq!(rebirth.alias, None);
     }
 
     #[test]
@@ -198,6 +246,7 @@ mod tests {
         let metrics = vec![Metric {
             name: "Tank_Temperature".to_string(),
             alias: Some(0),
+            timestamp: Some(1_700_000_000_000),
             data_type: DataType::UInt16,
             value: MetricValue::Int(21),
         }];
@@ -241,6 +290,7 @@ mod tests {
         let metrics = vec![Metric {
             name: "Tank_Temperature".to_string(),
             alias: Some(0),
+            timestamp: Some(1_700_000_000_000),
             data_type: DataType::UInt16,
             value: MetricValue::Int(22),
         }];
@@ -259,6 +309,7 @@ mod tests {
         let metrics = vec![Metric {
             name: "Connection_Healthy".to_string(),
             alias: None,
+            timestamp: Some(0),
             data_type: DataType::Boolean,
             value: MetricValue::Boolean(true),
         }];

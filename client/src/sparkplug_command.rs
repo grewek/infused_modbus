@@ -238,6 +238,7 @@ mod tests {
             metrics: vec![Metric {
                 name: String::new(),
                 alias: Some(alias),
+                timestamp: None,
                 data_type: DataType::UInt16,
                 value: MetricValue::Int(30),
             }],
@@ -261,6 +262,7 @@ mod tests {
             metrics: vec![Metric {
                 name: "Motor_Running".to_string(),
                 alias: None,
+                timestamp: None,
                 data_type: DataType::Boolean,
                 value: MetricValue::Boolean(true),
             }],
@@ -286,6 +288,7 @@ mod tests {
             metrics: vec![Metric {
                 name: String::new(),
                 alias: Some(alias_for_b),
+                timestamp: None,
                 data_type: DataType::UInt16,
                 value: MetricValue::Int(30),
             }],
@@ -306,6 +309,7 @@ mod tests {
             metrics: vec![Metric {
                 name: String::new(),
                 alias: Some(9999),
+                timestamp: None,
                 data_type: DataType::UInt16,
                 value: MetricValue::Int(30),
             }],
@@ -326,6 +330,7 @@ mod tests {
             metrics: vec![Metric {
                 name: String::new(),
                 alias: None,
+                timestamp: None,
                 data_type: DataType::UInt16,
                 value: MetricValue::Int(30),
             }],
@@ -347,6 +352,7 @@ mod tests {
             metrics: vec![Metric {
                 name: String::new(),
                 alias: Some(alias),
+                timestamp: None,
                 data_type: DataType::UInt16,
                 value: MetricValue::Boolean(true),
             }],
@@ -403,6 +409,7 @@ mod tests {
                 metrics: vec![Metric {
                     name: String::new(),
                     alias: Some(alias),
+                    timestamp: None,
                     data_type: DataType::UInt16,
                     value: MetricValue::Int(42),
                 }],
@@ -442,6 +449,7 @@ mod tests {
             metrics: vec![Metric {
                 name: "Node Control/Rebirth".to_string(),
                 alias: None,
+                timestamp: None,
                 data_type: DataType::Boolean,
                 value: MetricValue::Boolean(true),
             }],
@@ -457,6 +465,7 @@ mod tests {
             metrics: vec![Metric {
                 name: "Node Control/Rebirth".to_string(),
                 alias: None,
+                timestamp: None,
                 data_type: DataType::Boolean,
                 value: MetricValue::Boolean(false),
             }],
@@ -472,6 +481,7 @@ mod tests {
             metrics: vec![Metric {
                 name: "Some_Other_Command".to_string(),
                 alias: None,
+                timestamp: None,
                 data_type: DataType::Boolean,
                 value: MetricValue::Boolean(true),
             }],
@@ -551,6 +561,7 @@ mod tests {
                 metrics: vec![Metric {
                     name: "Node Control/Rebirth".to_string(),
                     alias: None,
+                    timestamp: None,
                     data_type: DataType::Boolean,
                     value: MetricValue::Boolean(true),
                 }],
