@@ -13,7 +13,14 @@ Most of the documentation lives **on the canvas itself**, as comment nodes —
 open the flow in the editor and read them before poking at anything. This
 README only covers getting the container running.
 
-## 1. Build and run the container
+## 1. Start a broker
+
+`client` no longer runs an MQTT broker itself (see `CLAUDE.md`'s "Embedded
+MQTT broker removed") — start the disposable test broker in
+[`examples/mqtt-broker/`](../mqtt-broker/README.md) first, since both
+Node-RED and `client` need one to connect to.
+
+## 2. Build and run the container
 
 ```sh
 docker build -t nodered-sparkplug-test examples/nodered
@@ -24,13 +31,13 @@ docker run -d --name nodered-sparkplug-test --network host \
 ```
 
 `--network host` is what lets the container reach `127.0.0.1:1883` — where
-`client`'s embedded broker listens by default — without any port-mapping
-setup. This is Linux-only, same constraint as the rest of this project (FUSE
-is Linux-only too).
+the test broker above listens — without any port-mapping setup. This is
+Linux-only, same constraint as the rest of this project (FUSE is
+Linux-only too).
 
 The editor is now at **http://localhost:1880**.
 
-## 2. Import the flow
+## 3. Import the flow
 
 Either paste `flow.json`'s contents via the editor's menu
 (**Import → paste**), or deploy it directly from the command line:
@@ -42,11 +49,12 @@ curl -s -X POST http://127.0.0.1:1880/flows \
     --data-binary @examples/nodered/flow.json
 ```
 
-## 3. Point `client` at it
+## 4. Point `client` at it
 
 ```sh
 cargo run -p client -- ignored examples/device-description.toml tcp://127.0.0.1:15020 \
-    --data-representation-layer mqtt --mqtt-group-id MyPlant --mqtt-edge-node-id Line1
+    --data-representation-layer mqtt --mqtt-broker 127.0.0.1:1883 \
+    --mqtt-group-id MyPlant --mqtt-edge-node-id Line1
 ```
 
 (Needs a running `server` too — see the top-level `examples/README.md` for
@@ -59,7 +67,7 @@ mqtt` on the client command there.)
 above. This is the single most common reason nothing appears to be
 happening — see the on-canvas comments for why it's not auto-discovered.
 
-## 4. What's in the flow
+## 5. What's in the flow
 
 - **Listener** (`mqtt sparkplug in` on `spBv1.0/#` → `debug`): shows every
   Sparkplug message from anything on the broker, decoded. The debug node
@@ -72,10 +80,13 @@ happening — see the on-canvas comments for why it's not auto-discovered.
   which metrics/values it sends without touching any code, then watch the
   write land for real over Modbus.
 
-## 5. Stop/remove
+## 6. Stop/remove
 
 ```sh
 docker stop nodered-sparkplug-test      # keeps the container + flow state
 docker rm nodered-sparkplug-test        # also drop the container (volume survives)
 docker volume rm nodered_sparkplug_data # also drop the saved flow/settings
 ```
+
+(Plus the broker from step 1 — see
+[`examples/mqtt-broker/`](../mqtt-broker/README.md#3-stopremove).)

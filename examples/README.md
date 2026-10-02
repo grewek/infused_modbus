@@ -109,8 +109,11 @@ connection succeeds).
 
 ## Trying the MQTT/Sparkplug B layer instead
 
-See [`nodered/`](nodered/README.md) for a Docker-based Node-RED test rig —
-swap `--data-representation-layer mqtt` into the `client` command above and
+`client` doesn't run an MQTT broker itself — see
+[`mqtt-broker/`](mqtt-broker/README.md) for a disposable one to test
+against, then swap `--data-representation-layer mqtt --mqtt-broker
+127.0.0.1:1883` into the `client` command above. See
+[`nodered/`](nodered/README.md) for a Docker-based Node-RED test rig to
 watch/send Sparkplug B traffic from a real, independent Sparkplug
 implementation.
 

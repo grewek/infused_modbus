@@ -6,7 +6,7 @@ A ready-to-use Node-RED test rig (Docker image + importable flow) for poking at 
 
 ## On `client`
 
-`client` connects to an already-running MQTT broker as a Sparkplug B **Edge Node**, with each configured machine published as its own **Device** under that Edge Node. This project does not run a broker itself — point `--mqtt-broker` at any Sparkplug-capable broker (Mosquitto, HiveMQ, EMQX, ...); see [`docker/mqtt-broker`](../docker/mqtt-broker/README.md) for a disposable one to test against:
+`client` connects to an already-running MQTT broker as a Sparkplug B **Edge Node**, with each configured machine published as its own **Device** under that Edge Node. This project does not run a broker itself — point `--mqtt-broker` at any Sparkplug-capable broker (Mosquitto, HiveMQ, EMQX, ...); see [`examples/mqtt-broker`](../examples/mqtt-broker/README.md) for a disposable one to test against:
 
 ```sh
 cargo run -p client -- ignored device.toml tcp://127.0.0.1:502 --data-representation-layer mqtt --mqtt-broker 127.0.0.1:1883 --mqtt-group-id MyPlant --mqtt-edge-node-id Line1

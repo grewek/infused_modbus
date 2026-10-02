@@ -115,7 +115,7 @@ fn usage() -> ! {
          <root> is ignored under mqtt, which has nothing to mount/write to disk.\n\
          --mqtt-broker <host:port> is the already-running MQTT broker this Edge Node connects \
          to (e.g. Mosquitto) — required under --data-representation-layer mqtt, this project \
-         does not run a broker itself. See docker/mqtt-broker for a disposable broker to test \
+         does not run a broker itself. See examples/mqtt-broker for a disposable broker to test \
          against.\n\
          --mqtt-group-id/--mqtt-edge-node-id set this Edge Node's Sparkplug B identity \
          (defaults: {DEFAULT_MQTT_GROUP_ID:?}/{DEFAULT_MQTT_EDGE_NODE_ID:?} — override \
@@ -619,7 +619,7 @@ fn main() {
         RepresentationLayer::Mqtt => {
             // This project doesn't run a broker itself — see CLAUDE.md's
             // "MQTT (Sparkplug B) representation layer" for why the
-            // embedded broker was removed. docker/mqtt-broker has a
+            // embedded broker was removed. examples/mqtt-broker has a
             // disposable one for local testing.
             let (broker_host, broker_port) = mqtt_broker.unwrap_or_else(|| {
                 panic!(
