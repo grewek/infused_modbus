@@ -493,7 +493,7 @@ User's proposal, refining the multi-machine design's already-shelved "FC43-direc
 
 **All detail questions above, and the (a)/(b)/(c) compression-architecture choice itself, are now resolved (2026-10-02) — see "(a) — compress the whole multi-machine blob" below the options table.** This whole section is fully designed; nothing is implemented yet.
 
-## Planned: dynamic per-machine subscription via Sparkplug B, as the real consumer for selective fetch (flagged 2026-10-02, spec-verified; scope decided 2026-10-02 — build both this and a static `--machines` flag, split by layer; mechanism details still open)
+## Planned: dynamic per-machine subscription via Sparkplug B, as the real consumer for selective fetch (flagged 2026-10-02, spec-verified, design fully decided 2026-10-02, not yet implemented)
 
 Motivation: the manifest+per-machine-FC20-fetch idea above has no payoff while `client` mounts **every** machine by default (no `--machines` subset flag exists). A static `--machines` CLI flag would trivially fix that for all three representation layers — but since this project now has Sparkplug B, the user asked whether the Edge Node could instead let a Host Application dynamically choose ("subscribe to") which machines to activate at runtime, making *that* the concrete consumer for selective fetch, scoped to the `mqtt` layer only.
 
@@ -527,6 +527,41 @@ Read literally, this means once *any* NDATA/DDATA has been published by the Edge
 **DataSet metric type, decided 2026-10-02: implement it in the `sparkplug` crate, not scoped narrowly to the manifest.** Justification given: this project will be extending `device-description.toml` and supporting richer metric types regardless (the per-value metadata fields above, the custom-function-codes design's own structured-field needs) — DataSet is a general capability worth having, with the manifest transport simply being its first concrete consumer, not the sole reason to build it.
 
 **`--machines` unknown-name handling, decided 2026-10-02:** log a message and continue — not a hard startup error. Matches the precedent already established elsewhere in this project (`transaction_consumer`/`sparkplug_command`'s own "unknown machine name: log and drop, don't treat as fatal" handling) rather than introducing a stricter, inconsistent failure mode just for this one new flag.
+
+## Implementation milestone plan for the three design threads above (planned 2026-10-02, implementation not yet started)
+
+Everything in the two sections above (FC43 capacity + Sparkplug selective subscription) plus the UN/ECE `unit` field is now fully designed. This milestone plan exists so the next session can start building directly instead of re-deriving sequencing — **no implementation work has started yet**, this is planning only, same granularity as the multi-machine 6-step plan and the `datafs`/MQTT 10/11-milestone plans elsewhere in this file.
+
+**Four largely-independent threads, in suggested execution order:**
+
+### Thread B — `sparkplug` crate foundations (do first: Thread C depends on it)
+- **B1.** `Metric.is_null` — wire into `encode_metric`/`decode_metric`, same pattern as `alias`/`timestamp` were added (explicit field on every call site, no `Default` impl, per this project's established precedent for growing this struct).
+- **B2.** `Metric.properties` (PropertySet) — the spec's generic per-metric metadata mechanism; needed later by the Node-RED dashboard plugin work and by UN/ECE unit exposure over Sparkplug, not only by this thread.
+- **B3.** DataSet metric value type — a general capability (per the 2026-10-02 decision above), first exercised by nothing in particular yet since the manifest's primary transport is plain TOML via FC43 (see Thread A), not Sparkplug — build it for its own sake as planned, don't force an immediate consumer.
+
+### Thread A — FC43 capacity fix (server/protocol-level, applies to all three representation layers equally)
+- **A1.** `detect_machine_layout` toggle: schema + parsing in `server::server_options`, wired into the gate.
+- **A2.** Fix the existing `assert!` panic in `device_identification::build_objects` to a clean Modbus exception — independent robustness fix, do it regardless of the rest of this thread's timing.
+- **A3.** Decide and hard-validate the reserved `file_number`: parse-time rejection if a user's own `[[file-records]]` entry collides with it.
+- **A4.** Add `miniz_oxide`, compress the full TOML once at server startup (gated by `detect_machine_layout`), cache the compressed bytes for the process's lifetime.
+- **A5.** Server: when the full (uncompressed) TOML exceeds FC43's budget, serve the small manifest (machine name/unit_id/`file_number`/compressed-length) via FC43's existing object mechanism instead — the existing small-description inline-chunk path stays completely untouched for anything that still fits.
+- **A6.** Server: FC20 dispatch for the reserved `file_number`, serving the cached compressed blob in chunks — a dedicated code path, not a reuse of `handle_read_file_record`'s static-declaration validation.
+- **A7.** Client: detect which of the two FC43 response shapes (full inline TOML vs. manifest) it got; if manifest, fetch the compressed blob via FC20 using the manifest's known length (`ceil(length / 249)` records, no continuation-flag ambiguity), decompress, parse as the real multi-machine TOML. Any failure at any step falls back to the local TOML file argument, same existing fallback chain.
+
+### Thread C — Sparkplug-driven selective subscription (`mqtt` layer only; needs B1 at minimum)
+- **C1.** `--machines <names>` CLI flag for `fuse`/`files` — optional, default mounts everything, unknown name logs and continues (per the decision above). Simple, no dependency on anything else in this plan — could even land before Thread A/B if a quick win is wanted.
+- **C2.** Client (`mqtt` layer): fetch every machine's full definition at startup unconditionally (via Thread A's mechanism once it exists, or today's existing plain FC43 fetch if the description is still small) and build each machine's full metric list.
+- **C3.** Client: publish full DBIRTH per machine immediately using `is_null=true` for every metric (needs B1) — no polling yet.
+- **C4.** Define the custom Subscribe/Unsubscribe NCMD metric convention — payload shape forward-compatible with later per-point granularity (`{machine, points: [...]}`, empty/omitted `points` = whole machine), per the explicit heads-up that finer granularity is coming later.
+- **C5.** Wire Subscribe → spawn that machine's existing `client::polling` task (no changes to the batching logic inside it).
+- **C6.** Wire Unsubscribe → stop that machine's polling task, publish DDEATH for it; unsubscribing the last machine returns the whole client to the dormant bootstrap state.
+
+### Thread D — UN/ECE `unit` field (mostly independent, can slot in anywhere)
+- **D1.** Pull the code list from `datasets/unece-units-of-measure`, build an embedded Rust table (code → name) from it, with a source comment crediting UN/CEFACT Rec. 20 — never reproduce the original document's own narrative text.
+- **D2.** Add `unit` to the per-value TOML schema (`protocol::device_description`), hard-validated against the full embedded table at parse time.
+- **D3. (Later, depends on B2):** expose `unit` as a Sparkplug `Metric.properties` entry once that exists — not scoped as part of this immediate plan, just the natural next step once both pieces exist.
+
+**Cross-thread note:** A and C are independent of each other in principle (A fixes "how does a big description get from server to client at all," C fixes "when does `client` bother polling Modbus") but C2 benefits directly from A once A exists for genuinely large deployments — building B → A → C in that order (as listed) avoids C needing its own throwaway version of "fetch a big description" before A provides the real one.
 
 ## Programmatic Rust API for `ServerHandle` — typed `set_*`/`get_*`, before any FFI layer (resolved and implemented 2026-10-01)
 
