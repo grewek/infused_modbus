@@ -486,7 +486,7 @@ User's proposal, refining the multi-machine design's already-shelved "FC43-direc
 
 **Explicitly not planned further than this yet** — the detail questions above and the (a)/(b)/(c) choice are the next things to work through, in that order.
 
-## Planned: dynamic per-machine subscription via Sparkplug B, as the real consumer for selective fetch (flagged 2026-10-02, spec-verified, design not finalized)
+## Planned: dynamic per-machine subscription via Sparkplug B, as the real consumer for selective fetch (flagged 2026-10-02, spec-verified; scope decided 2026-10-02 — build both this and a static `--machines` flag, split by layer; mechanism details still open)
 
 Motivation: the manifest+per-machine-FC20-fetch idea above has no payoff while `client` mounts **every** machine by default (no `--machines` subset flag exists). A static `--machines` CLI flag would trivially fix that for all three representation layers — but since this project now has Sparkplug B, the user asked whether the Edge Node could instead let a Host Application dynamically choose ("subscribe to") which machines to activate at runtime, making *that* the concrete consumer for selective fetch, scoped to the `mqtt` layer only.
 
@@ -509,7 +509,13 @@ Read literally, this means once *any* NDATA/DDATA has been published by the Edge
 
 **How this was checked:** the real Sparkplug B specification AsciiDoc source (`Sparkplug_1_Introduction.adoc` through `_8_HA.adoc`, plus the TCK's own `SessionEstablishmentTest.java`/`Requirements.java`), pulled from the still-present local `sparkplug-tck` Docker image (`/opt/sparkplug/specification/src/main/asciidoc/`, `/opt/sparkplug/tck/src/...`) built during the M10 TCK work — not from memory/recollection, per this project's established "check the real spec/source, don't guess" discipline (same rigor as the `sparkplug_b.proto` field-number cross-checks and the TCK bug-hunting sessions).
 
-**Explicitly not finalized yet:** this remains an alternative/complement to a plain static `--machines` CLI flag, not a replacement — the static flag is far simpler, needs no new Sparkplug extension work, and applies uniformly to `fuse`/`files`/`mqtt` alike, whereas the dynamic NCMD-driven approach is `mqtt`-only and adds real new surface (bootstrapping behavior if no Subscribe command ever arrives, whether/how a machine can be deselected at runtime — likely needs a DDEATH, not yet designed — and the DataSet-based manifest transport above). Whether to build the dynamic mechanism at all, build the static flag instead, or build both, is still an open decision.
+**Decided 2026-10-02: build both, split cleanly by representation layer, not as alternatives.** A static `--machines <names>` CLI flag (optional, defaults to mounting every machine, same backward-compatible shape as every other optional flag in this project) is the selection mechanism for `fuse`/`files` — both mount synchronously at startup, so a static, start-time choice is the natural fit, and neither has any Sparkplug session to drive something dynamic. Under `mqtt`, `--machines` is **not required at all** — selection happens entirely at runtime via the Sparkplug "Subscribe" NCMD mechanism above instead; a user running the `mqtt` layer never needs to pass `--machines` (most likely the flag is simply ignored there, same precedent as `<root>` already being ignored under `mqtt` — exact behavior if both are somehow combined still to be decided when this is implemented).
+
+**Still open, now more concrete since the scope is decided:**
+- Bootstrapping behavior if no Subscribe command ever arrives under `mqtt` (every machine birthed as `is_null` stubs forever, with nothing ever actually polled/fetched, is a valid-if-inert default — but worth deciding explicitly rather than leaving it as an accidental consequence).
+- Whether/how a machine can be deselected at runtime (likely needs a DDEATH — not yet designed).
+- The DataSet-based manifest transport question from above, if the manifest itself is to be carried over Sparkplug rather than (or in addition to) FC43.
+- `--machines`'s own exact semantics for `fuse`/`files`: unknown machine name in the list → hard error at startup or silently ignored? Case sensitivity? Not yet decided.
 
 ## Programmatic Rust API for `ServerHandle` — typed `set_*`/`get_*`, before any FFI layer (resolved and implemented 2026-10-01)
 
