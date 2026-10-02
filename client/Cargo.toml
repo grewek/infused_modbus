@@ -21,8 +21,11 @@ tokio = { version = "1", features = [
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-webpki = "0.103.15"
-rumqttd = "0.20"
-rumqttc = "0.25"
+# MQTT connection to an external broker is always plaintext in this project
+# (TLS exists only for the Modbus wire link, see client/src/connection.rs) —
+# rumqttc's own TLS feature (which transitively pulls in a second rustls
+# crypto provider, aws-lc-rs, alongside our own pinned `ring`) is unused.
+rumqttc = { version = "0.25", default-features = false }
 config = "0.14"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
@@ -30,3 +33,8 @@ toml = "0.8"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
 tempfile = "3.27.0"
+# Only used by the MQTT/Sparkplug test suite to spin up a real in-process
+# broker — this project connects to an already-running external broker in
+# production and never runs one itself (see CLAUDE.md's "MQTT (Sparkplug B)
+# representation layer").
+rumqttd = "0.20"
