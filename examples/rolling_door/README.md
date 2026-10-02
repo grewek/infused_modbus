@@ -47,7 +47,10 @@ Commands: estop | estop-clear | block | block-clear | status | help | quit (Ctrl
 
 Leave it running and, in another terminal, point this project's own
 `client` at it (see the top-level `examples/README.md` for the full
-walkthrough style):
+walkthrough style). For a real point-and-click UI instead of shell commands,
+see [`examples/nodered/`](../nodered/README.md)'s "Rolling Door" dashboard
+tab — gauges/buttons wired to this exact server over Sparkplug B
+(`--data-representation-layer mqtt`).
 
 ```sh
 mkdir -p /tmp/rolling-door-client

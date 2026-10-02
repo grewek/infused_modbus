@@ -208,5 +208,589 @@
         "x": 650,
         "y": 520,
         "wires": []
+    },
+    {
+        "id": "rd-ui-base",
+        "type": "ui-base",
+        "name": "Dashboard 2.0",
+        "path": "/dashboard",
+        "appIcon": "",
+        "includeClientData": true,
+        "acceptsClientConfig": [
+            "ui-notification",
+            "ui-control"
+        ],
+        "showPathInSidebar": false,
+        "showPageTitle": true,
+        "navigationStyle": "default",
+        "titleBarStyle": "default"
+    },
+    {
+        "id": "rd-ui-theme",
+        "type": "ui-theme",
+        "name": "Default Theme",
+        "colors": {
+            "surface": "#ffffff",
+            "primary": "#0094CE",
+            "bgPage": "#eeeeee",
+            "groupBg": "#ffffff",
+            "groupOutline": "#cccccc"
+        },
+        "sizes": {
+            "pagePadding": "12px",
+            "groupGap": "12px",
+            "groupBorderRadius": "4px",
+            "widgetGap": "12px",
+            "density": "default",
+            "pageWidth": "",
+            "sidebarWidth": "256px"
+        }
+    },
+    {
+        "id": "rd-ui-page",
+        "type": "ui-page",
+        "name": "Rolling Door",
+        "ui": "rd-ui-base",
+        "path": "/rolling-door",
+        "icon": "home",
+        "layout": "grid",
+        "theme": "rd-ui-theme",
+        "breakpoints": [
+            {
+                "name": "Default",
+                "px": "0",
+                "cols": "3"
+            },
+            {
+                "name": "Tablet",
+                "px": "576",
+                "cols": "6"
+            },
+            {
+                "name": "Desktop",
+                "px": "1024",
+                "cols": "9"
+            }
+        ],
+        "order": 1,
+        "className": "",
+        "visible": "true",
+        "disabled": "false"
+    },
+    {
+        "id": "rd-ui-group-status",
+        "type": "ui-group",
+        "name": "Status",
+        "page": "rd-ui-page",
+        "width": "6",
+        "height": "1",
+        "order": 1,
+        "showTitle": true,
+        "className": "",
+        "visible": "true",
+        "disabled": "false"
+    },
+    {
+        "id": "rd-ui-group-controls",
+        "type": "ui-group",
+        "name": "Controls",
+        "page": "rd-ui-page",
+        "width": "6",
+        "height": "1",
+        "order": 2,
+        "showTitle": true,
+        "className": "",
+        "visible": "true",
+        "disabled": "false"
+    },
+    {
+        "id": "rd-tab",
+        "type": "tab",
+        "label": "infused_modbus Rolling Door (Rolltor)",
+        "disabled": false,
+        "info": "Dashboard + Sparkplug B wiring for examples/rolling_door's Modbus server. See the comment node on the canvas and examples/nodered/README.md.",
+        "env": []
+    },
+    {
+        "id": "rd-comment-overview",
+        "type": "comment",
+        "z": "rd-tab",
+        "name": "OVERVIEW\n--------\nRun examples/rolling_door's Modbus server, then infused_modbus's `client` against it:\n  cargo run -p rolling_door_server\n  cargo run -p client -- ignored examples/rolling_door/device-description.toml tcp://127.0.0.1:15502 --data-representation-layer mqtt --mqtt-broker 127.0.0.1:1883 --mqtt-group-id NodeRedTest --mqtt-edge-node-id ClaudeClient\n\nOpen the dashboard at http://localhost:1880/dashboard/rolling-door once both are running.\n\nPITFALL - GROUP_ID/EDGE_NODE_ID are hardcoded in the function nodes below (same as the other tab's pitfall) - edit them there to match whatever --mqtt-group-id/--mqtt-edge-node-id you actually used. The device name (RollingDoor) is fixed - it comes from device-description.toml's [[machines]] name and doesn't need editing.\n\nPITFALL - the status widgets only populate once client's first DBIRTH arrives (or DDATA afterward for values that change) - if you deployed this flow after client already started, click 'Request Rebirth' to get a fresh snapshot of the current state instead of restarting client.",
+        "info": "",
+        "x": 150,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "rd-sub-in",
+        "type": "mqtt sparkplug in",
+        "z": "rd-tab",
+        "name": "RollingDoor birth/data",
+        "topic": "spBv1.0/+/+/+/RollingDoor",
+        "qos": "0",
+        "broker": "sp-broker-d1e66f9a",
+        "x": 210,
+        "y": 160,
+        "wires": [
+            [
+                "rd-split"
+            ]
+        ]
+    },
+    {
+        "id": "rd-split",
+        "type": "function",
+        "z": "rd-tab",
+        "name": "split metrics by name",
+        "info": "One output per known point - only fires an output when that specific metric is present in this message (DBIRTH carries all of them once; DDATA only carries what changed).",
+        "func": "const metrics = (msg.payload && msg.payload.metrics) || [];\nconst byName = {};\nfor (const m of metrics) {\n    byName[m.name] = m.value;\n}\nconst order = [\n    \"Door_Position\",\n    \"Motor_Running\",\n    \"Fully_Open\",\n    \"Fully_Closed\",\n    \"Emergency_Stop\",\n    \"Light_Barrier\"\n];\nreturn order.map((name) =>\n    Object.prototype.hasOwnProperty.call(byName, name) ? { payload: byName[name] } : null\n);",
+        "outputs": 6,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 460,
+        "y": 160,
+        "wires": [
+            [
+                "rd-gauge-position"
+            ],
+            [
+                "rd-fmt-motor"
+            ],
+            [
+                "rd-fmt-fully-open"
+            ],
+            [
+                "rd-fmt-fully-closed"
+            ],
+            [
+                "rd-fmt-estop"
+            ],
+            [
+                "rd-fmt-barrier"
+            ]
+        ]
+    },
+    {
+        "id": "rd-gauge-position",
+        "type": "ui-gauge",
+        "z": "rd-tab",
+        "name": "Door Position",
+        "group": "rd-ui-group-status",
+        "order": 1,
+        "width": 3,
+        "height": 3,
+        "gtype": "gauge-half",
+        "gstyle": "needle",
+        "title": "Door Position",
+        "alwaysShowTitle": false,
+        "floatingTitlePosition": "top-left",
+        "units": "%",
+        "icon": "",
+        "prefix": "",
+        "suffix": "",
+        "value": "payload",
+        "valueType": "msg",
+        "segments": [
+            {
+                "color": "#5CD65C",
+                "from": 0,
+                "text": "",
+                "textType": "label"
+            },
+            {
+                "color": "#FFC800",
+                "from": 40,
+                "text": "",
+                "textType": "label"
+            },
+            {
+                "color": "#EA5353",
+                "from": 70,
+                "text": "",
+                "textType": "label"
+            }
+        ],
+        "min": 0,
+        "max": 100,
+        "sizeThickness": 16,
+        "sizeGap": 4,
+        "sizeKeyThickness": 8,
+        "styleRounded": true,
+        "styleGlow": false,
+        "className": "",
+        "x": 760,
+        "y": 100,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "rd-fmt-motor",
+        "type": "function",
+        "z": "rd-tab",
+        "name": "format Motor_Running",
+        "func": "msg.payload = msg.payload ? \"\\ud83d\\udfe2 Running\" : \"\\u26aa Stopped\";\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 730,
+        "y": 140,
+        "wires": [
+            [
+                "rd-text-motor"
+            ]
+        ]
+    },
+    {
+        "id": "rd-text-motor",
+        "type": "ui-text",
+        "z": "rd-tab",
+        "group": "rd-ui-group-status",
+        "order": 2,
+        "width": 0,
+        "height": 0,
+        "name": "Motor",
+        "label": "Motor",
+        "format": "{{msg.payload}}",
+        "layout": "row-spread",
+        "className": "",
+        "style": false,
+        "font": "",
+        "fontSize": 16,
+        "color": "#000000",
+        "x": 990,
+        "y": 140,
+        "wires": []
+    },
+    {
+        "id": "rd-fmt-fully-open",
+        "type": "function",
+        "z": "rd-tab",
+        "name": "format Fully_Open",
+        "func": "msg.payload = msg.payload ? \"\\u2705 Open\" : \"\\u2014 not open\";\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 730,
+        "y": 180,
+        "wires": [
+            [
+                "rd-text-fully-open"
+            ]
+        ]
+    },
+    {
+        "id": "rd-text-fully-open",
+        "type": "ui-text",
+        "z": "rd-tab",
+        "group": "rd-ui-group-status",
+        "order": 3,
+        "width": 0,
+        "height": 0,
+        "name": "Fully Open",
+        "label": "Fully Open",
+        "format": "{{msg.payload}}",
+        "layout": "row-spread",
+        "className": "",
+        "style": false,
+        "font": "",
+        "fontSize": 16,
+        "color": "#000000",
+        "x": 990,
+        "y": 180,
+        "wires": []
+    },
+    {
+        "id": "rd-fmt-fully-closed",
+        "type": "function",
+        "z": "rd-tab",
+        "name": "format Fully_Closed",
+        "func": "msg.payload = msg.payload ? \"\\u2705 Closed\" : \"\\u2014 not closed\";\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 730,
+        "y": 220,
+        "wires": [
+            [
+                "rd-text-fully-closed"
+            ]
+        ]
+    },
+    {
+        "id": "rd-text-fully-closed",
+        "type": "ui-text",
+        "z": "rd-tab",
+        "group": "rd-ui-group-status",
+        "order": 4,
+        "width": 0,
+        "height": 0,
+        "name": "Fully Closed",
+        "label": "Fully Closed",
+        "format": "{{msg.payload}}",
+        "layout": "row-spread",
+        "className": "",
+        "style": false,
+        "font": "",
+        "fontSize": 16,
+        "color": "#000000",
+        "x": 990,
+        "y": 220,
+        "wires": []
+    },
+    {
+        "id": "rd-fmt-estop",
+        "type": "function",
+        "z": "rd-tab",
+        "name": "format Emergency_Stop",
+        "func": "msg.payload = msg.payload ? \"\\ud83d\\uded1 TRIPPED\" : \"OK\";\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 740,
+        "y": 260,
+        "wires": [
+            [
+                "rd-text-estop"
+            ]
+        ]
+    },
+    {
+        "id": "rd-text-estop",
+        "type": "ui-text",
+        "z": "rd-tab",
+        "group": "rd-ui-group-status",
+        "order": 5,
+        "width": 0,
+        "height": 0,
+        "name": "Emergency Stop",
+        "label": "Emergency Stop",
+        "format": "{{msg.payload}}",
+        "layout": "row-spread",
+        "className": "",
+        "style": false,
+        "font": "",
+        "fontSize": 16,
+        "color": "#000000",
+        "x": 1000,
+        "y": 260,
+        "wires": []
+    },
+    {
+        "id": "rd-fmt-barrier",
+        "type": "function",
+        "z": "rd-tab",
+        "name": "format Light_Barrier",
+        "func": "msg.payload = msg.payload ? \"\\ud83d\\udea7 BLOCKED\" : \"Clear\";\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 730,
+        "y": 300,
+        "wires": [
+            [
+                "rd-text-barrier"
+            ]
+        ]
+    },
+    {
+        "id": "rd-text-barrier",
+        "type": "ui-text",
+        "z": "rd-tab",
+        "group": "rd-ui-group-status",
+        "order": 6,
+        "width": 0,
+        "height": 0,
+        "name": "Light Barrier",
+        "label": "Light Barrier",
+        "format": "{{msg.payload}}",
+        "layout": "row-spread",
+        "className": "",
+        "style": false,
+        "font": "",
+        "fontSize": 16,
+        "color": "#000000",
+        "x": 990,
+        "y": 300,
+        "wires": []
+    },
+    {
+        "id": "rd-comment-controls",
+        "type": "comment",
+        "z": "rd-tab",
+        "name": "CONTROLS\n--------\nOpen/Close send a momentary DCMD, exactly like writing to transactions/Open_Command on the client's filesystem layers - the server clears the coil back to false the instant it's consumed. Request Rebirth asks client to republish NBIRTH+DBIRTH right now (see the overview comment for why that's sometimes necessary).",
+        "info": "",
+        "x": 170,
+        "y": 400,
+        "wires": []
+    },
+    {
+        "id": "rd-button-open",
+        "type": "ui-button",
+        "z": "rd-tab",
+        "name": "Open",
+        "group": "rd-ui-group-controls",
+        "order": 1,
+        "width": 0,
+        "height": 0,
+        "label": "Open",
+        "tooltip": "",
+        "color": "",
+        "bgcolor": "",
+        "className": "",
+        "icon": "",
+        "payload": "true",
+        "payloadType": "bool",
+        "x": 440,
+        "y": 460,
+        "wires": [
+            [
+                "rd-fn-open"
+            ]
+        ]
+    },
+    {
+        "id": "rd-fn-open",
+        "type": "function",
+        "z": "rd-tab",
+        "name": "build Open_Command DCMD",
+        "info": "Edit GROUP_ID/EDGE_NODE_ID to match your running `client`.",
+        "func": "const GROUP_ID = \"NodeRedTest\";\nconst EDGE_NODE_ID = \"ClaudeClient\";\n\nmsg.topic = `spBv1.0/${GROUP_ID}/DCMD/${EDGE_NODE_ID}/RollingDoor`;\nmsg.payload = {\n    metrics: [{ name: \"Open_Command\", value: true, type: \"boolean\" }]\n};\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 700,
+        "y": 460,
+        "wires": [
+            [
+                "rd-dcmd-out"
+            ]
+        ]
+    },
+    {
+        "id": "rd-button-close",
+        "type": "ui-button",
+        "z": "rd-tab",
+        "name": "Close",
+        "group": "rd-ui-group-controls",
+        "order": 2,
+        "width": 0,
+        "height": 0,
+        "label": "Close",
+        "tooltip": "",
+        "color": "",
+        "bgcolor": "",
+        "className": "",
+        "icon": "",
+        "payload": "true",
+        "payloadType": "bool",
+        "x": 440,
+        "y": 500,
+        "wires": [
+            [
+                "rd-fn-close"
+            ]
+        ]
+    },
+    {
+        "id": "rd-fn-close",
+        "type": "function",
+        "z": "rd-tab",
+        "name": "build Close_Command DCMD",
+        "info": "Edit GROUP_ID/EDGE_NODE_ID to match your running `client`.",
+        "func": "const GROUP_ID = \"NodeRedTest\";\nconst EDGE_NODE_ID = \"ClaudeClient\";\n\nmsg.topic = `spBv1.0/${GROUP_ID}/DCMD/${EDGE_NODE_ID}/RollingDoor`;\nmsg.payload = {\n    metrics: [{ name: \"Close_Command\", value: true, type: \"boolean\" }]\n};\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 700,
+        "y": 500,
+        "wires": [
+            [
+                "rd-dcmd-out"
+            ]
+        ]
+    },
+    {
+        "id": "rd-button-rebirth",
+        "type": "ui-button",
+        "z": "rd-tab",
+        "name": "Request Rebirth",
+        "group": "rd-ui-group-controls",
+        "order": 3,
+        "width": 0,
+        "height": 0,
+        "label": "Request Rebirth",
+        "tooltip": "",
+        "color": "",
+        "bgcolor": "",
+        "className": "",
+        "icon": "",
+        "payload": "true",
+        "payloadType": "bool",
+        "x": 460,
+        "y": 540,
+        "wires": [
+            [
+                "rd-fn-rebirth"
+            ]
+        ]
+    },
+    {
+        "id": "rd-fn-rebirth",
+        "type": "function",
+        "z": "rd-tab",
+        "name": "build Rebirth NCMD",
+        "info": "Edit GROUP_ID/EDGE_NODE_ID to match your running `client`.",
+        "func": "const GROUP_ID = \"NodeRedTest\";\nconst EDGE_NODE_ID = \"ClaudeClient\";\n\nmsg.topic = `spBv1.0/${GROUP_ID}/NCMD/${EDGE_NODE_ID}`;\nmsg.payload = {\n    metrics: [{ name: \"Node Control/Rebirth\", value: true, type: \"boolean\" }]\n};\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 700,
+        "y": 540,
+        "wires": [
+            [
+                "rd-dcmd-out"
+            ]
+        ]
+    },
+    {
+        "id": "rd-dcmd-out",
+        "type": "mqtt sparkplug out",
+        "z": "rd-tab",
+        "name": "send command",
+        "topic": "",
+        "qos": "0",
+        "retain": "false",
+        "broker": "sp-broker-d1e66f9a",
+        "x": 950,
+        "y": 500,
+        "wires": []
     }
 ]
