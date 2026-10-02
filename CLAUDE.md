@@ -427,20 +427,64 @@ Motivation: after hand-building `examples/nodered/`'s "Rolling Door" dashboard t
 
 **Explicitly not planned further than this yet** — package naming/location, the exact v1 property set, and multi-machine→multi-dashboard-page layout are open questions for a dedicated planning session, not resolved here.
 
-## Planned: grow FC43's device-description transfer capacity past its current ~31KB ceiling (flagged 2026-10-02, not yet planned in detail)
+## Planned: grow FC43's device-description transfer capacity past its current ~31KB ceiling (flagged 2026-10-02, back-of-envelope numbers + candidate architecture sketched 2026-10-02, direction not yet chosen)
 
 Motivation: surfaced while scoping the Node-RED dashboard plugin above — enriching every register/coil entry with the planned per-value metadata fields (`unit`/`device_class`/`icon`/`precision`/...) makes `device-description.toml` meaningfully bigger, pushing a real deployment closer to FC43's existing transfer ceiling (see "Relationship to FC43/FC20 wire transfer" above) sooner than previously assumed.
 
-**The real numbers, checked directly in `server/src/device_identification.rs`:** the TOML source is split into `MAX_TOML_CHUNK_LEN = 244`-byte chunks across private object IDs `0x81..=0xFF` — **127 slots**, a hard ceiling from the Modbus spec's own vendor-private object-ID range, not something this project can widen. 127 × 244 ≈ **30,988 bytes (~31KB)**. Today's two-machine demo (`examples/device-description.toml`, 14 entries) is 2,432 bytes — 10 chunks, under 8% of the budget — so there's no problem *yet*, but a realistic industrial deployment (multiple machines, hundreds of named points, each gaining several new metadata fields) could plausibly multiply per-entry size by 2-3× and entry count by 10-50×, which gets uncomfortably close to or past the ceiling well before any device description would otherwise seem "large."
+**The real numbers, checked directly in `server/src/device_identification.rs`:** the TOML source is split into `MAX_TOML_CHUNK_LEN = 244`-byte chunks across private object IDs `0x81..=0xFF` — **127 slots**, a hard ceiling from the Modbus spec's own vendor-private object-ID range, not something this project can widen. 127 × 244 ≈ **30,988 bytes (~31KB)**. Today's two-machine demo (`examples/device-description.toml`, 14 entries) is 2,432 bytes — 10 chunks, under 8% of the budget — so there's no problem *yet*.
 
-**Also a robustness gap, independent of the size question:** `build_objects` hits an `assert!` (process panic) once the description doesn't fit — not a clean Modbus exception response. A device description that grows past the ceiling over time (e.g. a technician adding metadata fields to an existing deployment) would crash the server outright at the next FC43 request, not fail gracefully.
+**Also a robustness gap, independent of the size question:** `build_objects` hits an `assert!` (process panic) once the description doesn't fit — not a clean Modbus exception response. A device description that grows past the ceiling over time (e.g. a technician adding metadata fields to an existing deployment) would crash the server outright at the next FC43 request, not fail gracefully. Fixing this (replace the panic with a clean exception, falling back exactly like a disabled/unimplemented FC43 does today) is worth doing independently of whatever capacity fix is chosen.
 
-**Candidate directions, not evaluated in detail yet:**
-- Switch the bulk transfer mechanism from FC43's object-ID addressing to FC20 (Read File Record, already implemented — see "FC 0x14" above) or a similar record-addressed scheme, whose addressable space (16-bit record numbers) is vastly larger than FC43's 127 private objects — this is the "FC43-directory + FC20-per-machine fetch" idea the multi-machine design already floated and shelved; worth revisiting now that FC20 exists and the capacity pressure is more concrete.
-- Compress the TOML source before chunking (plain text compresses well) — buys headroom without a wire-protocol change, but doesn't remove the ceiling, just pushes it out, and adds a dependency + decompression step on the client.
-- At minimum, replace the `assert!` with a clean Modbus exception (e.g. treat an oversized description like FC43 being unsupported, falling back exactly like a disabled/unimplemented FC43 does today) so the failure mode is graceful even before a real capacity fix lands.
+### Back-of-envelope sizing (2026-10-02) — how close is this ceiling, really?
 
-**Explicitly not planned further than this yet** — which direction (if any) to pursue, and whether to fix the panic independently of a capacity fix, are open questions for a dedicated planning session.
+Worked two scenarios against the real TOML entry shapes (exact byte counts, not estimates):
+
+- **Absolute theoretical max:** if all four of Modbus's independently-addressed 16-bit tables (coils, discrete inputs, input registers, holding registers) were fully populated to 65536 points each, one device's description alone is **≈19.7 MiB**; **× 255 devices ≈ 4.9 GiB**. Useful only as an outer bound — nobody hand-configures 65536 named points. (File records are excluded from this figure — their `file_number × record_number` addressing isn't the same kind of "fully populate the table" axis as the other four.)
+- **A realistic, far more telling number:** a single moderately-equipped machine (50 points per table = 200 points total) is **14,578 bytes** — already **47% of FC43's entire 31KB budget for one device**. **× 255 such devices ≈ 3.55 MB — about 115× over FC43's ceiling.** This is the number that matters: FC43 is already tight for a single well-equipped machine, long before "255 devices" or "every metadata field" enters the picture.
+
+**FC20 (Read File Record) capacity, for comparison:** its response format (`function_code(1) + byte_count(1) + [length(1) + reference_type(1) + data] per sub-request`) caps a single-record response at **249 bytes of data** (124 words) — essentially the same order of magnitude as FC43's 244-byte chunks, confirmed by reading `protocol/src/pdu.rs`'s `ReadFileRecordResponse::encode`. FC20's real advantage isn't per-message size, it's **addressable depth**: `file_number`/`record_number` are both `u16`, giving a single file up to 65536 records (~16.3 MB) — functionally unbounded for this use case, vs. FC43's hard 127-object ceiling.
+
+**The number FC20 doesn't fix — round-trip count:** 3.55 MB ÷ 249 B/response ≈ **14,260 round trips** to fetch the 255-device scenario uncompressed. At 5ms TCP RTT that's ~71s; at 20ms (WAN/busy network) ~285s; over RTU serial, realistically minutes. **FC20 solves the address-space ceiling but does nothing for transfer time at this scale** — that's a separate problem needing a separate fix (compression, see below).
+
+**Compression, measured (not estimated) on real files:**
+- `examples/device-description.toml` (hand-written, comment-heavy): 2,432 → 853 bytes, **2.85×**.
+- A synthetic 200-point/machine file (repetitive structure, the realistic shape of a *large* deployment): 14,578 → 1,034 bytes, **14.1×**.
+- Applied to the 255-device/3.55MB scenario: ~1,017 round trips at 14.1×, ~5,000 at the more conservative 2.85×. Compression **cannot** fix the address-space ceiling alone (253KB–1.25MB compressed is still far past FC43's 31KB) — **FC20's address space and compression solve two different problems (ceiling vs. round-trip count) and the large-scale case needs both, not either one alone.**
+
+### Candidate architecture: an FC43-served manifest pointing at per-machine FC20 blobs
+
+User's proposal, refining the multi-machine design's already-shelved "FC43-directory + FC20-per-machine fetch" idea: FC43 serves a small **manifest** (machine name, unit_id, a reserved `file_number` pointer, and the byte length of that machine's own TOML fragment) instead of the full multi-machine blob; the client then fetches only the machine(s) it needs via FC20, using the manifest's length to compute `ceil(length / 249)` records up front — this sidesteps FC20's lack of FC43's own `more_follows`/`next_object_id` continuation mechanism entirely, since the client never needs mid-transfer "is there more" feedback.
+
+**Manifest size, for 255 machines (checked, not estimated):**
+- This project's existing `[[...]]` array-of-tables TOML style: **22,612 bytes → 93 FC43 chunks (73% of the 127-object budget)**.
+- A compact inline-table array instead (`machines = [{name="M1",unit_id=1,file=1,len=14578}, ...]`): **11,405 bytes → 47 chunks (37%)**. Since this manifest is a wire artifact nobody hand-edits (unlike the real `device-description.toml`), optimizing purely for size here doesn't conflict with this project's readability-first TOML style elsewhere.
+
+**The key property this buys:** manifest size scales with **machine count**, not **point count** — FC43 itself needs no protocol change at all; it just serves a much smaller, bounded document instead of the whole thing.
+
+**Two real limitations found while reasoning through this, not yet resolved:**
+1. **Selectivity has no payoff against today's actual client behavior.** `client` mounts **every** machine in its device description by default (see "Multi-machine device description & FUSE layout" above) — the `--machines <names>` subset flag remains unimplemented. Until that flag is real, a manifest+per-machine-fetch client still ends up fetching every machine, just via more round trips (manifest fetch, then one discovery+fetch cycle per machine) than one coherent blob transfer — a net round-trip *regression* for the common case, not an improvement, unless paired with either the subset flag or a caching/change-detection scheme (e.g. a hash/version per machine in the manifest, letting a *reconnecting* client skip re-fetching machines that haven't changed since the TOML is loaded once at server startup and never hot-reloaded).
+2. **Whole-file compression and per-machine selective fetch are in direct tension.** A compressed stream (deflate/gzip/zstd) is not randomly seekable — decoding "machine 5" requires decompressing everything before it, since LZ77-style back-references can point arbitrarily far back. So: compress the *whole* multi-machine blob (best ratio, exploits cross-machine redundancy) **or** fetch machines selectively (needs independently-decodable per-machine units, which compress worse individually) — not cleanly both at once.
+
+### Three candidate options for the compression question, not yet chosen between
+
+| Option | Compression ratio | Selective per-machine fetch | Complexity |
+|---|---|---|---|
+| **(a) Compress the whole multi-machine blob as one unit, chunk it via FC20** | Best (full cross-machine redundancy) | None — always all-or-nothing | Low |
+| **(b) Compress each machine's fragment independently** | Worse (loses cross-machine redundancy) | Real, per-machine | Medium |
+| **(c) Per-machine compression with a shared preset dictionary** (zstd/zlib dictionary support, built from this project's own common TOML vocabulary — `access = "read_only"`, `[[machines.registers.entries]]`, etc.) | Close to (a) | Real, per-machine | High — new dependency decision, a dictionary to build/version |
+
+**Leaning, not decided:** (a) first, since it directly fixes the *measured* problem (round-trip count at scale) with the least complexity and matches today's actual "mount everything" client behavior exactly; (b)/(c) stay deferred until `--machines` actually exists and selective fetch has a concrete consumer (Extraction-Based Programming) — at which point (c)'s shared-dictionary approach is the natural next step if (b)'s compression loss turns out to matter in practice.
+
+### Detail questions still to work through before choosing (a)/(b)/(c) — explicitly not resolved yet
+
+- **Compression crate choice.** Same category of decision as `rustls`/`rumqttd` (infrastructure, not this project's core domain — use an external crate, don't hand-roll) — candidates to evaluate: `flate2` (deflate/gzip, can run on a pure-Rust `miniz_oxide` backend or link C zlib) vs. `zstd` (better ratio/speed, typically a C binding) vs. a pure-Rust zstd implementation if one is actively maintained. Needs the same real research pass (maintenance activity, pure-Rust vs. C binding trade-off) this project already applied to `rustls`/`rumqttd`/the Sparkplug crate choice.
+- **When to compress.** The TOML is loaded once at server startup and never changes for the process's lifetime (unlike `build_objects`, which is cheap enough to recompute per FC43 request) — compression is real CPU work, so it should likely be computed once at startup and cached, not per-request.
+- **Scope the change to the new FC20 path only.** Leave the existing small-file FC43-inline-chunk path (today's only mechanism) completely untouched for backward compatibility — compression only applies to whatever new bulk-transfer mechanism gets built, not retrofitted onto already-shipped, tested behavior.
+- **Decompression failure handling.** Folds into FC43's existing fallback chain (any failure → client falls back to its local TOML) — no new failure philosophy needed, just another arm of an already-existing chain.
+- **Reserved `file_number` collision avoidance.** Whatever `file_number`(s) get reserved for description-transfer use (one for the whole blob under (a), or one per machine under (b)/(c)) must be validated at parse time to never collide with a user's own `[[file-records]]` entries — this is the same bug *class* already caught and fixed once during FC20's original implementation (`file_records_ino` vs. `client_trust`/`server_id_ino` inode collision), worth remembering explicitly so it isn't repeated.
+- **`server-options.toml` gating.** The existing `read_file_record` toggle governs the user-facing `[[file-records]]` feature specifically — using FC20 for description transfer needs its own explicit gating decision (tied to `read_device_identification`'s toggle instead, most likely, since it's extending that feature), not silently reusing `read_file_record`'s semantics for an unrelated purpose.
+
+**Explicitly not planned further than this yet** — the detail questions above and the (a)/(b)/(c) choice are the next things to work through, in that order.
 
 ## Programmatic Rust API for `ServerHandle` — typed `set_*`/`get_*`, before any FFI layer (resolved and implemented 2026-10-01)
 
