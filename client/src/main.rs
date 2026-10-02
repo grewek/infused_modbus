@@ -64,7 +64,6 @@
 // stop bits) aren't configurable yet — this uses tokio-serial's defaults (8
 // data bits, no parity, 1 stop bit).
 
-use client::broker::BrokerConfig;
 use client::connection::Connection;
 use client::device_identification::fetch_device_description;
 use client::edge_node::connect_edge_node;
@@ -96,15 +95,6 @@ const DEVICE_DESCRIPTION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 // suffix), so it's not mistaken for something already made unique for them.
 const DEFAULT_MQTT_GROUP_ID: &str = "infused_modbus";
 const DEFAULT_MQTT_EDGE_NODE_ID: &str = "client";
-// How long to wait after starting the embedded broker before connecting to
-// it as the Edge Node's own loopback client — `start_embedded_broker`
-// returns as soon as the listener thread is spawned, not once it's actually
-// accepting connections (see client::broker's own doc comment), so without
-// this the very first connection attempt can race a broker that isn't
-// listening yet. Mirrors the same wait every `client::edge_node`/
-// `client::sparkplug_command` test already uses against a freshly started
-// embedded broker.
-const BROKER_STARTUP_GRACE_PERIOD: Duration = Duration::from_millis(300);
 // Persists this Edge Node's next bdSeq across process restarts — see
 // client::bd_seq_persistence's own module doc comment for why this is
 // required for real Sparkplug B conformance, not just a nice-to-have.
@@ -112,7 +102,7 @@ const MQTT_BD_SEQ_PATH: &str = "client-mqtt-bdseq";
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: client <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--mqtt-broker-config <path.toml>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>] [--mqtt-external-broker <host:port>] [--mqtt-primary-host-id <id>]\n\
+        "Usage: client <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--mqtt-broker <host:port>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>] [--mqtt-primary-host-id <id>]\n\
          <connection> is tcp://<address:port>, tls+tcp://<address:port>, or rtu://<serial-path>:<baud-rate>\n\
          --expect-server-fingerprint pins the server's TLS identity (tls+tcp:// only) — \
          without it, the server's identity is not verified at all (see CLAUDE.md's TLS design).\n\
@@ -120,21 +110,18 @@ fn usage() -> ! {
          without it, every directory keeps its historical hardcoded behavior. Ignored under \
          --data-representation-layer mqtt, which has no directories to permission.\n\
          --data-representation-layer picks fuse (a synthetic FUSE mount), files \
-         (real files, the default), or mqtt (a Sparkplug B Edge Node over an embedded MQTT \
-         broker — see CLAUDE.md's \"Planned: MQTT (Sparkplug B) representation layer\"). \
+         (real files, the default), or mqtt (a Sparkplug B Edge Node connected to an external \
+         MQTT broker — see CLAUDE.md's \"MQTT (Sparkplug B) representation layer\"). \
          <root> is ignored under mqtt, which has nothing to mount/write to disk.\n\
-         --mqtt-broker-config sets the embedded broker's tuning (listen address, connection \
-         limits, ...) — without it, every setting keeps client::broker::BrokerConfig's own \
-         defaults. mqtt layer only.\n\
+         --mqtt-broker <host:port> is the already-running MQTT broker this Edge Node connects \
+         to (e.g. Mosquitto) — required under --data-representation-layer mqtt, this project \
+         does not run a broker itself. See docker/mqtt-broker for a disposable broker to test \
+         against.\n\
          --mqtt-group-id/--mqtt-edge-node-id set this Edge Node's Sparkplug B identity \
          (defaults: {DEFAULT_MQTT_GROUP_ID:?}/{DEFAULT_MQTT_EDGE_NODE_ID:?} — override \
          --mqtt-edge-node-id for any deployment running more than one client instance against \
          the same broker/host application, since it must be unique per Edge Node). mqtt layer \
          only.\n\
-         --mqtt-external-broker <host:port> connects the Edge Node to an already-running \
-         broker instead of starting the embedded one (--mqtt-broker-config is then ignored) — \
-         for targeting an external broker such as the Sparkplug TCK's own HiveMQ instance. \
-         mqtt layer only.\n\
          --mqtt-primary-host-id <id> makes this Edge Node wait for the named Primary Host \
          Application to come online (via its retained spBv1.0/STATE/<id> message) before \
          publishing NBIRTH — without it, NBIRTH is published immediately, with no Primary Host \
@@ -178,47 +165,24 @@ enum RepresentationLayer {
     Mqtt,
 }
 
-/// Pulls `--mqtt-broker-config <path.toml>` out of `args` if present (same
-/// shape as `--fuse-permissions`), leaving the rest of `args` untouched.
-/// Absent entirely, every broker setting keeps `BrokerConfig::default()`.
-fn extract_mqtt_broker_config(args: &mut Vec<String>) -> BrokerConfig {
-    let Some(flag_index) = args.iter().position(|arg| arg == "--mqtt-broker-config") else {
-        return BrokerConfig::default();
-    };
+/// Pulls `--mqtt-broker <host:port>` out of `args` if present, leaving the
+/// rest of `args` untouched. Absent entirely, `None` — the caller rejects
+/// that under `--data-representation-layer mqtt`, since this project no
+/// longer runs a broker itself (see CLAUDE.md's "MQTT (Sparkplug B)
+/// representation layer" for why the embedded broker was removed).
+fn extract_mqtt_broker(args: &mut Vec<String>) -> Option<(String, u16)> {
+    let flag_index = args.iter().position(|arg| arg == "--mqtt-broker")?;
     if flag_index + 1 >= args.len() {
-        panic!("--mqtt-broker-config requires a path");
-    }
-    args.remove(flag_index);
-    let path = args.remove(flag_index);
-    let toml_source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
-    BrokerConfig::parse(&toml_source)
-        .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
-}
-
-/// Pulls `--mqtt-external-broker <host:port>` out of `args` if present,
-/// leaving the rest of `args` untouched. Absent entirely, `None` means "use
-/// the embedded broker" (the normal case). Exists for situations where the
-/// Edge Node must connect to a broker this process doesn't own itself —
-/// concretely, the Eclipse Sparkplug TCK's own HiveMQ instance, which the
-/// conformance test drives directly rather than observing traffic through
-/// our own embedded `rumqttd`. `--mqtt-broker-config` is silently ignored
-/// when this is set, since there is no embedded broker left to configure.
-fn extract_mqtt_external_broker(args: &mut Vec<String>) -> Option<(String, u16)> {
-    let flag_index = args
-        .iter()
-        .position(|arg| arg == "--mqtt-external-broker")?;
-    if flag_index + 1 >= args.len() {
-        panic!("--mqtt-external-broker requires a value (host:port)");
+        panic!("--mqtt-broker requires a value (host:port)");
     }
     args.remove(flag_index);
     let value = args.remove(flag_index);
-    let (host, port) = value.rsplit_once(':').unwrap_or_else(|| {
-        panic!("invalid --mqtt-external-broker value {value:?}: expected host:port")
-    });
+    let (host, port) = value
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("invalid --mqtt-broker value {value:?}: expected host:port"));
     let port: u16 = port
         .parse()
-        .unwrap_or_else(|error| panic!("invalid --mqtt-external-broker port {port:?}: {error}"));
+        .unwrap_or_else(|error| panic!("invalid --mqtt-broker port {port:?}: {error}"));
     Some((host.to_string(), port))
 }
 
@@ -329,8 +293,7 @@ fn main() {
     let expected_server_fingerprint = extract_expected_server_fingerprint(&mut raw_args);
     let fuse_permissions = extract_fuse_permissions(&mut raw_args);
     let representation_layer = extract_representation_layer(&mut raw_args);
-    let mqtt_broker_config = extract_mqtt_broker_config(&mut raw_args);
-    let mqtt_external_broker = extract_mqtt_external_broker(&mut raw_args);
+    let mqtt_broker = extract_mqtt_broker(&mut raw_args);
     let mqtt_group_id =
         extract_string_flag(&mut raw_args, "--mqtt-group-id", DEFAULT_MQTT_GROUP_ID);
     let mqtt_edge_node_id = extract_string_flag(
@@ -654,32 +617,15 @@ fn main() {
                 .unwrap_or_else(|error| eprintln!("warning: failed to clean up {root}: {error}"));
         }
         RepresentationLayer::Mqtt => {
-            // Either dial an already-running external broker (e.g. the
-            // Sparkplug TCK's own HiveMQ instance — see
-            // extract_mqtt_external_broker's doc comment) or start and
-            // connect to our own embedded one, loopback-only, via
-            // 127.0.0.1 regardless of what listen_address it was configured
-            // to bind (e.g. "0.0.0.0:1883" for external/network consumers)
-            // — only the port is shared between the two in that case.
-            let (broker_host, broker_port): (String, u16) = match mqtt_external_broker {
-                Some((host, port)) => (host, port),
-                None => {
-                    let broker_port: u16 = mqtt_broker_config
-                        .listen_address
-                        .rsplit(':')
-                        .next()
-                        .and_then(|port| port.parse().ok())
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "invalid --mqtt-broker-config listen_address {:?}: expected host:port",
-                                mqtt_broker_config.listen_address
-                            )
-                        });
-                    client::broker::start_embedded_broker(mqtt_broker_config);
-                    std::thread::sleep(BROKER_STARTUP_GRACE_PERIOD);
-                    ("127.0.0.1".to_string(), broker_port)
-                }
-            };
+            // This project doesn't run a broker itself — see CLAUDE.md's
+            // "MQTT (Sparkplug B) representation layer" for why the
+            // embedded broker was removed. docker/mqtt-broker has a
+            // disposable one for local testing.
+            let (broker_host, broker_port) = mqtt_broker.unwrap_or_else(|| {
+                panic!(
+                    "--mqtt-broker <host:port> is required under --data-representation-layer mqtt"
+                )
+            });
 
             let bd_seq =
                 client::bd_seq_persistence::next_bd_seq(std::path::Path::new(MQTT_BD_SEQ_PATH));
