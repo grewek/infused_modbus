@@ -23,11 +23,14 @@ static CRYPTO_PROVIDER_INSTALL: Once = Once::new();
 
 /// Installs `ring` as the process-wide default `rustls` crypto provider,
 /// exactly once. Needed because `ClientConfig::builder()`/`ServerConfig::
-/// builder()` below rely on rustls auto-detecting the default provider,
-/// which only works when exactly one provider crate is linked into the
-/// binary — true before `rumqttc`/`rumqttd` were added (M3), but their own
-/// transitive `rustls` dependency also links `aws-lc-rs`, so the ambiguity
-/// has to be resolved explicitly now rather than left to autodetection.
+/// builder()` below require a default provider to already be installed —
+/// rustls doesn't do this on its own. This used to also have to resolve an
+/// ambiguity between two linked providers (`rumqttc`/`rumqttd`'s own
+/// transitive `rustls` dependency pulled in `aws-lc-rs` alongside this
+/// crate's own pinned `ring`) — no longer the case since `rumqttc`'s unused
+/// TLS feature was dropped and `rumqttd` moved to dev-dependencies (see
+/// CLAUDE.md's "MQTT (Sparkplug B) representation layer"), but the explicit
+/// install is still required either way.
 fn ensure_crypto_provider_installed() {
     CRYPTO_PROVIDER_INSTALL.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();

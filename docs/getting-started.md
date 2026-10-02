@@ -53,7 +53,7 @@ cargo run -p server -- admin list
 ## Run the client
 
 ```sh
-cargo run -p client -- <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--mqtt-broker-config <path.toml>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>] [--mqtt-external-broker <host:port>]
+cargo run -p client -- <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--mqtt-broker <host:port>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>]
 ```
 
 `<connection>` uses the same `tcp://`/`rtu://`/`tls+tcp://` scheme as the server. `<device-description.toml>` is required as a fallback, but if the server it connects to supports FC 43 (see [Device description discovery](filesystem.md#device-description-discovery-fc-43)), the client uses the server's own description instead. `--data-representation-layer` (default `files`) and `--fuse-permissions` (see [Directory permissions](directory-permissions.md)) work identically to the server's own flags of the same name; `<root>` is ignored under `mqtt`. The `--mqtt-*` flags only apply under `--data-representation-layer mqtt` — see [MQTT (Sparkplug B) layer](mqtt-sparkplug.md). `client` mounts/writes **every** machine described in the effective device description — see [Device description TOML format](device-description.md) — each under its own top-level directory (`fuse`/`files`) or as its own Sparkplug B Device (`mqtt`).
