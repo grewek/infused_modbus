@@ -441,6 +441,7 @@ mod tests {
                 alias: Some(0),
                 timestamp: None,
                 data_type: sparkplug::data_type::DataType::UInt16,
+                is_null: false,
                 value: MetricValue::Int(21),
             }];
             edge_node
@@ -509,6 +510,7 @@ mod tests {
                 alias: Some(0),
                 timestamp: None,
                 data_type: sparkplug::data_type::DataType::UInt16,
+                is_null: false,
                 value: MetricValue::Int(23),
             }];
             edge_node

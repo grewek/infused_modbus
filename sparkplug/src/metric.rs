@@ -1,17 +1,20 @@
 //! Encode/decode for Sparkplug B's `Metric` message — the missing link between
 //! `wire`'s raw protobuf primitives and `data_type`/`metric_value`'s pure data
 //! types. Deliberately minimal: `name` (field 1), `alias` (field 2),
-//! `timestamp` (field 3), `datatype` (field 4), and the scalar `value` oneof
-//! (fields 10-16, via `MetricValue`) are modeled. `is_historical`/
-//! `is_transient`/`is_null`/`metadata`/`properties` aren't yet — no concrete
-//! need for them has shown up; add them once one does, per this project's
-//! Extraction-Based Programming convention. (`alias` itself was added in M5,
-//! once `client::sparkplug_alias`'s per-Edge-Node alias assignment became a
-//! real need — M4 had deliberately left it out for the same reason.
-//! `timestamp` was added after the Eclipse Sparkplug TCK's
+//! `timestamp` (field 3), `datatype` (field 4), `is_null` (field 7), and the
+//! scalar `value` oneof (fields 10-16, via `MetricValue`) are modeled.
+//! `is_historical`/`is_transient`/`metadata`/`properties` aren't yet — no
+//! concrete need for them has shown up; add them once one does, per this
+//! project's Extraction-Based Programming convention. (`alias` itself was
+//! added in M5, once `client::sparkplug_alias`'s per-Edge-Node alias
+//! assignment became a real need — M4 had deliberately left it out for the
+//! same reason. `timestamp` was added after the Eclipse Sparkplug TCK's
 //! `payloads-name-birth-data-requirement` assertion caught every metric in
 //! NBIRTH/DBIRTH/NDATA/DDATA missing it — a metric-level timestamp, distinct
-//! from `Payload`'s own top-level one.)
+//! from `Payload`'s own top-level one. `is_null` was added for the planned
+//! Sparkplug selective-subscription design — see CLAUDE.md's Thread B1 — so a
+//! DBIRTH can declare a metric's full name/alias/type before a real value is
+//! known yet.)
 
 use crate::data_type::DataType;
 use crate::metric_value::MetricValue;
@@ -21,6 +24,7 @@ const FIELD_NAME: u32 = 1;
 const FIELD_ALIAS: u32 = 2;
 const FIELD_TIMESTAMP: u32 = 3;
 const FIELD_DATATYPE: u32 = 4;
+const FIELD_IS_NULL: u32 = 7;
 const FIELD_INT_VALUE: u32 = 10;
 const FIELD_LONG_VALUE: u32 = 11;
 const FIELD_FLOAT_VALUE: u32 = 12;
@@ -35,6 +39,10 @@ pub struct Metric {
     pub alias: Option<u64>,
     pub timestamp: Option<u64>,
     pub data_type: DataType,
+    /// Per spec, protobuf's implicit presence: the field is simply omitted on
+    /// the wire when `false` (the default), not encoded as an explicit
+    /// `false` varint — `decode_metric` defaults to `false` when absent.
+    pub is_null: bool,
     pub value: MetricValue,
 }
 
@@ -99,6 +107,17 @@ pub fn encode_metric(metric: &Metric, buffer: &mut Vec<u8>) {
         buffer,
     );
     wire::encode_varint(u64::from(u32::from(metric.data_type)), buffer);
+
+    if metric.is_null {
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_IS_NULL,
+                wire_type: WireType::Varint,
+            },
+            buffer,
+        );
+        wire::encode_varint(1, buffer);
+    }
 
     match &metric.value {
         MetricValue::Int(value) => {
@@ -185,6 +204,7 @@ pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
     let mut alias: Option<u64> = None;
     let mut timestamp: Option<u64> = None;
     let mut data_type: Option<DataType> = None;
+    let mut is_null = false;
     let mut value: Option<MetricValue> = None;
 
     let mut offset = 0;
@@ -216,6 +236,11 @@ pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
                 data_type = Some(
                     DataType::try_from(code).map_err(|_| DecodeError::UnknownDataTypeCode(code))?,
                 );
+                offset += consumed;
+            }
+            FIELD_IS_NULL => {
+                let (raw, consumed) = wire::decode_varint(&bytes[offset..])?;
+                is_null = raw != 0;
                 offset += consumed;
             }
             FIELD_INT_VALUE => {
@@ -270,6 +295,7 @@ pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
         alias,
         timestamp,
         data_type: data_type.ok_or(DecodeError::MissingDataType)?,
+        is_null,
         value: value.ok_or(DecodeError::MissingValue)?,
     })
 }
@@ -291,8 +317,76 @@ mod tests {
             alias: None,
             timestamp: None,
             data_type: DataType::UInt8,
+            is_null: false,
             value: MetricValue::Int(42),
         });
+    }
+
+    #[test]
+    fn round_trips_a_null_placeholder_metric() {
+        round_trip(Metric {
+            name: "Tank_Temperature".to_string(),
+            alias: Some(0),
+            timestamp: Some(1_700_000_000_000),
+            data_type: DataType::UInt16,
+            is_null: true,
+            value: MetricValue::Int(0),
+        });
+    }
+
+    #[test]
+    fn encode_omits_is_null_field_when_false() {
+        let mut buffer = Vec::new();
+        encode_metric(
+            &Metric {
+                name: "Tank_Temperature".to_string(),
+                alias: None,
+                timestamp: None,
+                data_type: DataType::UInt16,
+                is_null: false,
+                value: MetricValue::Int(21),
+            },
+            &mut buffer,
+        );
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let (tag, tag_len) = wire::decode_tag(&buffer[offset..]).unwrap();
+            offset += tag_len;
+            assert_ne!(tag.field_number, FIELD_IS_NULL);
+            offset += wire::skip_field(tag.wire_type, &buffer[offset..]).unwrap();
+        }
+    }
+
+    #[test]
+    fn decode_defaults_is_null_to_false_when_absent() {
+        let mut buffer = Vec::new();
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_NAME,
+                wire_type: WireType::LengthDelimited,
+            },
+            &mut buffer,
+        );
+        wire::encode_length_delimited(b"Tank_Temperature", &mut buffer);
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_DATATYPE,
+                wire_type: WireType::Varint,
+            },
+            &mut buffer,
+        );
+        wire::encode_varint(u64::from(u32::from(DataType::UInt16)), &mut buffer);
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_INT_VALUE,
+                wire_type: WireType::Varint,
+            },
+            &mut buffer,
+        );
+        wire::encode_varint(21, &mut buffer);
+
+        let metric = decode_metric(&buffer).unwrap();
+        assert!(!metric.is_null);
     }
 
     #[test]
@@ -302,6 +396,7 @@ mod tests {
             alias: Some(7),
             timestamp: None,
             data_type: DataType::UInt16,
+            is_null: false,
             value: MetricValue::Int(21),
         });
     }
@@ -313,6 +408,7 @@ mod tests {
             alias: None,
             timestamp: Some(1_700_000_000_000),
             data_type: DataType::UInt16,
+            is_null: false,
             value: MetricValue::Int(21),
         });
     }
@@ -324,6 +420,7 @@ mod tests {
             alias: None,
             timestamp: None,
             data_type: DataType::UInt64,
+            is_null: false,
             value: MetricValue::Long(7),
         });
     }
@@ -335,6 +432,7 @@ mod tests {
             alias: None,
             timestamp: None,
             data_type: DataType::Float,
+            is_null: false,
             value: MetricValue::Float(50.05),
         });
     }
@@ -346,6 +444,7 @@ mod tests {
             alias: None,
             timestamp: None,
             data_type: DataType::Double,
+            is_null: false,
             value: MetricValue::Double(12.345_678_9),
         });
     }
@@ -357,6 +456,7 @@ mod tests {
             alias: None,
             timestamp: None,
             data_type: DataType::Boolean,
+            is_null: false,
             value: MetricValue::Boolean(true),
         });
     }
@@ -368,6 +468,7 @@ mod tests {
             alias: None,
             timestamp: None,
             data_type: DataType::String,
+            is_null: false,
             value: MetricValue::String("pump-a-plc".to_string()),
         });
     }
@@ -379,6 +480,7 @@ mod tests {
             alias: None,
             timestamp: None,
             data_type: DataType::Bytes,
+            is_null: false,
             value: MetricValue::Bytes(vec![0x0D, 0xFE, 0x00, 0x20]),
         });
     }
@@ -451,6 +553,7 @@ mod tests {
                 alias: Some(7),
                 timestamp: None,
                 data_type: DataType::UInt16,
+                is_null: false,
                 value: MetricValue::Int(21),
             })
         );
@@ -475,6 +578,7 @@ mod tests {
             alias: None,
             timestamp: None,
             data_type: DataType::UInt16,
+            is_null: false,
             value: MetricValue::Int(21),
         };
         encode_metric(&metric, &mut buffer);

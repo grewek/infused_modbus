@@ -240,6 +240,7 @@ mod tests {
                 alias: Some(alias),
                 timestamp: None,
                 data_type: DataType::UInt16,
+                is_null: false,
                 value: MetricValue::Int(30),
             }],
         };
@@ -264,6 +265,7 @@ mod tests {
                 alias: None,
                 timestamp: None,
                 data_type: DataType::Boolean,
+                is_null: false,
                 value: MetricValue::Boolean(true),
             }],
         };
@@ -290,6 +292,7 @@ mod tests {
                 alias: Some(alias_for_b),
                 timestamp: None,
                 data_type: DataType::UInt16,
+                is_null: false,
                 value: MetricValue::Int(30),
             }],
         };
@@ -311,6 +314,7 @@ mod tests {
                 alias: Some(9999),
                 timestamp: None,
                 data_type: DataType::UInt16,
+                is_null: false,
                 value: MetricValue::Int(30),
             }],
         };
@@ -332,6 +336,7 @@ mod tests {
                 alias: None,
                 timestamp: None,
                 data_type: DataType::UInt16,
+                is_null: false,
                 value: MetricValue::Int(30),
             }],
         };
@@ -354,6 +359,7 @@ mod tests {
                 alias: Some(alias),
                 timestamp: None,
                 data_type: DataType::UInt16,
+                is_null: false,
                 value: MetricValue::Boolean(true),
             }],
         };
@@ -412,6 +418,7 @@ mod tests {
                     alias: Some(alias),
                     timestamp: None,
                     data_type: DataType::UInt16,
+                    is_null: false,
                     value: MetricValue::Int(42),
                 }],
             };
@@ -452,6 +459,7 @@ mod tests {
                 alias: None,
                 timestamp: None,
                 data_type: DataType::Boolean,
+                is_null: false,
                 value: MetricValue::Boolean(true),
             }],
         };
@@ -468,6 +476,7 @@ mod tests {
                 alias: None,
                 timestamp: None,
                 data_type: DataType::Boolean,
+                is_null: false,
                 value: MetricValue::Boolean(false),
             }],
         };
@@ -484,6 +493,7 @@ mod tests {
                 alias: None,
                 timestamp: None,
                 data_type: DataType::Boolean,
+                is_null: false,
                 value: MetricValue::Boolean(true),
             }],
         };
@@ -565,6 +575,7 @@ mod tests {
                     alias: None,
                     timestamp: None,
                     data_type: DataType::Boolean,
+                    is_null: false,
                     value: MetricValue::Boolean(true),
                 }],
             };

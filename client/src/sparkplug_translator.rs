@@ -195,6 +195,7 @@ pub fn build_machine_metrics(
                 alias: aliases.alias_for(&machine.name, &register.name),
                 timestamp: timestamp_millis,
                 data_type: map_data_type(register.data_type),
+                is_null: false,
                 value: map_register_value(value),
             });
         }
@@ -209,6 +210,7 @@ pub fn build_machine_metrics(
                 alias: aliases.alias_for(&machine.name, &coil.name),
                 timestamp: timestamp_millis,
                 data_type: SparkplugDataType::Boolean,
+                is_null: false,
                 value: map_coil_value(value),
             });
         }
@@ -228,6 +230,7 @@ pub fn build_machine_metrics(
                 alias: aliases.alias_for(&machine.name, &discrete_input.name),
                 timestamp: timestamp_millis,
                 data_type: SparkplugDataType::Boolean,
+                is_null: false,
                 value: map_coil_value(value),
             });
         }
@@ -247,6 +250,7 @@ pub fn build_machine_metrics(
                 alias: aliases.alias_for(&machine.name, &input_register.name),
                 timestamp: timestamp_millis,
                 data_type: map_data_type(input_register.data_type),
+                is_null: false,
                 value: map_register_value(value),
             });
         }
@@ -268,6 +272,7 @@ pub fn build_machine_metrics(
                 alias: aliases.alias_for(&machine.name, &name),
                 timestamp: timestamp_millis,
                 data_type: SparkplugDataType::Bytes,
+                is_null: false,
                 value: MetricValue::Bytes(value),
             });
         }

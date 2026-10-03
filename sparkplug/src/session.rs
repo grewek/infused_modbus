@@ -18,6 +18,7 @@ fn bd_seq_metric(bd_seq: u64, timestamp_millis: Option<u64>) -> Metric {
         alias: None,
         timestamp: timestamp_millis,
         data_type: DataType::UInt64,
+        is_null: false,
         value: MetricValue::Long(bd_seq),
     }
 }
@@ -38,6 +39,7 @@ fn rebirth_metric(timestamp_millis: Option<u64>) -> Metric {
         alias: None,
         timestamp: timestamp_millis,
         data_type: DataType::Boolean,
+        is_null: false,
         value: MetricValue::Boolean(false),
     }
 }
@@ -172,6 +174,7 @@ mod tests {
                 alias: None,
                 timestamp: None,
                 data_type: DataType::UInt64,
+                is_null: false,
                 value: MetricValue::Long(7),
             }]
         );
@@ -191,6 +194,7 @@ mod tests {
                     alias: None,
                     timestamp: Some(1_700_000_000_000),
                     data_type: DataType::UInt64,
+                    is_null: false,
                     value: MetricValue::Long(7),
                 },
                 Metric {
@@ -198,6 +202,7 @@ mod tests {
                     alias: None,
                     timestamp: Some(1_700_000_000_000),
                     data_type: DataType::Boolean,
+                    is_null: false,
                     value: MetricValue::Boolean(false),
                 }
             ]
@@ -248,6 +253,7 @@ mod tests {
             alias: Some(0),
             timestamp: Some(1_700_000_000_000),
             data_type: DataType::UInt16,
+            is_null: false,
             value: MetricValue::Int(21),
         }];
         let dbirth = build_dbirth_payload(metrics.clone(), 1_700_000_000_000, &mut seq_counter);
@@ -292,6 +298,7 @@ mod tests {
             alias: Some(0),
             timestamp: Some(1_700_000_000_000),
             data_type: DataType::UInt16,
+            is_null: false,
             value: MetricValue::Int(22),
         }];
         let ddata = build_ddata_payload(metrics.clone(), 1_700_000_000_000, &mut seq_counter);
@@ -311,6 +318,7 @@ mod tests {
             alias: None,
             timestamp: Some(0),
             data_type: DataType::Boolean,
+            is_null: false,
             value: MetricValue::Boolean(true),
         }];
         let ndata = build_ndata_payload(metrics.clone(), 0, &mut seq_counter);

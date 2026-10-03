@@ -55,6 +55,7 @@ mod tests {
             alias: Some(alias),
             timestamp: None,
             data_type: DataType::UInt16,
+            is_null: false,
             value,
         }
     }
