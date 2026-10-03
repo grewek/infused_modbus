@@ -196,6 +196,7 @@ pub fn build_machine_metrics(
                 timestamp: timestamp_millis,
                 data_type: map_data_type(register.data_type),
                 is_null: false,
+                properties: None,
                 value: map_register_value(value),
             });
         }
@@ -211,6 +212,7 @@ pub fn build_machine_metrics(
                 timestamp: timestamp_millis,
                 data_type: SparkplugDataType::Boolean,
                 is_null: false,
+                properties: None,
                 value: map_coil_value(value),
             });
         }
@@ -231,6 +233,7 @@ pub fn build_machine_metrics(
                 timestamp: timestamp_millis,
                 data_type: SparkplugDataType::Boolean,
                 is_null: false,
+                properties: None,
                 value: map_coil_value(value),
             });
         }
@@ -251,6 +254,7 @@ pub fn build_machine_metrics(
                 timestamp: timestamp_millis,
                 data_type: map_data_type(input_register.data_type),
                 is_null: false,
+                properties: None,
                 value: map_register_value(value),
             });
         }
@@ -273,6 +277,7 @@ pub fn build_machine_metrics(
                 timestamp: timestamp_millis,
                 data_type: SparkplugDataType::Bytes,
                 is_null: false,
+                properties: None,
                 value: MetricValue::Bytes(value),
             });
         }

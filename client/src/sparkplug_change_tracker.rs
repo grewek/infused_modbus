@@ -56,6 +56,7 @@ mod tests {
             timestamp: None,
             data_type: DataType::UInt16,
             is_null: false,
+            properties: None,
             value,
         }
     }
