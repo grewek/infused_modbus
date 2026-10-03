@@ -362,14 +362,20 @@ Everything above (FC43 capacity + Sparkplug selective subscription + UN/ECE `uni
 
 All three landed as separate reviewed commits (`36229bd`, `312b1ef`, `bd93e7b`, `2a20592`, `3140b0f`, `b046f41`); 961 workspace tests pass. Not yet exercised by any real consumer (no concrete need forced it yet, per Extraction-Based Programming) — Thread C (B1) and the Node-RED dashboard plugin (B2) are the planned first consumers.
 
-### Thread A — FC43 capacity fix (server/protocol-level, applies to all three representation layers)
-- **A1.** `detect_machine_layout` toggle: schema + parsing in `server::server_options`, wired into the gate.
-- **A2.** Fix the existing `assert!` panic in `device_identification::build_objects` to a clean Modbus exception — independent of the rest of this thread's timing.
-- **A3.** Decide and hard-validate the reserved `file_number`: parse-time rejection on collision with a user's own `[[file-records]]`.
-- **A4.** Add `miniz_oxide`, compress the full TOML once at server startup (gated by `detect_machine_layout`), cache for the process's lifetime.
-- **A5.** Server: when the full TOML exceeds FC43's budget, serve the small manifest via FC43's existing object mechanism instead — the existing inline-chunk path stays untouched for anything that still fits.
-- **A6.** Server: FC20 dispatch for the reserved `file_number`, serving the cached compressed blob in chunks — a dedicated code path, not a reuse of `handle_read_file_record`'s static-declaration validation.
-- **A7.** Client: detect which FC43 response shape it got; if manifest, fetch via FC20 using the known length, decompress, parse as the real TOML. Any failure at any step falls back to the local TOML file argument.
+### Thread A — FC43 capacity fix (server/protocol-level, applies to all three representation layers) — **in progress, A1-A4 done 2026-10-03, A5-A8 next**
+
+Re-split into 8 steps during implementation (the original A5 split into "build the manifest type" and "wire it into FC43's dispatch", mirroring Thread B's "standalone capability first, wire in at the first real consumer" pattern) — same content, finer increments. **Resume here next session, starting with A5.**
+
+- **A1.** ✅ `detect_machine_layout` toggle — new top-level key in `server-options.toml` (sibling to `[function-codes]`, not a member — it isn't a function-code gate), `server::server_options::ServerOptions.detect_machine_layout`. Deliberately independent of `is_enabled()`'s FC dispatch and `any_enabled()`'s warning.
+- **A2.** ✅ `device_identification::build_objects` now returns `Result<Vec<DeviceIdentificationObject>, TooLargeForFc43>` instead of panicking; `handler::handle_encapsulated_interface_transport` turns an `Err` into a real `EXCEPTION_SERVER_DEVICE_FAILURE` (0x04, new — first use of this exception code in the project).
+- **A3.** ✅ `protocol::device_description::RESERVED_DEVICE_DESCRIPTION_FILE_NUMBER = 0xFFFF` (top of the `u16` range, mirroring FC43's own reservation of the *top* of its object-ID range) — a user's own `[[file-records]]` entry colliding with it is a hard parse error (`DeviceDescriptionError::ReservedFileNumber`), same discipline as `fuse-permissions.toml` rejecting a `client-trust` key.
+- **A4.** ✅ `miniz_oxide` added to `server`; new `server::device_description_compression` module (`compress_toml_source`/`decompress_toml_source`, DEFLATE level 10, `decompress_to_vec_with_limit`-bounded at 64 MiB against a zip-bomb peer). **Deliberately not wired into `main.rs`'s startup sequence yet** — nothing consumes it until A6, so wiring it in now would be dead plumbing A6 would touch again anyway.
+- **A5.** Manifest data type (standalone): machine name/unit_id/reserved-`file_number`/compressed-length, compact inline-table TOML array (per the measured 11,405-byte/47-chunk size for 255 machines) + serialization. Not yet wired into `build_objects`.
+- **A6.** Server: wire the manifest into FC43 — when the full TOML exceeds FC43's budget (`detect_machine_layout` must also be on), serve the manifest via FC43's existing object mechanism instead of the full inline-chunked TOML. The existing small-description inline-chunk path stays completely untouched for anything that still fits. This is also where A4's compression actually gets called once and cached (`Arc`, process lifetime).
+- **A7.** Server: FC20 dispatch for the reserved `file_number`, serving the cached compressed blob in chunks — a dedicated code path, not a reuse of `handle_read_file_record`'s static-declaration validation.
+- **A8.** Client: detect which FC43 response shape it got; if manifest, fetch via FC20 using the known length (`ceil(length / 249)` records), decompress, parse as the real TOML. Any failure at any step falls back to the local TOML file argument, same existing fallback chain.
+
+Commits so far: `226008e` (A1), `1709380` (A2), `ca21490` (A3), `e9e17a3` (A4). 963 workspace tests pass, clippy/fmt clean at every step.
 
 ### Thread C — Sparkplug-driven selective subscription (`mqtt` layer only; needs B1 at minimum)
 - **C1.** `--machines <names>` for `fuse`/`files` — simple, no dependency on anything else here; could land first if a quick win is wanted.
