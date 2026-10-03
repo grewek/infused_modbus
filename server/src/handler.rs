@@ -42,9 +42,9 @@ use protocol::device_description::{
 };
 use protocol::pdu::{
     EXCEPTION_ILLEGAL_DATA_ADDRESS, EXCEPTION_ILLEGAL_DATA_VALUE, EXCEPTION_ILLEGAL_FUNCTION,
-    ExceptionResponse, FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
-    FUNCTION_CODE_MASK_WRITE_REGISTER, FUNCTION_CODE_READ_COILS,
-    FUNCTION_CODE_READ_DISCRETE_INPUTS, FUNCTION_CODE_READ_FILE_RECORD,
+    EXCEPTION_SERVER_DEVICE_FAILURE, ExceptionResponse,
+    FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT, FUNCTION_CODE_MASK_WRITE_REGISTER,
+    FUNCTION_CODE_READ_COILS, FUNCTION_CODE_READ_DISCRETE_INPUTS, FUNCTION_CODE_READ_FILE_RECORD,
     FUNCTION_CODE_READ_HOLDING_REGISTERS, FUNCTION_CODE_READ_INPUT_REGISTERS,
     FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS, FUNCTION_CODE_REPORT_SERVER_ID,
     FUNCTION_CODE_WRITE_FILE_RECORD, FUNCTION_CODE_WRITE_MULTIPLE_COILS,
@@ -218,7 +218,13 @@ fn handle_encapsulated_interface_transport(pdu: &[u8], toml_source: &str) -> Vec
         }
         .encode();
     };
-    let objects = build_objects(toml_source);
+    let Ok(objects) = build_objects(toml_source) else {
+        return ExceptionResponse {
+            function_code: FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
+            exception_code: EXCEPTION_SERVER_DEVICE_FAILURE,
+        }
+        .encode();
+    };
     handle_read_device_identification(&request, &objects)
 }
 
@@ -2102,6 +2108,50 @@ mod tests {
         let decoded = ReadDeviceIdentificationResponse::decode(&response).unwrap();
         assert_eq!(decoded.objects[0].id, 0x80);
         assert_eq!(decoded.objects[0].value, vec![0x01]);
+    }
+
+    #[test]
+    fn encapsulated_interface_transport_reports_a_clean_exception_when_too_large_for_fc43() {
+        use protocol::pdu::{READ_DEVICE_ID_EXTENDED, ReadDeviceIdentificationRequest};
+
+        let store = Arc::new(Mutex::new(RegisterStore::new()));
+        let coil_store = Arc::new(Mutex::new(CoilStore::new()));
+        let request = ReadDeviceIdentificationRequest {
+            read_device_id_code: READ_DEVICE_ID_EXTENDED,
+            object_id: 0x80,
+        }
+        .encode();
+        // 244-byte chunks x 127 private object IDs (0x81..=0xFF) is FC43's
+        // own budget (see device_identification::build_objects) -- one byte
+        // over that overflows it.
+        let oversized_toml_source = "x".repeat(244 * 127 + 1);
+
+        let response = test_handle_request(
+            &request,
+            &ServerOptions::allow_all(),
+            &registers(),
+            &store,
+            &coils(),
+            &coil_store,
+            &Vec::new(),
+            &Arc::new(Mutex::new(DiscreteInputStore::new())),
+            &Vec::new(),
+            &Arc::new(Mutex::new(InputRegisterStore::new())),
+            &Vec::new(),
+            &Arc::new(Mutex::new(FileRecordStore::new())),
+            MemLayout::Abcd,
+            MemLayout::Abcd,
+            &oversized_toml_source,
+            None,
+        );
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
+                exception_code: EXCEPTION_SERVER_DEVICE_FAILURE,
+            }
+        );
     }
 
     #[test]

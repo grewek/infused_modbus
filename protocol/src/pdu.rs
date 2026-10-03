@@ -38,6 +38,14 @@ pub const READ_DEVICE_ID_INDIVIDUAL: u8 = 0x04;
 pub const EXCEPTION_ILLEGAL_FUNCTION: u8 = 0x01;
 pub const EXCEPTION_ILLEGAL_DATA_ADDRESS: u8 = 0x02;
 pub const EXCEPTION_ILLEGAL_DATA_VALUE: u8 = 0x03;
+/// "An unrecoverable error occurred while the server was attempting to
+/// perform the requested action" — the spec's own catch-all for a failure
+/// that isn't about what the client asked, only about the server's own
+/// inability to do it right now. First use: FC43 (Read Device
+/// Identification) when the device description is too large to fit the
+/// private-object scheme's 127-slot budget — see
+/// `server::device_identification::build_objects`.
+pub const EXCEPTION_SERVER_DEVICE_FAILURE: u8 = 0x04;
 
 const FUNCTION_CODE_BYTE: usize = 0;
 

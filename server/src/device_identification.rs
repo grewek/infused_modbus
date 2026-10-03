@@ -46,6 +46,21 @@ const MAX_PDU_LEN: usize = 253;
 // any response at all, since 7 + 2 + 255 = 264 > 253.
 const MAX_TOML_CHUNK_LEN: usize = 244;
 
+/// `build_objects` couldn't fit `toml_source` into the private-object ID
+/// space — see `build_objects`'s own doc comment for the exact budget.
+/// Carries the chunk count actually needed and the number of slots really
+/// available, so a caller can report something more useful than a bare
+/// "too big" (`handler::handle_encapsulated_interface_transport` doesn't
+/// use these today — it just turns this into
+/// `EXCEPTION_SERVER_DEVICE_FAILURE` — but a future manifest fallback, see
+/// CLAUDE.md's "Planned: grow FC43's device-description transfer capacity",
+/// is the real consumer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooLargeForFc43 {
+    pub chunks_needed: usize,
+    pub chunks_available: usize,
+}
+
 /// Builds the full, fixed list of objects this server can serve — object
 /// 0x80 (the presence flag) plus the TOML source split into
 /// `MAX_TOML_CHUNK_LEN`-byte chunks starting at 0x81. Computed fresh per
@@ -53,35 +68,41 @@ const MAX_TOML_CHUNK_LEN: usize = 244;
 /// startup and never changes, so this is trivially deterministic, and
 /// FC 43 requests are rare (client startup, not the polling hot path).
 ///
-/// Panics if `toml_source` is long enough that its chunks would run past
-/// object ID 0xFF — the private-object ID space (0x81..=0xFF, 127 slots)
-/// caps how much text this scheme can carry to roughly 31KB, which a real
-/// device description isn't expected to approach.
-pub fn build_objects(toml_source: &str) -> Vec<DeviceIdentificationObject> {
+/// Returns `Err(TooLargeForFc43)` — rather than panicking, as this used to
+/// (fixed per CLAUDE.md's Thread A2: a description that grows past the
+/// ceiling over time shouldn't crash the server outright at the next FC43
+/// request) — if `toml_source` is long enough that its chunks would run
+/// past object ID 0xFF. The private-object ID space (0x81..=0xFF, 127
+/// slots) caps how much text this scheme can carry to roughly 31KB.
+pub fn build_objects(
+    toml_source: &str,
+) -> Result<Vec<DeviceIdentificationObject>, TooLargeForFc43> {
     let mut objects = vec![DeviceIdentificationObject {
         id: PRESENCE_OBJECT_ID,
         value: vec![0x01],
     }];
 
+    let chunks_available = 0xFF - FIRST_TOML_CHUNK_OBJECT_ID as usize + 1;
     for (index, chunk) in toml_source
         .as_bytes()
         .chunks(MAX_TOML_CHUNK_LEN)
         .enumerate()
     {
         let id = FIRST_TOML_CHUNK_OBJECT_ID as usize + index;
-        assert!(
-            id <= 0xFF,
-            "device description is too large to serve via FC43 (needs {} chunk object(s), only {} available)",
-            index + 1,
-            0xFF - FIRST_TOML_CHUNK_OBJECT_ID as usize + 1
-        );
+        if id > 0xFF {
+            let chunks_needed = toml_source.len().div_ceil(MAX_TOML_CHUNK_LEN);
+            return Err(TooLargeForFc43 {
+                chunks_needed,
+                chunks_available,
+            });
+        }
         objects.push(DeviceIdentificationObject {
             id: id as u8,
             value: chunk.to_vec(),
         });
     }
 
-    objects
+    Ok(objects)
 }
 
 /// Answers a Read Device Identification request against a fixed object
@@ -156,7 +177,7 @@ mod tests {
 
     #[test]
     fn build_objects_always_includes_the_presence_flag() {
-        let objects = build_objects("");
+        let objects = build_objects("").unwrap();
         assert_eq!(objects[0].id, 0x80);
         assert_eq!(objects[0].value, vec![0x01]);
     }
@@ -164,7 +185,7 @@ mod tests {
     #[test]
     fn build_objects_chunks_toml_source_starting_at_0x81() {
         let toml_source = "a".repeat(MAX_TOML_CHUNK_LEN + 10);
-        let objects = build_objects(&toml_source);
+        let objects = build_objects(&toml_source).unwrap();
         assert_eq!(objects.len(), 3); // presence flag + 2 chunks
         assert_eq!(objects[1].id, 0x81);
         assert_eq!(objects[1].value.len(), MAX_TOML_CHUNK_LEN);
@@ -173,9 +194,31 @@ mod tests {
     }
 
     #[test]
+    fn build_objects_returns_an_error_instead_of_panicking_when_too_large() {
+        // 127 chunk slots available (0x81..=0xFF) -- one byte over the
+        // 128th chunk's worth of source overflows that budget.
+        let toml_source = "x".repeat(MAX_TOML_CHUNK_LEN * 127 + 1);
+        assert_eq!(
+            build_objects(&toml_source),
+            Err(TooLargeForFc43 {
+                chunks_needed: 128,
+                chunks_available: 127,
+            })
+        );
+    }
+
+    #[test]
+    fn build_objects_succeeds_at_exactly_the_chunk_budget() {
+        let toml_source = "x".repeat(MAX_TOML_CHUNK_LEN * 127);
+        let objects = build_objects(&toml_source).unwrap();
+        assert_eq!(objects.len(), 128); // presence flag + 127 chunks
+        assert_eq!(objects.last().unwrap().id, 0xFF);
+    }
+
+    #[test]
     fn build_objects_reassembles_to_the_original_source() {
         let toml_source = "name = \"Stop_Process\"\naddress = 40002\n".repeat(20);
-        let objects = build_objects(&toml_source);
+        let objects = build_objects(&toml_source).unwrap();
         let reassembled: Vec<u8> = objects[1..]
             .iter()
             .flat_map(|object| object.value.clone())
@@ -185,7 +228,7 @@ mod tests {
 
     #[test]
     fn handle_extended_read_starting_at_presence_flag_returns_it() {
-        let objects = build_objects("hello");
+        let objects = build_objects("hello").unwrap();
         let request = ReadDeviceIdentificationRequest {
             read_device_id_code: READ_DEVICE_ID_EXTENDED,
             object_id: 0x80,
@@ -206,7 +249,7 @@ mod tests {
         // another (see MAX_TOML_CHUNK_LEN's doc comment), so this should
         // take exactly four responses (presence flag + one per chunk).
         let toml_source = "x".repeat(MAX_TOML_CHUNK_LEN * 3);
-        let objects = build_objects(&toml_source);
+        let objects = build_objects(&toml_source).unwrap();
         assert_eq!(objects.len(), 4);
 
         let mut request = ReadDeviceIdentificationRequest {
@@ -239,7 +282,7 @@ mod tests {
 
     #[test]
     fn handle_rejects_unsupported_read_device_id_codes() {
-        let objects = build_objects("hello");
+        let objects = build_objects("hello").unwrap();
         let request = ReadDeviceIdentificationRequest {
             read_device_id_code: READ_DEVICE_ID_BASIC,
             object_id: 0x00,
@@ -256,7 +299,7 @@ mod tests {
 
     #[test]
     fn handle_rejects_unknown_starting_object_id() {
-        let objects = build_objects("hello");
+        let objects = build_objects("hello").unwrap();
         let request = ReadDeviceIdentificationRequest {
             read_device_id_code: READ_DEVICE_ID_EXTENDED,
             object_id: 0xAA,
