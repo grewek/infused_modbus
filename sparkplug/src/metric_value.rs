@@ -1,7 +1,13 @@
-//! The scalar shape of `Metric.value` (Sparkplug B's protobuf `oneof`, fields
-//! 10-16). `dataset_value`/`template_value`/`extension_value` (fields 17-19)
-//! are deliberately not modeled — no concrete need for composite/array metric
-//! values yet; every value this project produces from Modbus data is scalar.
+//! The shape of `Metric.value` (Sparkplug B's protobuf `oneof`, fields
+//! 10-17). `template_value`/`extension_value` (fields 18-19) are deliberately
+//! not modeled — no concrete need for templates or composite/array metric
+//! values yet; every scalar value this project produces from Modbus data is
+//! one of the first seven variants here. `DataSet` (field 17, see
+//! `data_set::DataSet`) was added per CLAUDE.md's Thread B3 as a general
+//! capability — not yet produced by any Modbus-derived metric, but a real
+//! wire type this crate can now encode/decode.
+
+use crate::data_set::DataSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetricValue {
@@ -12,4 +18,5 @@ pub enum MetricValue {
     Boolean(bool),
     String(String),
     Bytes(Vec<u8>),
+    DataSet(DataSet),
 }

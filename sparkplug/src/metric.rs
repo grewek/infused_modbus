@@ -18,6 +18,7 @@
 //! Node-RED dashboard plugin and the UN/ECE `unit` field both need a generic
 //! per-metric metadata channel, see `property.rs`.)
 
+use crate::data_set;
 use crate::data_type::DataType;
 use crate::metric_value::MetricValue;
 use crate::property::{self, PropertySet};
@@ -36,6 +37,7 @@ const FIELD_DOUBLE_VALUE: u32 = 13;
 const FIELD_BOOLEAN_VALUE: u32 = 14;
 const FIELD_STRING_VALUE: u32 = 15;
 const FIELD_BYTES_VALUE: u32 = 16;
+const FIELD_DATASET_VALUE: u32 = 17;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Metric {
@@ -65,6 +67,7 @@ pub enum DecodeError {
     MissingValue,
     UnknownDataTypeCode(u32),
     Property(property::DecodeError),
+    DataSet(data_set::DecodeError),
 }
 
 impl From<wire::DecodeError> for DecodeError {
@@ -76,6 +79,12 @@ impl From<wire::DecodeError> for DecodeError {
 impl From<property::DecodeError> for DecodeError {
     fn from(error: property::DecodeError) -> Self {
         DecodeError::Property(error)
+    }
+}
+
+impl From<data_set::DecodeError> for DecodeError {
+    fn from(error: data_set::DecodeError) -> Self {
+        DecodeError::DataSet(error)
     }
 }
 
@@ -215,6 +224,18 @@ pub fn encode_metric(metric: &Metric, buffer: &mut Vec<u8>) {
             );
             wire::encode_length_delimited(value, buffer);
         }
+        MetricValue::DataSet(value) => {
+            wire::encode_tag(
+                Tag {
+                    field_number: FIELD_DATASET_VALUE,
+                    wire_type: WireType::LengthDelimited,
+                },
+                buffer,
+            );
+            let mut data_set_bytes = Vec::new();
+            data_set::encode_data_set(value, &mut data_set_bytes);
+            wire::encode_length_delimited(&data_set_bytes, buffer);
+        }
     }
 }
 
@@ -309,6 +330,13 @@ pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
             FIELD_BYTES_VALUE => {
                 let (field_bytes, consumed) = wire::decode_length_delimited(&bytes[offset..])?;
                 value = Some(MetricValue::Bytes(field_bytes.to_vec()));
+                offset += consumed;
+            }
+            FIELD_DATASET_VALUE => {
+                let (field_bytes, consumed) = wire::decode_length_delimited(&bytes[offset..])?;
+                value = Some(MetricValue::DataSet(data_set::decode_data_set(
+                    field_bytes,
+                )?));
                 offset += consumed;
             }
             _ => {
@@ -629,6 +657,79 @@ mod tests {
             properties: None,
             value: MetricValue::Bytes(vec![0x0D, 0xFE, 0x00, 0x20]),
         });
+    }
+
+    #[test]
+    fn round_trips_dataset_value() {
+        use crate::data_set::{DataSet, DataSetValue, Row};
+
+        round_trip(Metric {
+            name: "Machines".to_string(),
+            alias: None,
+            timestamp: None,
+            data_type: DataType::DataSet,
+            is_null: false,
+            properties: None,
+            value: MetricValue::DataSet(DataSet {
+                columns: vec!["Name".to_string(), "UnitId".to_string()],
+                types: vec![DataType::String, DataType::UInt8],
+                rows: vec![Row {
+                    elements: vec![
+                        DataSetValue::String("PumpA".to_string()),
+                        DataSetValue::Int(1),
+                    ],
+                }],
+            }),
+        });
+    }
+
+    #[test]
+    fn decode_propagates_dataset_decode_errors() {
+        let mut buffer = Vec::new();
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_NAME,
+                wire_type: WireType::LengthDelimited,
+            },
+            &mut buffer,
+        );
+        wire::encode_length_delimited(b"Machines", &mut buffer);
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_DATATYPE,
+                wire_type: WireType::Varint,
+            },
+            &mut buffer,
+        );
+        wire::encode_varint(u64::from(u32::from(DataType::DataSet)), &mut buffer);
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_DATASET_VALUE,
+                wire_type: WireType::LengthDelimited,
+            },
+            &mut buffer,
+        );
+        // A malformed embedded DataSet: one declared column, no matching type.
+        let mut malformed_data_set = Vec::new();
+        wire::encode_tag(
+            Tag {
+                field_number: 2,
+                wire_type: WireType::LengthDelimited,
+            },
+            &mut malformed_data_set,
+        );
+        wire::encode_length_delimited(b"Name", &mut malformed_data_set);
+        wire::encode_length_delimited(&malformed_data_set, &mut buffer);
+
+        assert_eq!(
+            decode_metric(&buffer),
+            Err(DecodeError::DataSet(
+                data_set::DecodeError::MismatchedColumnsAndTypes {
+                    columns: 1,
+                    types: 0
+                }
+            ))
+        );
     }
 
     #[test]
