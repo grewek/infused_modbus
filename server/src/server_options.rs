@@ -26,6 +26,19 @@
 // aren't implemented yet — `handle_request` has no match arm for them
 // regardless of what's configured here, so the key is inert until those
 // function codes actually exist, but the config surface is ready for them.
+//
+// `detect_machine_layout` (see CLAUDE.md's "Planned: grow FC43's device-
+// description transfer capacity" section) is a top-level key, a sibling of
+// `[function-codes]`, not a member of it — it isn't itself a function code
+// gate. It governs a narrower thing: whether the server may fall back to
+// serving a small manifest + bulk FC20 transfer of the compressed device
+// description when the full description doesn't fit FC43's own inline-chunk
+// budget. Tying it to `read_device_identification` would need FC20's handler
+// to sub-dispatch by `file_number` against two different gates (a finer-
+// grained model this file has never needed before); requiring both
+// `read_device_identification` and `read_file_record` would conflate two
+// independent technician choices ("expose my own file-records" vs. "let a
+// large description be fetched at all"). A dedicated toggle avoids both.
 
 use serde::Deserialize;
 use std::fmt;
@@ -78,12 +91,18 @@ struct RawFunctionCodes {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawServerOptions {
+    #[serde(default)]
+    detect_machine_layout: bool,
     #[serde(rename = "function-codes", default)]
     function_codes: RawFunctionCodes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerOptions {
+    /// Gates the FC43 manifest+FC20-bulk-transfer fallback for an
+    /// oversized device description — not a function-code gate itself, see
+    /// this module's own doc comment above.
+    pub detect_machine_layout: bool,
     pub read_coils: bool,
     pub read_discrete_inputs: bool,
     pub read_holding_registers: bool,
@@ -121,6 +140,11 @@ impl From<toml::de::Error> for ServerOptionsError {
 impl From<RawFunctionCodes> for ServerOptions {
     fn from(raw: RawFunctionCodes) -> Self {
         ServerOptions {
+            // Overwritten by `ServerOptions::parse` from the top-level
+            // `RawServerOptions` field — `RawFunctionCodes` alone has no
+            // opinion on it, so this is just a placeholder to keep this
+            // conversion total.
+            detect_machine_layout: false,
             read_coils: raw.read_coils,
             read_discrete_inputs: raw.read_discrete_inputs,
             read_holding_registers: raw.read_holding_registers,
@@ -143,7 +167,10 @@ impl From<RawFunctionCodes> for ServerOptions {
 impl ServerOptions {
     pub fn parse(toml_source: &str) -> Result<Self, ServerOptionsError> {
         let raw: RawServerOptions = toml::from_str(toml_source)?;
-        Ok(raw.function_codes.into())
+        Ok(ServerOptions {
+            detect_machine_layout: raw.detect_machine_layout,
+            ..raw.function_codes.into()
+        })
     }
 
     /// Whether `function_code` is enabled per this configuration — the
@@ -202,6 +229,7 @@ impl ServerOptions {
     #[cfg(test)]
     pub fn allow_all() -> Self {
         ServerOptions {
+            detect_machine_layout: true,
             read_coils: true,
             read_discrete_inputs: true,
             read_holding_registers: true,
@@ -239,6 +267,7 @@ mod tests {
         assert_eq!(
             options,
             ServerOptions {
+                detect_machine_layout: false,
                 read_coils: false,
                 read_discrete_inputs: false,
                 read_holding_registers: false,
@@ -275,6 +304,27 @@ mod tests {
         assert!(options.write_single_register);
         assert!(!options.read_coils);
         assert!(!options.write_multiple_registers);
+    }
+
+    #[test]
+    fn detect_machine_layout_defaults_to_false() {
+        assert!(!ServerOptions::parse("").unwrap().detect_machine_layout);
+        assert!(!ServerOptions::default().detect_machine_layout);
+    }
+
+    #[test]
+    fn parse_reads_detect_machine_layout_as_a_top_level_key() {
+        let options = ServerOptions::parse("detect_machine_layout = true\n").unwrap();
+        assert!(options.detect_machine_layout);
+    }
+
+    #[test]
+    fn detect_machine_layout_is_independent_of_any_enabled() {
+        // It isn't a function code, so enabling it alone must not flip
+        // any_enabled() to true (that warning is scoped to "can the server
+        // answer any Modbus request at all").
+        let options = ServerOptions::parse("detect_machine_layout = true\n").unwrap();
+        assert!(!options.any_enabled());
     }
 
     #[test]
