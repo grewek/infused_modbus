@@ -151,6 +151,7 @@ mod tests {
                 timestamp: None,
                 data_type: DataType::UInt64,
                 is_null: false,
+                properties: None,
                 value: MetricValue::Long(3),
             }],
             seq: Some(0),
@@ -168,6 +169,7 @@ mod tests {
                     timestamp: None,
                     data_type: DataType::UInt16,
                     is_null: false,
+                    properties: None,
                     value: MetricValue::Int(21),
                 },
                 Metric {
@@ -176,6 +178,7 @@ mod tests {
                     timestamp: None,
                     data_type: DataType::Boolean,
                     is_null: false,
+                    properties: None,
                     value: MetricValue::Boolean(true),
                 },
                 Metric {
@@ -184,6 +187,7 @@ mod tests {
                     timestamp: None,
                     data_type: DataType::Float,
                     is_null: false,
+                    properties: None,
                     value: MetricValue::Float(12.5),
                 },
             ],

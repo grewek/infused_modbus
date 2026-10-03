@@ -1,23 +1,26 @@
 //! Encode/decode for Sparkplug B's `Metric` message — the missing link between
 //! `wire`'s raw protobuf primitives and `data_type`/`metric_value`'s pure data
 //! types. Deliberately minimal: `name` (field 1), `alias` (field 2),
-//! `timestamp` (field 3), `datatype` (field 4), `is_null` (field 7), and the
-//! scalar `value` oneof (fields 10-16, via `MetricValue`) are modeled.
-//! `is_historical`/`is_transient`/`metadata`/`properties` aren't yet — no
-//! concrete need for them has shown up; add them once one does, per this
-//! project's Extraction-Based Programming convention. (`alias` itself was
-//! added in M5, once `client::sparkplug_alias`'s per-Edge-Node alias
-//! assignment became a real need — M4 had deliberately left it out for the
-//! same reason. `timestamp` was added after the Eclipse Sparkplug TCK's
+//! `timestamp` (field 3), `datatype` (field 4), `is_null` (field 7),
+//! `properties` (field 9), and the scalar `value` oneof (fields 10-16, via
+//! `MetricValue`) are modeled. `is_historical`/`is_transient`/`metadata`
+//! aren't yet — no concrete need for them has shown up; add them once one
+//! does, per this project's Extraction-Based Programming convention. (`alias`
+//! itself was added in M5, once `client::sparkplug_alias`'s per-Edge-Node
+//! alias assignment became a real need — M4 had deliberately left it out for
+//! the same reason. `timestamp` was added after the Eclipse Sparkplug TCK's
 //! `payloads-name-birth-data-requirement` assertion caught every metric in
 //! NBIRTH/DBIRTH/NDATA/DDATA missing it — a metric-level timestamp, distinct
 //! from `Payload`'s own top-level one. `is_null` was added for the planned
 //! Sparkplug selective-subscription design — see CLAUDE.md's Thread B1 — so a
 //! DBIRTH can declare a metric's full name/alias/type before a real value is
-//! known yet.)
+//! known yet. `properties` was added for CLAUDE.md's Thread B2 — the
+//! Node-RED dashboard plugin and the UN/ECE `unit` field both need a generic
+//! per-metric metadata channel, see `property.rs`.)
 
 use crate::data_type::DataType;
 use crate::metric_value::MetricValue;
+use crate::property::{self, PropertySet};
 use crate::wire::{self, Tag, WireType};
 
 const FIELD_NAME: u32 = 1;
@@ -25,6 +28,7 @@ const FIELD_ALIAS: u32 = 2;
 const FIELD_TIMESTAMP: u32 = 3;
 const FIELD_DATATYPE: u32 = 4;
 const FIELD_IS_NULL: u32 = 7;
+const FIELD_PROPERTIES: u32 = 9;
 const FIELD_INT_VALUE: u32 = 10;
 const FIELD_LONG_VALUE: u32 = 11;
 const FIELD_FLOAT_VALUE: u32 = 12;
@@ -43,6 +47,7 @@ pub struct Metric {
     /// the wire when `false` (the default), not encoded as an explicit
     /// `false` varint — `decode_metric` defaults to `false` when absent.
     pub is_null: bool,
+    pub properties: Option<PropertySet>,
     pub value: MetricValue,
 }
 
@@ -59,11 +64,18 @@ pub enum DecodeError {
     MissingDataType,
     MissingValue,
     UnknownDataTypeCode(u32),
+    Property(property::DecodeError),
 }
 
 impl From<wire::DecodeError> for DecodeError {
     fn from(error: wire::DecodeError) -> Self {
         DecodeError::Wire(error)
+    }
+}
+
+impl From<property::DecodeError> for DecodeError {
+    fn from(error: property::DecodeError) -> Self {
+        DecodeError::Property(error)
     }
 }
 
@@ -117,6 +129,19 @@ pub fn encode_metric(metric: &Metric, buffer: &mut Vec<u8>) {
             buffer,
         );
         wire::encode_varint(1, buffer);
+    }
+
+    if let Some(properties) = &metric.properties {
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_PROPERTIES,
+                wire_type: WireType::LengthDelimited,
+            },
+            buffer,
+        );
+        let mut properties_bytes = Vec::new();
+        property::encode_property_set(properties, &mut properties_bytes);
+        wire::encode_length_delimited(&properties_bytes, buffer);
     }
 
     match &metric.value {
@@ -205,6 +230,7 @@ pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
     let mut timestamp: Option<u64> = None;
     let mut data_type: Option<DataType> = None;
     let mut is_null = false;
+    let mut properties: Option<PropertySet> = None;
     let mut value: Option<MetricValue> = None;
 
     let mut offset = 0;
@@ -241,6 +267,11 @@ pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
             FIELD_IS_NULL => {
                 let (raw, consumed) = wire::decode_varint(&bytes[offset..])?;
                 is_null = raw != 0;
+                offset += consumed;
+            }
+            FIELD_PROPERTIES => {
+                let (field_bytes, consumed) = wire::decode_length_delimited(&bytes[offset..])?;
+                properties = Some(property::decode_property_set(field_bytes)?);
                 offset += consumed;
             }
             FIELD_INT_VALUE => {
@@ -296,6 +327,7 @@ pub fn decode_metric(bytes: &[u8]) -> Result<Metric, DecodeError> {
         timestamp,
         data_type: data_type.ok_or(DecodeError::MissingDataType)?,
         is_null,
+        properties,
         value: value.ok_or(DecodeError::MissingValue)?,
     })
 }
@@ -318,6 +350,7 @@ mod tests {
             timestamp: None,
             data_type: DataType::UInt8,
             is_null: false,
+            properties: None,
             value: MetricValue::Int(42),
         });
     }
@@ -330,8 +363,112 @@ mod tests {
             timestamp: Some(1_700_000_000_000),
             data_type: DataType::UInt16,
             is_null: true,
+            properties: None,
             value: MetricValue::Int(0),
         });
+    }
+
+    #[test]
+    fn round_trips_a_metric_with_properties() {
+        use crate::property::{Property, PropertyDataType, PropertyValue};
+
+        round_trip(Metric {
+            name: "Tank_Temperature".to_string(),
+            alias: None,
+            timestamp: None,
+            data_type: DataType::UInt16,
+            is_null: false,
+            properties: Some(PropertySet {
+                entries: vec![(
+                    "unit".to_string(),
+                    Property {
+                        data_type: PropertyDataType::String,
+                        value: PropertyValue::String("CEL".to_string()),
+                    },
+                )],
+            }),
+            value: MetricValue::Int(21),
+        });
+    }
+
+    #[test]
+    fn encode_omits_properties_field_when_absent() {
+        let mut buffer = Vec::new();
+        encode_metric(
+            &Metric {
+                name: "Tank_Temperature".to_string(),
+                alias: None,
+                timestamp: None,
+                data_type: DataType::UInt16,
+                is_null: false,
+                properties: None,
+                value: MetricValue::Int(21),
+            },
+            &mut buffer,
+        );
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let (tag, tag_len) = wire::decode_tag(&buffer[offset..]).unwrap();
+            offset += tag_len;
+            assert_ne!(tag.field_number, FIELD_PROPERTIES);
+            offset += wire::skip_field(tag.wire_type, &buffer[offset..]).unwrap();
+        }
+    }
+
+    #[test]
+    fn decode_propagates_property_decode_errors() {
+        let mut buffer = Vec::new();
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_NAME,
+                wire_type: WireType::LengthDelimited,
+            },
+            &mut buffer,
+        );
+        wire::encode_length_delimited(b"Tank_Temperature", &mut buffer);
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_DATATYPE,
+                wire_type: WireType::Varint,
+            },
+            &mut buffer,
+        );
+        wire::encode_varint(u64::from(u32::from(DataType::UInt16)), &mut buffer);
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_PROPERTIES,
+                wire_type: WireType::LengthDelimited,
+            },
+            &mut buffer,
+        );
+        // An empty embedded PropertySet with zero keys/values is valid on its
+        // own, so this instead builds one with a lone key and no matching
+        // value to trigger a real property::DecodeError.
+        let mut malformed_properties = Vec::new();
+        wire::encode_tag(
+            Tag {
+                field_number: 1,
+                wire_type: WireType::LengthDelimited,
+            },
+            &mut malformed_properties,
+        );
+        wire::encode_length_delimited(b"unit", &mut malformed_properties);
+        wire::encode_length_delimited(&malformed_properties, &mut buffer);
+        wire::encode_tag(
+            Tag {
+                field_number: FIELD_INT_VALUE,
+                wire_type: WireType::Varint,
+            },
+            &mut buffer,
+        );
+        wire::encode_varint(21, &mut buffer);
+
+        assert_eq!(
+            decode_metric(&buffer),
+            Err(DecodeError::Property(
+                property::DecodeError::MismatchedKeyValueCounts { keys: 1, values: 0 }
+            ))
+        );
     }
 
     #[test]
@@ -344,6 +481,7 @@ mod tests {
                 timestamp: None,
                 data_type: DataType::UInt16,
                 is_null: false,
+                properties: None,
                 value: MetricValue::Int(21),
             },
             &mut buffer,
@@ -397,6 +535,7 @@ mod tests {
             timestamp: None,
             data_type: DataType::UInt16,
             is_null: false,
+            properties: None,
             value: MetricValue::Int(21),
         });
     }
@@ -409,6 +548,7 @@ mod tests {
             timestamp: Some(1_700_000_000_000),
             data_type: DataType::UInt16,
             is_null: false,
+            properties: None,
             value: MetricValue::Int(21),
         });
     }
@@ -421,6 +561,7 @@ mod tests {
             timestamp: None,
             data_type: DataType::UInt64,
             is_null: false,
+            properties: None,
             value: MetricValue::Long(7),
         });
     }
@@ -433,6 +574,7 @@ mod tests {
             timestamp: None,
             data_type: DataType::Float,
             is_null: false,
+            properties: None,
             value: MetricValue::Float(50.05),
         });
     }
@@ -445,6 +587,7 @@ mod tests {
             timestamp: None,
             data_type: DataType::Double,
             is_null: false,
+            properties: None,
             value: MetricValue::Double(12.345_678_9),
         });
     }
@@ -457,6 +600,7 @@ mod tests {
             timestamp: None,
             data_type: DataType::Boolean,
             is_null: false,
+            properties: None,
             value: MetricValue::Boolean(true),
         });
     }
@@ -469,6 +613,7 @@ mod tests {
             timestamp: None,
             data_type: DataType::String,
             is_null: false,
+            properties: None,
             value: MetricValue::String("pump-a-plc".to_string()),
         });
     }
@@ -481,6 +626,7 @@ mod tests {
             timestamp: None,
             data_type: DataType::Bytes,
             is_null: false,
+            properties: None,
             value: MetricValue::Bytes(vec![0x0D, 0xFE, 0x00, 0x20]),
         });
     }
@@ -554,6 +700,7 @@ mod tests {
                 timestamp: None,
                 data_type: DataType::UInt16,
                 is_null: false,
+                properties: None,
                 value: MetricValue::Int(21),
             })
         );
@@ -579,6 +726,7 @@ mod tests {
             timestamp: None,
             data_type: DataType::UInt16,
             is_null: false,
+            properties: None,
             value: MetricValue::Int(21),
         };
         encode_metric(&metric, &mut buffer);
