@@ -139,6 +139,21 @@ pub struct FileRecordDescription {
     pub record_length: u16,
 }
 
+/// Reserved for the server's own compressed-device-description bulk
+/// transfer over FC20 (see CLAUDE.md's "Planned: grow FC43's device-
+/// description transfer capacity past its current ~31KB ceiling", Thread
+/// A3) — a user's own `[[file-records]]` entry is not allowed to use this
+/// `file_number` at all, enforced as a hard parse error (see
+/// `DeviceDescriptionError::ReservedFileNumber`), the same "can't even
+/// appear in the config" discipline `fuse-permissions.toml` already
+/// applies to a `client-trust` key, not a "realistically nobody would pick
+/// this number" assumption. Chosen at the very top of the `u16` range —
+/// real devices documented for FC20/21 use low numbers (e.g. 20, 90, per
+/// the research in CLAUDE.md's "FC 0x14" section) — mirroring how FC43
+/// itself reserves the top of its own object-ID range (0x80-0xFF) for
+/// private/vendor use rather than the bottom.
+pub const RESERVED_DEVICE_DESCRIPTION_FILE_NUMBER: u16 = 0xFFFF;
+
 // One machine on a shared link (a multi-drop RTU bus, or a device reachable
 // through a Unit-ID-aware TCP gateway) — see CLAUDE.md's "Planned:
 // multi-machine device description & FUSE layout" section. Everything that
@@ -308,6 +323,13 @@ pub enum DeviceDescriptionError {
     DuplicateMachineName {
         name: String,
     },
+    // A `[[file-records]]` entry using `RESERVED_DEVICE_DESCRIPTION_FILE_NUMBER`
+    // — reserved for the server's own compressed-description bulk transfer,
+    // see that constant's own doc comment.
+    ReservedFileNumber {
+        machine: String,
+        file_number: u16,
+    },
 }
 
 impl fmt::Display for DeviceDescriptionError {
@@ -330,6 +352,13 @@ impl fmt::Display for DeviceDescriptionError {
             DeviceDescriptionError::DuplicateMachineName { name } => {
                 write!(formatter, "duplicate machine name '{name}'")
             }
+            DeviceDescriptionError::ReservedFileNumber {
+                machine,
+                file_number,
+            } => write!(
+                formatter,
+                "machine '{machine}': file_number {file_number} is reserved for the server's own compressed-description transfer and cannot be used in [[file-records]]"
+            ),
         }
     }
 }
@@ -448,6 +477,15 @@ fn resolve_machine(raw: RawMachine) -> Result<MachineDescription, DeviceDescript
         address,
     })
     .collect();
+
+    for entry in &raw.file_records {
+        if entry.file_number == RESERVED_DEVICE_DESCRIPTION_FILE_NUMBER {
+            return Err(DeviceDescriptionError::ReservedFileNumber {
+                machine: machine_name.to_string(),
+                file_number: entry.file_number,
+            });
+        }
+    }
 
     let file_records = raw
         .file_records
@@ -751,6 +789,48 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parse_rejects_a_file_record_using_the_reserved_file_number() {
+        let toml_source = r#"
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [[machines.file-records]]
+            file_number = 65535
+            record_number = 1
+            record_length = 1
+        "#;
+
+        let error = DeviceDescription::parse(toml_source).unwrap_err();
+        match error {
+            DeviceDescriptionError::ReservedFileNumber {
+                machine,
+                file_number,
+            } => {
+                assert_eq!(machine, "PumpA");
+                assert_eq!(file_number, RESERVED_DEVICE_DESCRIPTION_FILE_NUMBER);
+            }
+            other => panic!("expected ReservedFileNumber, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_a_file_record_one_below_the_reserved_file_number() {
+        let toml_source = r#"
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [[machines.file-records]]
+            file_number = 65534
+            record_number = 1
+            record_length = 1
+        "#;
+
+        assert!(DeviceDescription::parse(toml_source).is_ok());
     }
 
     #[test]
