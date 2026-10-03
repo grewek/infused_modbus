@@ -349,16 +349,18 @@ Motivation: the manifest+per-machine-fetch idea above has no payoff while `clien
 
 **`--machines` unknown-name handling: log and continue**, not a hard startup error — matches the "unknown machine name: log and drop" precedent already established elsewhere (`transaction_consumer`, `sparkplug_command`).
 
-## Implementation milestone plan for the three design threads above (planned 2026-10-02, implementation not yet started)
+## Implementation milestone plan for the three design threads above (planned 2026-10-02; Thread B implemented 2026-10-03)
 
-Everything above (FC43 capacity + Sparkplug selective subscription + UN/ECE `unit`) is fully designed. **No implementation work has started yet** — this is the next-session starting point.
+Everything above (FC43 capacity + Sparkplug selective subscription + UN/ECE `unit`) is fully designed. **Thread B is done; Threads A/C/D have not started** — Thread A is next per the suggested order below.
 
 **Four largely-independent threads, suggested execution order:**
 
-### Thread B — `sparkplug` crate foundations (do first: Thread C depends on it)
-- **B1.** `Metric.is_null` — wire into `encode_metric`/`decode_metric`, same pattern as `alias`/`timestamp`.
-- **B2.** `Metric.properties` (PropertySet) — needed later by the Node-RED dashboard plugin and UN/ECE unit exposure, not only by this thread.
-- **B3.** DataSet metric value type — a general capability, build it for its own sake, don't force an immediate consumer.
+### Thread B — `sparkplug` crate foundations (done 2026-10-03; was needed first since Thread C depends on it)
+- **B1.** ✅ `Metric.is_null` (field 7) — wired into `encode_metric`/`decode_metric`, protobuf implicit-presence (omitted when `false`). `sparkplug/src/metric.rs`.
+- **B2.** ✅ `Metric.properties` (field 9) — new `sparkplug::property` module (`PropertyDataType`, a genuinely different numbering from `Metric`'s own `DataType` — flagged explicitly in a doc comment and a dedicated test; `PropertyValue`/`Property`/`PropertySet`), wired into `Metric`.
+- **B3.** ✅ DataSet metric value type (field 17 of `Metric.value`) — new `sparkplug::data_set` module (`DataSetValue`/`Row`/`DataSet`; `types` reuses `Metric`'s own `DataType`, unlike `PropertyDataType`), wired into `MetricValue`. `num_of_columns` deliberately not modeled (redundant with `columns.len()`, same convention as `WriteMultipleRegistersRequest`).
+
+All three landed as separate reviewed commits (`36229bd`, `312b1ef`, `bd93e7b`, `2a20592`, `3140b0f`, `b046f41`); 961 workspace tests pass. Not yet exercised by any real consumer (no concrete need forced it yet, per Extraction-Based Programming) — Thread C (B1) and the Node-RED dashboard plugin (B2) are the planned first consumers.
 
 ### Thread A — FC43 capacity fix (server/protocol-level, applies to all three representation layers)
 - **A1.** `detect_machine_layout` toggle: schema + parsing in `server::server_options`, wired into the gate.
