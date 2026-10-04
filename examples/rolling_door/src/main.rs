@@ -18,7 +18,9 @@
 
 use datafs::{CoilValue, MachineStores, RegisterValue, build_machine_stores};
 use protocol::device_description::DeviceDescription;
+use protocol::device_description_manifest::ManifestMachine;
 use server::connection::serve_tcp_connection;
+use server::fc43_bulk_transfer::Fc43BulkTransfer;
 use server::handler::ServerMachineState;
 use server::server_handle::ServerHandle;
 use server::server_options::ServerOptions;
@@ -85,6 +87,17 @@ async fn main() {
             .collect(),
     );
     let toml_source = Arc::new(DEVICE_DESCRIPTION_TOML.to_string());
+    let fc43_bulk_transfer = Arc::new(Fc43BulkTransfer::build(
+        DEVICE_DESCRIPTION_TOML,
+        description
+            .machines
+            .iter()
+            .map(|machine| ManifestMachine {
+                name: machine.name.clone(),
+                unit_id: machine.unit_id,
+            })
+            .collect(),
+    ));
 
     let handle = Arc::new(ServerHandle::new(&description.machines, &machine_stores));
 
@@ -100,12 +113,14 @@ async fn main() {
             };
             let machines = Arc::clone(&machines);
             let toml_source = Arc::clone(&toml_source);
+            let fc43_bulk_transfer = Arc::clone(&fc43_bulk_transfer);
             tokio::spawn(async move {
                 serve_tcp_connection(
                     stream,
                     server_options,
                     machines,
                     toml_source,
+                    fc43_bulk_transfer,
                     REQUEST_TIMEOUT,
                 )
                 .await;

@@ -3,6 +3,7 @@
 // handler::handle_request does) because each connection/port is served as
 // its own spawned tokio task, which needs 'static ownership.
 
+use crate::fc43_bulk_transfer::Fc43BulkTransfer;
 use crate::handler::{ServerMachineState, handle_request};
 use crate::server_options::ServerOptions;
 use std::collections::HashMap;
@@ -21,6 +22,7 @@ pub async fn serve_tcp_connection<S>(
     server_options: ServerOptions,
     machines: Arc<HashMap<u8, ServerMachineState>>,
     toml_source: Arc<String>,
+    fc43_bulk_transfer: Arc<Fc43BulkTransfer>,
     timeout: Duration,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -34,6 +36,7 @@ pub async fn serve_tcp_connection<S>(
         // clones sidestep it entirely, and Arc::clone is cheap.
         let handler_machines = Arc::clone(&machines);
         let handler_toml_source = Arc::clone(&toml_source);
+        let handler_fc43_bulk_transfer = Arc::clone(&fc43_bulk_transfer);
         let result = protocol::tcp::serve_request(
             &mut stream,
             async move |unit_id: u8, pdu: &[u8]| {
@@ -43,6 +46,7 @@ pub async fn serve_tcp_connection<S>(
                     &server_options,
                     &handler_machines,
                     &handler_toml_source,
+                    &handler_fc43_bulk_transfer,
                 )
             },
             timeout,
@@ -67,6 +71,7 @@ pub async fn serve_rtu_connection<S>(
     server_options: ServerOptions,
     machines: Arc<HashMap<u8, ServerMachineState>>,
     toml_source: Arc<String>,
+    fc43_bulk_transfer: Arc<Fc43BulkTransfer>,
     frame_silence: Duration,
     timeout: Duration,
 ) where
@@ -75,6 +80,7 @@ pub async fn serve_rtu_connection<S>(
     loop {
         let handler_machines = Arc::clone(&machines);
         let handler_toml_source = Arc::clone(&toml_source);
+        let handler_fc43_bulk_transfer = Arc::clone(&fc43_bulk_transfer);
         let result = protocol::rtu::serve_request(
             &mut stream,
             async move |unit_id: u8, pdu: &[u8]| {
@@ -84,6 +90,7 @@ pub async fn serve_rtu_connection<S>(
                     &server_options,
                     &handler_machines,
                     &handler_toml_source,
+                    &handler_fc43_bulk_transfer,
                 )
             },
             frame_silence,
@@ -172,6 +179,7 @@ mod tests {
             ServerOptions::allow_all(),
             test_machines(Arc::clone(&store)),
             Arc::new(String::new()),
+            Arc::new(Fc43BulkTransfer::build("", Vec::new())),
             Duration::from_secs(1),
         ));
 
@@ -210,6 +218,7 @@ mod tests {
             ServerOptions::allow_all(),
             test_machines(Arc::clone(&store)),
             Arc::new(String::new()),
+            Arc::new(Fc43BulkTransfer::build("", Vec::new())),
             Duration::from_secs(1),
         ));
 
@@ -254,6 +263,7 @@ mod tests {
             ServerOptions::allow_all(),
             test_machines(Arc::clone(&store)),
             Arc::new(String::new()),
+            Arc::new(Fc43BulkTransfer::build("", Vec::new())),
             Duration::from_secs(1),
         ));
 
@@ -300,6 +310,7 @@ mod tests {
             ServerOptions::allow_all(),
             test_machines(Arc::clone(&store)),
             Arc::new(String::new()),
+            Arc::new(Fc43BulkTransfer::build("", Vec::new())),
             Duration::from_millis(20),
             Duration::from_secs(1),
         ));
@@ -339,6 +350,7 @@ mod tests {
             ServerOptions::allow_all(),
             test_machines(Arc::clone(&store)),
             Arc::new(String::new()),
+            Arc::new(Fc43BulkTransfer::build("", Vec::new())),
             Duration::from_millis(20),
             Duration::from_secs(1),
         ));

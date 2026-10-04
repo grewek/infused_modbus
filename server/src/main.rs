@@ -50,7 +50,9 @@
 use datafs::filesystem::{InfusedFilesystem, MachineConfig, WriteMode};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::DeviceDescription;
+use protocol::device_description_manifest::ManifestMachine;
 use server::connection::{serve_rtu_connection, serve_tcp_connection};
+use server::fc43_bulk_transfer::Fc43BulkTransfer;
 use server::handler::ServerMachineState;
 use server::transaction_consumer::run_transaction_consumer;
 use std::collections::HashMap;
@@ -251,6 +253,7 @@ fn start_serving(
     server_options: server::server_options::ServerOptions,
     machines: Arc<HashMap<u8, ServerMachineState>>,
     toml_source: Arc<String>,
+    fc43_bulk_transfer: Arc<Fc43BulkTransfer>,
     client_trust: Arc<Mutex<datafs::client_trust::ClientTrustState>>,
     approved_clients: Arc<Mutex<server::client_trust::ApprovedClients>>,
     live_connections: Arc<Mutex<server::live_connections::LiveConnections>>,
@@ -274,12 +277,14 @@ fn start_serving(
                     };
                     let machines = Arc::clone(&machines);
                     let toml_source = Arc::clone(&toml_source);
+                    let fc43_bulk_transfer = Arc::clone(&fc43_bulk_transfer);
                     tokio::spawn(async move {
                         serve_tcp_connection(
                             stream,
                             server_options,
                             machines,
                             toml_source,
+                            fc43_bulk_transfer,
                             REQUEST_TIMEOUT,
                         )
                         .await;
@@ -333,6 +338,7 @@ fn start_serving(
                     let acceptor = acceptor.clone();
                     let machines = Arc::clone(&machines);
                     let toml_source = Arc::clone(&toml_source);
+                    let fc43_bulk_transfer = Arc::clone(&fc43_bulk_transfer);
                     let live_connections = Arc::clone(&live_connections);
                     let connection_semaphore = Arc::clone(&connection_semaphore);
                     tokio::spawn(async move {
@@ -384,6 +390,7 @@ fn start_serving(
                                 server_options,
                                 machines,
                                 toml_source,
+                                fc43_bulk_transfer,
                                 REQUEST_TIMEOUT,
                             )
                             .await;
@@ -406,6 +413,7 @@ fn start_serving(
                                 server_options,
                                 machines,
                                 toml_source,
+                                fc43_bulk_transfer,
                                 REQUEST_TIMEOUT,
                             ) => {}
                             // Resolves once `server admin revoke` drops this
@@ -442,6 +450,7 @@ fn start_serving(
                     server_options,
                     machines,
                     toml_source,
+                    fc43_bulk_transfer,
                     frame_silence,
                     REQUEST_TIMEOUT,
                 )
@@ -491,6 +500,27 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed to read {device_description_path}: {error}"));
     let description = DeviceDescription::parse(&toml_source)
         .unwrap_or_else(|error| panic!("failed to parse {device_description_path}: {error}"));
+
+    // Built once, here, at startup — not per FC43 request (see
+    // fc43_bulk_transfer's own doc comment on why that matters: DEFLATE
+    // compression of the whole description is real CPU work whose result
+    // never changes afterward). Only ever consulted by
+    // handle_encapsulated_interface_transport once the real `toml_source`
+    // doesn't fit FC43's own inline-chunk budget, and only once
+    // `detect_machine_layout` is on — but it's unconditionally built
+    // regardless of that toggle, since the common case (a small
+    // description) makes this trivially cheap anyway.
+    let fc43_bulk_transfer = Arc::new(Fc43BulkTransfer::build(
+        &toml_source,
+        description
+            .machines
+            .iter()
+            .map(|machine| ManifestMachine {
+                name: machine.name.clone(),
+                unit_id: machine.unit_id,
+            })
+            .collect(),
+    ));
 
     // One fresh set of stores per configured machine, name-keyed — shared
     // by the transaction consumer (below) and the FUSE tree (further down).
@@ -628,6 +658,7 @@ fn main() {
         server_options,
         Arc::clone(&machines),
         Arc::clone(&toml_source),
+        Arc::clone(&fc43_bulk_transfer),
         Arc::clone(&client_trust),
         approved_clients,
         live_connections,

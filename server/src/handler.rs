@@ -30,6 +30,7 @@
 // old or the fully-requested new one.
 
 use crate::device_identification::{build_objects, handle_read_device_identification};
+use crate::fc43_bulk_transfer::Fc43BulkTransfer;
 use crate::server_options::ServerOptions;
 use datafs::register_encoding::{register_value_from_words, register_value_to_words};
 use datafs::{
@@ -110,6 +111,7 @@ pub fn handle_request(
     server_options: &ServerOptions,
     machines: &HashMap<u8, ServerMachineState>,
     toml_source: &str,
+    fc43_bulk_transfer: &Fc43BulkTransfer,
 ) -> Option<Vec<u8>> {
     let Some(&function_code) = pdu.first() else {
         return Some(
@@ -140,7 +142,12 @@ pub fn handle_request(
     }
 
     if function_code == FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT {
-        return Some(handle_encapsulated_interface_transport(pdu, toml_source));
+        return Some(handle_encapsulated_interface_transport(
+            pdu,
+            toml_source,
+            server_options.detect_machine_layout,
+            fc43_bulk_transfer,
+        ));
     }
 
     let machine = machines.get(&unit_id)?;
@@ -210,7 +217,22 @@ pub fn handle_request(
 // distinguishes "wrong MEI type" from other malformed-request cases, but
 // there's no other MEI type to dispatch to yet, so it collapses to the
 // same response here).
-fn handle_encapsulated_interface_transport(pdu: &[u8], toml_source: &str) -> Vec<u8> {
+//
+// `toml_source` not fitting FC43's own inline-chunk budget no longer means
+// an automatic EXCEPTION_SERVER_DEVICE_FAILURE (Thread A6, see CLAUDE.md's
+// "Planned: grow FC43's device-description transfer capacity"): if
+// `detect_machine_layout` is on, this falls back to serving
+// `fc43_bulk_transfer`'s pre-built manifest TOML instead, through the
+// exact same object mechanism, as if it were just a much smaller device
+// description — the manifest itself failing to fit too would be a real
+// bug (it's sized to scale with machine count, not point count), so that
+// still falls through to the same clean exception as before.
+fn handle_encapsulated_interface_transport(
+    pdu: &[u8],
+    toml_source: &str,
+    detect_machine_layout: bool,
+    fc43_bulk_transfer: &Fc43BulkTransfer,
+) -> Vec<u8> {
     let Ok(request) = ReadDeviceIdentificationRequest::decode(pdu) else {
         return ExceptionResponse {
             function_code: FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
@@ -218,12 +240,25 @@ fn handle_encapsulated_interface_transport(pdu: &[u8], toml_source: &str) -> Vec
         }
         .encode();
     };
-    let Ok(objects) = build_objects(toml_source) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
-            exception_code: EXCEPTION_SERVER_DEVICE_FAILURE,
+    let objects = match build_objects(toml_source) {
+        Ok(objects) => objects,
+        Err(_) if detect_machine_layout => {
+            let Ok(objects) = build_objects(&fc43_bulk_transfer.manifest_toml) else {
+                return ExceptionResponse {
+                    function_code: FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
+                    exception_code: EXCEPTION_SERVER_DEVICE_FAILURE,
+                }
+                .encode();
+            };
+            objects
         }
-        .encode();
+        Err(_) => {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
+                exception_code: EXCEPTION_SERVER_DEVICE_FAILURE,
+            }
+            .encode();
+        }
     };
     handle_read_device_identification(&request, &objects)
 }
@@ -1015,8 +1050,22 @@ mod tests {
                 server_id: server_id.map(str::to_string),
             },
         );
-        handle_request(TEST_UNIT_ID, pdu, server_options, &machines, toml_source)
-            .expect("TEST_UNIT_ID is always configured in this helper")
+        // Built fresh from `toml_source` on every call, unlike the real
+        // server (which builds this once at startup, see
+        // fc43_bulk_transfer's own doc comment on why that matters there) —
+        // fine here since these are unit tests, not a hot path, and no
+        // existing test needs the manifest's own `machines` list to be
+        // non-empty.
+        let fc43_bulk_transfer = Fc43BulkTransfer::build(toml_source, Vec::new());
+        handle_request(
+            TEST_UNIT_ID,
+            pdu,
+            server_options,
+            &machines,
+            toml_source,
+            &fc43_bulk_transfer,
+        )
+        .expect("TEST_UNIT_ID is always configured in this helper")
     }
 
     fn registers() -> Vec<RegisterDescription> {
@@ -2125,10 +2174,19 @@ mod tests {
         // own budget (see device_identification::build_objects) -- one byte
         // over that overflows it.
         let oversized_toml_source = "x".repeat(244 * 127 + 1);
+        // `detect_machine_layout: false` here specifically -- this test
+        // covers the pre-Thread-A6 behavior (no manifest fallback at all).
+        // See `encapsulated_interface_transport_falls_back_to_the_manifest_
+        // when_too_large_and_detect_machine_layout_is_enabled` for the
+        // fallback itself.
+        let server_options = ServerOptions {
+            detect_machine_layout: false,
+            ..ServerOptions::allow_all()
+        };
 
         let response = test_handle_request(
             &request,
-            &ServerOptions::allow_all(),
+            &server_options,
             &registers(),
             &store,
             &coils(),
@@ -2151,6 +2209,62 @@ mod tests {
                 function_code: FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
                 exception_code: EXCEPTION_SERVER_DEVICE_FAILURE,
             }
+        );
+    }
+
+    #[test]
+    fn encapsulated_interface_transport_falls_back_to_the_manifest_when_too_large_and_detect_machine_layout_is_enabled()
+     {
+        use protocol::device_description_manifest::{DeviceDescriptionManifest, ManifestMachine};
+        use protocol::pdu::{
+            READ_DEVICE_ID_EXTENDED, ReadDeviceIdentificationRequest,
+            ReadDeviceIdentificationResponse,
+        };
+
+        let oversized_toml_source = "x".repeat(244 * 127 + 1);
+        let machines: HashMap<u8, ServerMachineState> = HashMap::new();
+        let manifest_machines = vec![ManifestMachine {
+            name: "PumpA".to_string(),
+            unit_id: 1,
+        }];
+        let fc43_bulk_transfer =
+            Fc43BulkTransfer::build(&oversized_toml_source, manifest_machines.clone());
+        let request = ReadDeviceIdentificationRequest {
+            read_device_id_code: READ_DEVICE_ID_EXTENDED,
+            object_id: 0x80,
+        }
+        .encode();
+        let server_options = ServerOptions {
+            detect_machine_layout: true,
+            ..ServerOptions::allow_all()
+        };
+
+        // unit_id is irrelevant here -- FC43 answers regardless (see
+        // fc43_answers_regardless_of_unit_id_even_with_no_machines_configured).
+        let response = handle_request(
+            0xFF,
+            &request,
+            &server_options,
+            &machines,
+            &oversized_toml_source,
+            &fc43_bulk_transfer,
+        )
+        .unwrap();
+
+        // Not an exception: decodes as a real Read Device Identification
+        // response whose content is the small manifest, not the oversized
+        // real description.
+        let decoded = ReadDeviceIdentificationResponse::decode(&response).unwrap();
+        let manifest_bytes: Vec<u8> = decoded.objects[1..]
+            .iter()
+            .flat_map(|object| object.value.clone())
+            .collect();
+        let manifest =
+            DeviceDescriptionManifest::parse(&String::from_utf8(manifest_bytes).unwrap()).unwrap();
+        assert_eq!(manifest.machines, manifest_machines);
+        assert_eq!(
+            manifest.compressed_length as usize,
+            fc43_bulk_transfer.compressed_toml.len()
         );
     }
 
@@ -2198,6 +2312,7 @@ mod tests {
             &ServerOptions::allow_all(),
             &machines,
             "",
+            &Fc43BulkTransfer::build("", Vec::new()),
         );
 
         assert_eq!(response, None);
@@ -2220,6 +2335,7 @@ mod tests {
             &ServerOptions::allow_all(),
             &machines,
             "name = \"X\"",
+            &Fc43BulkTransfer::build("name = \"X\"", Vec::new()),
         );
 
         assert!(response.is_some());

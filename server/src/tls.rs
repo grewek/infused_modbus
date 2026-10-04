@@ -271,6 +271,7 @@ where
 mod tests {
     use super::*;
     use crate::connection::serve_tcp_connection;
+    use crate::fc43_bulk_transfer::Fc43BulkTransfer;
     use datafs::{CoilStore, RegisterStore};
     use protocol::adu::TcpAdu;
     use protocol::device_description::{AccessRight, DataType, MemLayout, RegisterDescription};
@@ -593,6 +594,7 @@ mod tests {
                 crate::server_options::ServerOptions::allow_all(),
                 machines,
                 Arc::new(String::new()),
+                Arc::new(Fc43BulkTransfer::build("", Vec::new())),
                 Duration::from_secs(1),
             )
             .await;
