@@ -1,6 +1,7 @@
 pub mod adu;
 pub mod connection_string;
 pub mod device_description;
+pub mod device_description_manifest;
 pub mod pdu;
 pub mod rtu;
 pub mod tcp;
