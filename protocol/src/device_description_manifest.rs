@@ -1,12 +1,17 @@
 // A small, machine-count-scaling stand-in for the full device-description
 // TOML, served over FC43 once the real description is too large to fit its
 // existing inline-chunk object budget (CLAUDE.md's "Planned: grow FC43's
-// device-description transfer capacity past its current ~31KB ceiling",
-// Thread A5). Standalone here — not yet wired into
-// `device_identification::build_objects` (Thread A6) or any client-side
-// FC43 response handling (Thread A8); this module is just the data type
-// and its TOML (de)serialization, the same "capability first, wire in
-// later" sequencing Thread B used for `sparkplug::property`/`data_set`.
+// device-description transfer capacity past its current ~31KB ceiling").
+// `DeviceDescriptionManifest` itself and its TOML (de)serialization were
+// built standalone (Thread A5), then wired into the server's actual FC43
+// dispatch (Thread A6: `server::handler::handle_encapsulated_interface_
+// transport` falls back to serving this manifest once the real
+// description doesn't fit). `BULK_TRANSFER_CHUNK_BYTES`/
+// `bulk_transfer_chunk_range` below are Thread A7's shared chunking math,
+// used by the server's dedicated FC20 dispatch for the reserved
+// `file_number` — kept here, not server-only, so a client (Thread A8,
+// not yet built) computes the exact same chunk boundaries independently,
+// with no round trip needed to discover them.
 //
 // Deliberately excludes every per-point field (registers, coils, ...) —
 // that's the whole point of a manifest: size scales with machine count,
@@ -14,11 +19,45 @@
 // machine this server describes before fetching anything heavier, and (b)
 // perform the FC20 bulk fetch of the real, compressed TOML: which reserved
 // `file_number` to read from, and the compressed blob's exact length (to
-// compute `ceil(length / 249)` FC20 records up front, since FC20 has no
+// compute how many FC20 records to request up front, since FC20 has no
 // equivalent to FC43's own More-Follows continuation).
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::ops::Range;
+
+/// Each FC20 "record" of the reserved bulk-transfer file carries this many
+/// bytes. Derived from Modbus's own 253-byte PDU cap, same `MAX_PDU_LEN`
+/// every other PDU-size check in this project uses: a `ReadFileRecordResponse`
+/// carrying one record costs 2 header bytes (function code + byte count)
+/// plus 2 bytes of per-record overhead (the record's own length byte +
+/// the fixed reference-type byte), leaving 249 bytes for data — rounded
+/// down to 248, the nearest even number, since a record's byte length is
+/// always `2 * record_length` (whole 16-bit words). Fixed and shared
+/// between server and client — neither computes it independently, so a
+/// client can work out exactly how many FC20 records to request from
+/// `compressed_length` alone.
+pub const BULK_TRANSFER_CHUNK_BYTES: usize = 248;
+
+/// The half-open byte range of the compressed TOML blob that chunk
+/// `record_number` covers, given the blob's total `compressed_length` —
+/// `None` once `record_number` is past the end. Every chunk is exactly
+/// `BULK_TRANSFER_CHUNK_BYTES` long except possibly the last, which is
+/// whatever remains. Shared by the server (building a response — Thread
+/// A7) and, eventually, the client (deciding how many chunks to request
+/// and what `record_length` each one needs — Thread A8) so the two sides
+/// can never disagree about where a chunk starts or ends.
+pub fn bulk_transfer_chunk_range(
+    compressed_length: usize,
+    record_number: u16,
+) -> Option<Range<usize>> {
+    let start = record_number as usize * BULK_TRANSFER_CHUNK_BYTES;
+    if start >= compressed_length {
+        return None;
+    }
+    let end = (start + BULK_TRANSFER_CHUNK_BYTES).min(compressed_length);
+    Some(start..end)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestMachine {
@@ -153,5 +192,58 @@ mod tests {
     fn parse_rejects_a_missing_required_field() {
         let toml_source = "compressed_length = 0\nmachines = []\n";
         assert!(DeviceDescriptionManifest::parse(toml_source).is_err());
+    }
+
+    #[test]
+    fn chunk_range_covers_a_full_chunk_in_the_middle() {
+        let compressed_length = BULK_TRANSFER_CHUNK_BYTES * 3;
+        assert_eq!(
+            bulk_transfer_chunk_range(compressed_length, 1),
+            Some(BULK_TRANSFER_CHUNK_BYTES..BULK_TRANSFER_CHUNK_BYTES * 2)
+        );
+    }
+
+    #[test]
+    fn chunk_range_shrinks_for_a_partial_final_chunk() {
+        let compressed_length = BULK_TRANSFER_CHUNK_BYTES + 10;
+        assert_eq!(
+            bulk_transfer_chunk_range(compressed_length, 1),
+            Some(BULK_TRANSFER_CHUNK_BYTES..BULK_TRANSFER_CHUNK_BYTES + 10)
+        );
+    }
+
+    #[test]
+    fn chunk_range_is_none_past_the_end() {
+        let compressed_length = BULK_TRANSFER_CHUNK_BYTES;
+        assert_eq!(bulk_transfer_chunk_range(compressed_length, 1), None);
+    }
+
+    #[test]
+    fn chunk_range_is_none_for_an_empty_blob() {
+        assert_eq!(bulk_transfer_chunk_range(0, 0), None);
+    }
+
+    #[test]
+    fn chunk_range_covers_the_only_chunk_of_a_small_blob() {
+        assert_eq!(bulk_transfer_chunk_range(10, 0), Some(0..10));
+    }
+
+    #[test]
+    fn chunk_count_matches_a_naive_ceiling_division() {
+        for compressed_length in [0usize, 1, 247, 248, 249, 1000, 65536] {
+            let mut naive_count = 0u16;
+            let mut covered = 0usize;
+            while covered < compressed_length {
+                let range = bulk_transfer_chunk_range(compressed_length, naive_count)
+                    .expect("must cover every byte up to compressed_length");
+                covered = range.end;
+                naive_count += 1;
+            }
+            assert_eq!(
+                bulk_transfer_chunk_range(compressed_length, naive_count),
+                None,
+                "one past the last real chunk must be out of range for length {compressed_length}"
+            );
+        }
     }
 }

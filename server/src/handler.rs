@@ -39,8 +39,10 @@ use datafs::{
 };
 use protocol::device_description::{
     AccessRight, CoilDescription, DiscreteInputDescription, FileRecordDescription,
-    InputRegisterDescription, MemLayout, RegisterDescription,
+    InputRegisterDescription, MemLayout, RESERVED_DEVICE_DESCRIPTION_FILE_NUMBER,
+    RegisterDescription,
 };
+use protocol::device_description_manifest::bulk_transfer_chunk_range;
 use protocol::pdu::{
     EXCEPTION_ILLEGAL_DATA_ADDRESS, EXCEPTION_ILLEGAL_DATA_VALUE, EXCEPTION_ILLEGAL_FUNCTION,
     EXCEPTION_SERVER_DEVICE_FAILURE, ExceptionResponse,
@@ -147,6 +149,34 @@ pub fn handle_request(
             toml_source,
             server_options.detect_machine_layout,
             fc43_bulk_transfer,
+        ));
+    }
+
+    // Same unit_id-independence as FC43 just above, and for the same
+    // reason: the reserved file_number's "file" is the whole multi-machine
+    // compressed description, not any one machine's own data (Thread A7,
+    // see CLAUDE.md's "Planned: grow FC43's device-description transfer
+    // capacity"). Gated on `detect_machine_layout` too, matching FC43's own
+    // manifest fallback — if that's off, a request naming the reserved
+    // number falls through to the normal per-machine path below, which
+    // rejects it with ILLEGAL_DATA_ADDRESS anyway (A3's parse-time
+    // validation guarantees no real `[[file-records]]` entry can ever use
+    // it). Only dispatched here when *every* sub-request targets the
+    // reserved number — a request mixing it with real file records has no
+    // well-defined answer here either, so it falls through to the same
+    // per-machine rejection rather than this module guessing at a merge.
+    if function_code == FUNCTION_CODE_READ_FILE_RECORD
+        && server_options.detect_machine_layout
+        && let Ok(request) = ReadFileRecordRequest::decode(pdu)
+        && !request.sub_requests.is_empty()
+        && request
+            .sub_requests
+            .iter()
+            .all(|sub_request| sub_request.file_number == RESERVED_DEVICE_DESCRIPTION_FILE_NUMBER)
+    {
+        return Some(handle_read_device_description_bulk_transfer(
+            &request,
+            &fc43_bulk_transfer.compressed_toml,
         ));
     }
 
@@ -261,6 +291,65 @@ fn handle_encapsulated_interface_transport(
         }
     };
     handle_read_device_identification(&request, &objects)
+}
+
+// FC20's dedicated path for the reserved bulk-transfer `file_number`
+// (Thread A7) — the caller (`handle_request`) has already confirmed every
+// sub-request targets it, so this never consults `file_record_store` or
+// any machine's static `file_records` at all; `compressed_toml` is the one
+// true source of truth. `record_number` is a chunk index, not a real file
+// record address — `bulk_transfer_chunk_range` (shared with the client,
+// once Thread A8 exists) is what the client used to decide what to ask
+// for in the first place, so the two sides can never disagree about where
+// a chunk starts or ends.
+fn handle_read_device_description_bulk_transfer(
+    request: &ReadFileRecordRequest,
+    compressed_toml: &[u8],
+) -> Vec<u8> {
+    let mut records = Vec::with_capacity(request.sub_requests.len());
+    for sub_request in &request.sub_requests {
+        let Some(range) =
+            bulk_transfer_chunk_range(compressed_toml.len(), sub_request.record_number)
+        else {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+            .encode();
+        };
+        let chunk = &compressed_toml[range];
+        // A chunk's own byte length is only ever shorter than
+        // BULK_TRANSFER_CHUNK_BYTES for the last one, and only odd when
+        // `compressed_toml`'s own length is odd — `div_ceil` covers both:
+        // it's the exact word count needed to carry `chunk`, with one
+        // trailing pad byte implied when it's odd (added below).
+        let expected_record_length = chunk.len().div_ceil(2) as u16;
+        if sub_request.record_length != expected_record_length {
+            return ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+            }
+            .encode();
+        }
+        let mut data = chunk.to_vec();
+        if !data.len().is_multiple_of(2) {
+            data.push(0);
+        }
+        records.push(data);
+    }
+
+    let encoded = ReadFileRecordResponse { records }.encode();
+    // Can't actually happen given BULK_TRANSFER_CHUNK_BYTES is sized to
+    // keep a single chunk's response within budget — checked anyway,
+    // same defensive precedent as handle_read_file_record's own check.
+    if encoded.len() > MAX_PDU_LEN {
+        return ExceptionResponse {
+            function_code: FUNCTION_CODE_READ_FILE_RECORD,
+            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+        }
+        .encode();
+    }
+    encoded
 }
 
 // Resolves every sub-request against the static file-record descriptions
@@ -996,6 +1085,7 @@ fn handle_write_multiple_coils(
 mod tests {
     use super::*;
     use protocol::device_description::DataType;
+    use protocol::device_description_manifest::BULK_TRANSFER_CHUNK_BYTES;
     use protocol::pdu::{FileRecordSubRequest, WriteFileRecordSubRequest};
 
     const TEST_UNIT_ID: u8 = 0x01;
@@ -3191,6 +3281,229 @@ mod tests {
             ExceptionResponse {
                 function_code: FUNCTION_CODE_READ_FILE_RECORD,
                 exception_code: EXCEPTION_ILLEGAL_FUNCTION,
+            }
+        );
+    }
+
+    // Thread A7's dedicated FC20 path for the reserved bulk-transfer
+    // file_number — see fc43_bulk_transfer's own doc comment and
+    // handle_read_device_description_bulk_transfer's. Uses `handle_request`
+    // directly (not `test_handle_request`) throughout, since these need a
+    // real `Fc43BulkTransfer` built from a chosen `toml_source`, not the
+    // throwaway empty one that helper builds internally — and an empty
+    // `machines` map, since this path is deliberately unit_id-independent.
+
+    fn empty_machines() -> HashMap<u8, ServerMachineState> {
+        HashMap::new()
+    }
+
+    fn bulk_transfer_sub_request(record_number: u16, record_length: u16) -> FileRecordSubRequest {
+        FileRecordSubRequest {
+            file_number: RESERVED_DEVICE_DESCRIPTION_FILE_NUMBER,
+            record_number,
+            record_length,
+        }
+    }
+
+    #[test]
+    fn bulk_transfer_serves_a_single_small_chunk() {
+        let toml_source = "name = \"Stop_Process\"\n";
+        let fc43_bulk_transfer = Fc43BulkTransfer::build(toml_source, Vec::new());
+        let expected_record_length = fc43_bulk_transfer.compressed_toml.len().div_ceil(2) as u16;
+        let request = ReadFileRecordRequest {
+            sub_requests: vec![bulk_transfer_sub_request(0, expected_record_length)],
+        }
+        .encode();
+
+        let response = handle_request(
+            0xFF, // irrelevant -- this path is unit_id-independent, like FC43
+            &request,
+            &ServerOptions::allow_all(),
+            &empty_machines(),
+            toml_source,
+            &fc43_bulk_transfer,
+        )
+        .unwrap();
+
+        let decoded = ReadFileRecordResponse::decode(&response).unwrap();
+        assert_eq!(decoded.records.len(), 1);
+        let mut received = decoded.records[0].clone();
+        received.truncate(fc43_bulk_transfer.compressed_toml.len());
+        assert_eq!(received, fc43_bulk_transfer.compressed_toml);
+    }
+
+    // A highly repetitive source (e.g. "x" repeated) compresses down to
+    // almost nothing under DEFLATE, defeating the point of a multi-chunk
+    // test -- this generates low-entropy-but-not-trivially-compressible
+    // printable ASCII (a simple xorshift PRNG, deterministic so the test
+    // itself stays deterministic) so the compressed blob stays close in
+    // size to `length`.
+    fn pseudo_random_ascii(length: usize) -> String {
+        let mut state: u32 = 0x1234_5678;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (b'!' + (state % 94) as u8) as char
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bulk_transfer_reassembles_a_blob_spanning_several_chunks() {
+        // Several times BULK_TRANSFER_CHUNK_BYTES, plus a remainder, so this
+        // exercises several full chunks and one short final one -- sized up
+        // front since pseudo_random_ascii compresses somewhat, unlike a
+        // trivially repetitive source.
+        let toml_source = pseudo_random_ascii(BULK_TRANSFER_CHUNK_BYTES * 6);
+        let fc43_bulk_transfer = Fc43BulkTransfer::build(&toml_source, Vec::new());
+        let compressed_length = fc43_bulk_transfer.compressed_toml.len();
+
+        let mut reassembled = Vec::new();
+        let mut record_number = 0u16;
+        loop {
+            let Some(range) = bulk_transfer_chunk_range(compressed_length, record_number) else {
+                break;
+            };
+            let record_length = (range.end - range.start).div_ceil(2) as u16;
+            let request = ReadFileRecordRequest {
+                sub_requests: vec![bulk_transfer_sub_request(record_number, record_length)],
+            }
+            .encode();
+            let response = handle_request(
+                0xFF,
+                &request,
+                &ServerOptions::allow_all(),
+                &empty_machines(),
+                &toml_source,
+                &fc43_bulk_transfer,
+            )
+            .unwrap();
+            let decoded = ReadFileRecordResponse::decode(&response).unwrap();
+            reassembled.extend_from_slice(&decoded.records[0]);
+            record_number += 1;
+        }
+
+        reassembled.truncate(compressed_length);
+        assert_eq!(reassembled, fc43_bulk_transfer.compressed_toml);
+        assert!(record_number > 1, "expected more than one chunk");
+    }
+
+    #[test]
+    fn bulk_transfer_rejects_a_record_number_past_the_end() {
+        let toml_source = "name = \"Stop_Process\"\n";
+        let fc43_bulk_transfer = Fc43BulkTransfer::build(toml_source, Vec::new());
+        let request = ReadFileRecordRequest {
+            sub_requests: vec![bulk_transfer_sub_request(9999, 1)],
+        }
+        .encode();
+
+        let response = handle_request(
+            0xFF,
+            &request,
+            &ServerOptions::allow_all(),
+            &empty_machines(),
+            toml_source,
+            &fc43_bulk_transfer,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            }
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_rejects_a_mismatched_record_length() {
+        let toml_source = "name = \"Stop_Process\"\n";
+        let fc43_bulk_transfer = Fc43BulkTransfer::build(toml_source, Vec::new());
+        let wrong_record_length = fc43_bulk_transfer.compressed_toml.len().div_ceil(2) as u16 + 1;
+        let request = ReadFileRecordRequest {
+            sub_requests: vec![bulk_transfer_sub_request(0, wrong_record_length)],
+        }
+        .encode();
+
+        let response = handle_request(
+            0xFF,
+            &request,
+            &ServerOptions::allow_all(),
+            &empty_machines(),
+            toml_source,
+            &fc43_bulk_transfer,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
+            }
+        );
+    }
+
+    #[test]
+    fn bulk_transfer_is_not_reachable_when_detect_machine_layout_is_disabled() {
+        let toml_source = "name = \"Stop_Process\"\n";
+        let fc43_bulk_transfer = Fc43BulkTransfer::build(toml_source, Vec::new());
+        let request = ReadFileRecordRequest {
+            sub_requests: vec![bulk_transfer_sub_request(0, 1)],
+        }
+        .encode();
+        let server_options = ServerOptions {
+            detect_machine_layout: false,
+            ..ServerOptions::allow_all()
+        };
+        // A real machine is configured for this unit_id so the request
+        // reaches the normal per-machine FC20 handler instead of just
+        // getting dropped for an unconfigured unit_id -- isolating this
+        // test to the `detect_machine_layout` gate specifically.
+        let machines = {
+            let mut machines = HashMap::new();
+            machines.insert(
+                TEST_UNIT_ID,
+                ServerMachineState {
+                    registers: Arc::new(Vec::new()),
+                    store: Arc::new(Mutex::new(RegisterStore::new())),
+                    coils: Arc::new(Vec::new()),
+                    coil_store: Arc::new(Mutex::new(CoilStore::new())),
+                    discrete_inputs: Arc::new(Vec::new()),
+                    discrete_input_store: Arc::new(Mutex::new(DiscreteInputStore::new())),
+                    input_registers: Arc::new(Vec::new()),
+                    input_register_store: Arc::new(Mutex::new(InputRegisterStore::new())),
+                    file_records: Arc::new(Vec::new()),
+                    file_record_store: Arc::new(Mutex::new(FileRecordStore::new())),
+                    mem_layout: MemLayout::Abcd,
+                    input_register_mem_layout: MemLayout::Abcd,
+                    server_id: None,
+                },
+            );
+            machines
+        };
+
+        let response = handle_request(
+            TEST_UNIT_ID,
+            &request,
+            &server_options,
+            &machines,
+            toml_source,
+            &fc43_bulk_transfer,
+        )
+        .unwrap();
+
+        // Falls through to the normal per-machine path, which has no
+        // file_records at all configured -- same ILLEGAL_DATA_ADDRESS as
+        // any other unknown (file_number, record_number).
+        assert_eq!(
+            ExceptionResponse::decode(&response).unwrap(),
+            ExceptionResponse {
+                function_code: FUNCTION_CODE_READ_FILE_RECORD,
+                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
             }
         );
     }
