@@ -419,6 +419,7 @@ dependencies = [
  "config",
  "datafs",
  "fuser",
+ "miniz_oxide",
  "protocol",
  "rumqttc",
  "rumqttd",

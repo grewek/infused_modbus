@@ -8,6 +8,7 @@ pub mod bd_seq_persistence;
 #[cfg(test)]
 pub(crate) mod broker;
 pub mod connection;
+pub mod device_description_bulk_transfer;
 pub mod device_identification;
 pub mod edge_node;
 pub mod polling;

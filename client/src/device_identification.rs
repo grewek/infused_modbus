@@ -11,6 +11,8 @@
 // "hung".
 
 use crate::connection::Connection;
+use crate::device_description_bulk_transfer::fetch_compressed_device_description;
+use protocol::device_description_manifest::DeviceDescriptionManifest;
 use protocol::pdu::{
     ExceptionResponse, READ_DEVICE_ID_EXTENDED, ReadDeviceIdentificationRequest,
     ReadDeviceIdentificationResponse,
@@ -95,21 +97,32 @@ pub async fn fetch_device_description(
     }
 
     let toml_bytes: Vec<u8> = chunks.into_iter().flatten().collect();
-    match String::from_utf8(toml_bytes) {
-        Ok(toml_source) => {
-            println!(
-                "Received the full device description from the server ({} bytes).",
-                toml_source.len()
-            );
-            Some(toml_source)
-        }
+    let toml_source = match String::from_utf8(toml_bytes) {
+        Ok(toml_source) => toml_source,
         Err(_) => {
             println!(
                 "Server's device description was not valid UTF-8 — using the local description instead."
             );
-            None
+            return None;
         }
+    };
+
+    // Thread A7/A8: a real device description's TOML never has top-level
+    // `file_number`/`compressed_length` keys (only `[[machines]]`), so a
+    // successful parse here unambiguously means the server fell back to
+    // the manifest (Thread A6, once the real description didn't fit
+    // FC43's own inline-chunk budget) — fetch and decompress the real
+    // thing over FC20 instead of treating this manifest text as the
+    // description itself.
+    if let Ok(manifest) = DeviceDescriptionManifest::parse(&toml_source) {
+        return fetch_compressed_device_description(connection, unit_id, &manifest, timeout).await;
     }
+
+    println!(
+        "Received the full device description from the server ({} bytes).",
+        toml_source.len()
+    );
+    Some(toml_source)
 }
 
 #[cfg(test)]
@@ -287,5 +300,79 @@ mod tests {
 
         let result = fetch_device_description(&mut connection, 1, Duration::from_millis(50)).await;
         assert_eq!(result, None);
+    }
+
+    // End-to-end across both halves of Threads A6-A8: an FC43 response
+    // whose chunks reassemble into a `DeviceDescriptionManifest` (not a
+    // real device description) is recognized as such, and the real TOML is
+    // then fetched over FC20 and decompressed — not returned as-is.
+    #[tokio::test]
+    async fn fc43_manifest_response_is_fetched_and_decompressed_via_fc20() {
+        use miniz_oxide::deflate::compress_to_vec;
+        use protocol::device_description_manifest::ManifestMachine;
+        use protocol::pdu::{ReadFileRecordRequest, ReadFileRecordResponse};
+
+        let (mut connection, mut device) = connected_pair().await;
+        let real_toml_source = "name = \"Stop_Process\"\n";
+        let compressed = compress_to_vec(real_toml_source.as_bytes(), 10);
+        let manifest = DeviceDescriptionManifest {
+            file_number: 0xFFFF,
+            compressed_length: compressed.len() as u32,
+            machines: vec![ManifestMachine {
+                name: "PumpA".to_string(),
+                unit_id: 1,
+            }],
+        };
+        let manifest_toml = manifest.to_toml_string();
+        assert!(
+            manifest_toml.len() <= 244,
+            "test assumes the manifest itself fits in a single FC43 chunk"
+        );
+
+        let device_task = tokio::spawn(async move {
+            // First round trip: FC43 serves the manifest, exactly like a
+            // real device description that fits in one response.
+            let (transaction_id, _request) = read_request(&mut device).await;
+            let response = ReadDeviceIdentificationResponse {
+                read_device_id_code: READ_DEVICE_ID_EXTENDED,
+                conformity_level: 0x03,
+                more_follows: false,
+                next_object_id: 0,
+                objects: vec![
+                    DeviceIdentificationObject {
+                        id: 0x80,
+                        value: vec![0x01],
+                    },
+                    DeviceIdentificationObject {
+                        id: 0x81,
+                        value: manifest_toml.into_bytes(),
+                    },
+                ],
+            };
+            write_response(&mut device, transaction_id, response.encode()).await;
+
+            // Second round trip: FC20 serves the real, compressed TOML.
+            let mut header = vec![0u8; 7];
+            device.read_exact(&mut header).await.unwrap();
+            let mut function_and_count = vec![0u8; 2];
+            device.read_exact(&mut function_and_count).await.unwrap();
+            let byte_count = function_and_count[1];
+            let mut rest = vec![0u8; byte_count as usize];
+            device.read_exact(&mut rest).await.unwrap();
+            let transaction_id = u16::from_be_bytes([header[0], header[1]]);
+            let mut pdu = function_and_count;
+            pdu.extend_from_slice(&rest);
+            let request = ReadFileRecordRequest::decode(&pdu).unwrap();
+            assert_eq!(request.sub_requests[0].file_number, 0xFFFF);
+
+            let response = ReadFileRecordResponse {
+                records: vec![compressed],
+            };
+            write_response(&mut device, transaction_id, response.encode()).await;
+        });
+
+        let result = fetch_device_description(&mut connection, 1, Duration::from_secs(1)).await;
+        assert_eq!(result, Some(real_toml_source.to_string()));
+        device_task.await.unwrap();
     }
 }
