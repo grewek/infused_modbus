@@ -6,14 +6,24 @@
 //! changes to the Modbus-facing half" bet that held for `datafs::flatfile`
 //! (see CLAUDE.md).
 
+use crate::connection::Connection;
 use crate::edge_node::EdgeNodeConnection;
+use crate::polling::spawn_machine_polling_task;
+use crate::reconnect::ReconnectSignal;
 use crate::sparkplug_alias::AliasAllocator;
-use crate::sparkplug_translator::{build_machine_metrics, metric_value_to_staged_value};
+use crate::sparkplug_change_tracker::ChangeTracker;
+use crate::sparkplug_translator::{
+    build_machine_metrics, build_machine_metrics_null_placeholders, metric_value_to_staged_value,
+};
+use crate::subscription_state::{MachineTasks, SubscriptionState};
 use datafs::{MachineStores, StagedValue};
 use protocol::device_description::MachineDescription;
 use sparkplug::metric_value::MetricValue;
 use sparkplug::payload::{Payload, decode_payload};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// The well-known Sparkplug B metric name a host application sends (as an
 /// `NCMD`, `Boolean(true)`) to request that an Edge Node republish its full
@@ -30,6 +40,53 @@ pub fn is_rebirth_request(payload: &Payload) -> bool {
     payload.metrics.iter().any(|metric| {
         metric.name == REBIRTH_METRIC_NAME && metric.value == MetricValue::Boolean(true)
     })
+}
+
+/// The well-known Sparkplug B metric names a host application sends (as an
+/// `NCMD`) to request that an Edge Node start/stop producing real data for
+/// one machine — see CLAUDE.md's "Planned: dynamic per-machine subscription
+/// via Sparkplug B", "Subscribe/Unsubscribe metric convention" (C4.1). Same
+/// fixed-name, never-aliased convention as `REBIRTH_METRIC_NAME` above —
+/// node-level control metrics, outside `AliasAllocator`'s translated Modbus
+/// alias space.
+const SUBSCRIBE_METRIC_NAME: &str = "Node Control/Subscribe";
+const UNSUBSCRIBE_METRIC_NAME: &str = "Node Control/Unsubscribe";
+
+/// Every machine name requested via a `"Node Control/Subscribe"` metric in
+/// `payload` — a payload may carry more than one (a Host Application
+/// subscribing several machines in one `NCMD`), so this returns every match
+/// rather than just the first. v1 is whole-machine-only (see CLAUDE.md): the
+/// metric's value is a bare `String` naming the machine, not yet the
+/// `{machine, points}` shape a future per-point granularity would need. A
+/// matching metric whose value isn't a `String` is logged and skipped, not
+/// treated as a reason to reject the rest of the payload — same "one bad
+/// entry doesn't reject the rest" precedent `decode_dcmd_metrics` already
+/// established for `DCMD`.
+pub fn subscribe_requests(payload: &Payload) -> Vec<String> {
+    requested_machine_names(payload, SUBSCRIBE_METRIC_NAME)
+}
+
+/// The `"Node Control/Unsubscribe"` counterpart to `subscribe_requests` —
+/// same shape, same per-entry error handling.
+pub fn unsubscribe_requests(payload: &Payload) -> Vec<String> {
+    requested_machine_names(payload, UNSUBSCRIBE_METRIC_NAME)
+}
+
+fn requested_machine_names(payload: &Payload, metric_name: &str) -> Vec<String> {
+    payload
+        .metrics
+        .iter()
+        .filter(|metric| metric.name == metric_name)
+        .filter_map(|metric| match &metric.value {
+            MetricValue::String(machine_name) => Some(machine_name.clone()),
+            other => {
+                eprintln!(
+                    "{metric_name}: expected a String value naming the machine, got {other:?}"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// Decodes one already-parsed `DCMD` `Payload` addressed to `machine` into a
@@ -135,20 +192,137 @@ pub async fn run_dcmd_forwarder(
     }
 }
 
-/// Drives `edge_node.ncmd_receiver` forever — as of M8 there's only one
-/// node-level command worth reacting to (`Node Control/Rebirth`), so an
-/// `NCMD` that isn't one is simply ignored, not logged as an error (a host
-/// application is free to send other node-level commands this project
-/// doesn't yet act on). On a `Rebirth` request, republishes `NBIRTH`
-/// (`EdgeNodeConnection::publish_nbirth` — same `bdSeq`, `seq` reset to 0)
-/// followed by a fresh `DBIRTH` for every machine in `machines`, built from
-/// `stores_by_machine`'s current live values exactly like the original
-/// birth at connect time. Returns once `ncmd_receiver` closes.
-pub async fn run_rebirth_handler(
-    edge_node: &EdgeNodeConnection,
+/// Spawns the periodic DDATA-publishing task for `machine` — reads `stores`
+/// on every `poll_interval` tick, diffs the resulting metrics against
+/// `tracker`, and publishes only what changed. Factored out of `client::
+/// main`'s own (previously unconditional, now subscription-gated) DDATA
+/// loop so `handle_subscribe` below can spawn the identical task once a
+/// machine is actually subscribed. `tracker` should already be seeded with
+/// the machine's current baseline (e.g. the same placeholder metrics its
+/// `DBIRTH` carried — see `build_machine_metrics_null_placeholders`) so the
+/// first real tick only reports genuine changes, not a full redundant dump.
+/// Takes an explicit `runtime_handle` for the same reason `client::polling::
+/// spawn_machine_polling_task` does — see that function's own doc comment.
+pub fn spawn_machine_ddata_ticker(
+    edge_node: Arc<EdgeNodeConnection>,
+    machine: MachineDescription,
+    stores: MachineStores,
+    aliases: Arc<AliasAllocator>,
+    poll_interval: Duration,
+    mut tracker: ChangeTracker,
+    runtime_handle: &tokio::runtime::Handle,
+) -> tokio::task::JoinHandle<()> {
+    runtime_handle.spawn(async move {
+        let mut ticker = tokio::time::interval(poll_interval);
+        loop {
+            ticker.tick().await;
+            let metrics = build_machine_metrics(&machine, &stores, &aliases);
+            let changed = tracker.changed_metrics(&metrics);
+            if changed.is_empty() {
+                continue;
+            }
+            if let Err(error) = edge_node.publish_ddata(&machine.name, changed).await {
+                eprintln!("failed to publish DDATA for {}: {error}", machine.name);
+            }
+        }
+    })
+}
+
+/// Activates `machine_name` for the dynamic per-machine subscription model
+/// (see CLAUDE.md's "Planned: dynamic per-machine subscription via
+/// Sparkplug B"): if it matches a configured machine and isn't already
+/// active, spawns its Modbus polling task and DDATA ticker and registers
+/// both in `subscription_state`. A no-op if the machine is already active
+/// (idempotent — see `SubscriptionState::activate`) or if `machine_name`
+/// matches no configured machine (logged, not fatal — same "log and drop"
+/// precedent as everywhere else in this project).
+#[allow(clippy::too_many_arguments)]
+async fn handle_subscribe(
+    machine_name: &str,
     machines: &[MachineDescription],
     stores_by_machine: &HashMap<String, MachineStores>,
-    aliases: &AliasAllocator,
+    aliases: &Arc<AliasAllocator>,
+    connection: &Arc<AsyncMutex<Connection>>,
+    poll_interval: Duration,
+    poll_timeout: Duration,
+    reconnect_signal: &Arc<ReconnectSignal>,
+    subscription_state: &SubscriptionState,
+    edge_node: &Arc<EdgeNodeConnection>,
+    runtime_handle: &tokio::runtime::Handle,
+) {
+    if subscription_state.is_active(machine_name).await {
+        return;
+    }
+    let Some(machine) = machines.iter().find(|machine| machine.name == machine_name) else {
+        eprintln!("Subscribe for unknown machine {machine_name:?}, ignoring it");
+        return;
+    };
+    let Some(stores) = stores_by_machine.get(machine_name) else {
+        eprintln!("no stores registered for machine {machine_name}, cannot subscribe");
+        return;
+    };
+
+    let polling = spawn_machine_polling_task(
+        machine,
+        stores,
+        Arc::clone(connection),
+        poll_interval,
+        poll_timeout,
+        Arc::clone(reconnect_signal),
+        runtime_handle,
+    );
+
+    let mut tracker = ChangeTracker::new();
+    tracker.changed_metrics(&build_machine_metrics_null_placeholders(machine, aliases));
+
+    let ddata_ticker = spawn_machine_ddata_ticker(
+        Arc::clone(edge_node),
+        machine.clone(),
+        stores.clone(),
+        Arc::clone(aliases),
+        poll_interval,
+        tracker,
+        runtime_handle,
+    );
+
+    subscription_state
+        .activate(
+            machine_name.to_string(),
+            MachineTasks {
+                polling,
+                ddata_ticker,
+            },
+        )
+        .await;
+
+    println!("Subscribed to machine {machine_name:?} — Modbus polling started.");
+}
+
+/// Drives `edge_node.ncmd_receiver` forever, handling every node-level
+/// control metric this project understands. Named `run_ncmd_handler`, not
+/// `run_rebirth_handler` — it outgrew handling only `Node Control/Rebirth`
+/// once Subscribe needed the same single consumer loop (only one task may
+/// ever drain `ncmd_receiver`, so every `NCMD` concern has to live in one
+/// loop, not a separate task per concern). On a `Rebirth` request,
+/// republishes `NBIRTH` (`EdgeNodeConnection::publish_nbirth` — same
+/// `bdSeq`, `seq` reset to 0) followed by a fresh `DBIRTH` for every machine
+/// in `machines`, built from `stores_by_machine`'s current live values
+/// exactly like the original birth at connect time. On a Subscribe request
+/// (see CLAUDE.md's "Subscribe/Unsubscribe metric convention"), activates
+/// the named machine via `handle_subscribe`. Unsubscribe handling is not
+/// yet wired here (Thread C6). Returns once `ncmd_receiver` closes.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_ncmd_handler(
+    edge_node: Arc<EdgeNodeConnection>,
+    machines: &[MachineDescription],
+    stores_by_machine: &HashMap<String, MachineStores>,
+    aliases: Arc<AliasAllocator>,
+    connection: Arc<AsyncMutex<Connection>>,
+    poll_interval: Duration,
+    poll_timeout: Duration,
+    reconnect_signal: Arc<ReconnectSignal>,
+    subscription_state: Arc<SubscriptionState>,
+    runtime_handle: tokio::runtime::Handle,
 ) {
     loop {
         let received = edge_node.ncmd_receiver.lock().await.recv().await;
@@ -164,30 +338,46 @@ pub async fn run_rebirth_handler(
             }
         };
 
-        if !is_rebirth_request(&payload) {
-            continue;
-        }
-
-        if let Err(error) = edge_node.publish_nbirth().await {
-            eprintln!("failed to republish NBIRTH for a rebirth request: {error}");
-            continue;
-        }
-
-        for machine in machines {
-            let Some(stores) = stores_by_machine.get(&machine.name) else {
-                eprintln!(
-                    "no stores registered for machine {} during rebirth",
-                    machine.name
-                );
+        if is_rebirth_request(&payload) {
+            if let Err(error) = edge_node.publish_nbirth().await {
+                eprintln!("failed to republish NBIRTH for a rebirth request: {error}");
                 continue;
-            };
-            let metrics = build_machine_metrics(machine, stores, aliases);
-            if let Err(error) = edge_node.publish_dbirth(&machine.name, metrics).await {
-                eprintln!(
-                    "failed to republish DBIRTH for machine {} during rebirth: {error}",
-                    machine.name
-                );
             }
+
+            for machine in machines {
+                let Some(stores) = stores_by_machine.get(&machine.name) else {
+                    eprintln!(
+                        "no stores registered for machine {} during rebirth",
+                        machine.name
+                    );
+                    continue;
+                };
+                let metrics = build_machine_metrics(machine, stores, &aliases);
+                if let Err(error) = edge_node.publish_dbirth(&machine.name, metrics).await {
+                    eprintln!(
+                        "failed to republish DBIRTH for machine {} during rebirth: {error}",
+                        machine.name
+                    );
+                }
+            }
+            continue;
+        }
+
+        for machine_name in subscribe_requests(&payload) {
+            handle_subscribe(
+                &machine_name,
+                machines,
+                stores_by_machine,
+                &aliases,
+                &connection,
+                poll_interval,
+                poll_timeout,
+                &reconnect_signal,
+                &subscription_state,
+                &edge_node,
+                &runtime_handle,
+            )
+            .await;
         }
     }
 }
@@ -511,7 +701,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn run_rebirth_handler_republishes_nbirth_and_dbirth_end_to_end() {
+    async fn run_ncmd_handler_republishes_nbirth_and_dbirth_on_rebirth() {
         use crate::broker::{BrokerConfig, start_embedded_broker};
         use crate::edge_node::connect_edge_node;
         use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
@@ -527,9 +717,22 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
 
             let machine = test_machine("PumpA");
-            let aliases = AliasAllocator::build(std::slice::from_ref(&machine));
+            let aliases = Arc::new(AliasAllocator::build(std::slice::from_ref(&machine)));
             let mut stores_by_machine = HashMap::new();
             stores_by_machine.insert("PumpA".to_string(), datafs::MachineStores::new());
+
+            // The rebirth path never touches `connection` at all — a real
+            // TCP connection to a loopback listener that never has to
+            // accept/respond to anything is enough to satisfy
+            // `run_ncmd_handler`'s signature (it needs a real connection
+            // object, but one is never used for this test's scenario).
+            let dummy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dummy_address = dummy_listener.local_addr().unwrap().to_string();
+            let connection = Arc::new(AsyncMutex::new(
+                Connection::connect_tcp(&dummy_address).await.unwrap(),
+            ));
+            let reconnect_signal = Arc::new(ReconnectSignal::new());
+            let subscription_state = Arc::new(SubscriptionState::new());
 
             // Subscribe *before* connecting the Edge Node, so the initial
             // NBIRTH connect_edge_node publishes is actually captured
@@ -548,8 +751,9 @@ mod tests {
                 }
             }
 
-            let edge_node =
-                connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0, None).await;
+            let edge_node = Arc::new(
+                connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0, None).await,
+            );
             edge_node.subscribe_ncmd().await.unwrap();
 
             // Drain the initial NBIRTH from connect_edge_node itself.
@@ -561,8 +765,21 @@ mod tests {
             }
 
             let machines = vec![machine];
+            let runtime_handle = tokio::runtime::Handle::current();
             tokio::spawn(async move {
-                run_rebirth_handler(&edge_node, &machines, &stores_by_machine, &aliases).await;
+                run_ncmd_handler(
+                    edge_node,
+                    &machines,
+                    &stores_by_machine,
+                    aliases,
+                    connection,
+                    Duration::from_millis(100),
+                    Duration::from_secs(5),
+                    reconnect_signal,
+                    subscription_state,
+                    runtime_handle,
+                )
+                .await;
             });
 
             let mut host_options = MqttOptions::new("host-application-4", "127.0.0.1", port);
@@ -634,5 +851,114 @@ mod tests {
         })
         .await
         .expect("test timed out");
+    }
+
+    fn control_metric(name: &str, value: MetricValue) -> Metric {
+        Metric {
+            name: name.to_string(),
+            alias: None,
+            timestamp: None,
+            data_type: DataType::String,
+            is_null: false,
+            properties: None,
+            value,
+        }
+    }
+
+    #[test]
+    fn subscribe_requests_extracts_the_named_machine() {
+        let payload = Payload {
+            timestamp: Some(0),
+            seq: None,
+            metrics: vec![control_metric(
+                "Node Control/Subscribe",
+                MetricValue::String("PumpA".to_string()),
+            )],
+        };
+        assert_eq!(subscribe_requests(&payload), vec!["PumpA".to_string()]);
+        assert!(unsubscribe_requests(&payload).is_empty());
+    }
+
+    #[test]
+    fn subscribe_requests_extracts_every_match_in_one_payload() {
+        let payload = Payload {
+            timestamp: Some(0),
+            seq: None,
+            metrics: vec![
+                control_metric(
+                    "Node Control/Subscribe",
+                    MetricValue::String("PumpA".to_string()),
+                ),
+                control_metric(
+                    "Node Control/Subscribe",
+                    MetricValue::String("PumpB".to_string()),
+                ),
+            ],
+        };
+        assert_eq!(
+            subscribe_requests(&payload),
+            vec!["PumpA".to_string(), "PumpB".to_string()]
+        );
+    }
+
+    #[test]
+    fn unsubscribe_requests_extracts_the_named_machine() {
+        let payload = Payload {
+            timestamp: Some(0),
+            seq: None,
+            metrics: vec![control_metric(
+                "Node Control/Unsubscribe",
+                MetricValue::String("PumpA".to_string()),
+            )],
+        };
+        assert_eq!(unsubscribe_requests(&payload), vec!["PumpA".to_string()]);
+        assert!(subscribe_requests(&payload).is_empty());
+    }
+
+    #[test]
+    fn subscribe_and_unsubscribe_requests_in_the_same_payload_are_kept_separate() {
+        let payload = Payload {
+            timestamp: Some(0),
+            seq: None,
+            metrics: vec![
+                control_metric(
+                    "Node Control/Subscribe",
+                    MetricValue::String("PumpA".to_string()),
+                ),
+                control_metric(
+                    "Node Control/Unsubscribe",
+                    MetricValue::String("PumpB".to_string()),
+                ),
+            ],
+        };
+        assert_eq!(subscribe_requests(&payload), vec!["PumpA".to_string()]);
+        assert_eq!(unsubscribe_requests(&payload), vec!["PumpB".to_string()]);
+    }
+
+    #[test]
+    fn subscribe_requests_skips_a_non_string_value() {
+        let payload = Payload {
+            timestamp: Some(0),
+            seq: None,
+            metrics: vec![control_metric(
+                "Node Control/Subscribe",
+                MetricValue::Boolean(true),
+            )],
+        };
+        assert!(subscribe_requests(&payload).is_empty());
+    }
+
+    #[test]
+    fn subscribe_requests_ignores_unrelated_metrics() {
+        let payload = Payload {
+            timestamp: Some(0),
+            seq: None,
+            metrics: vec![control_metric(
+                "Node Control/Rebirth",
+                MetricValue::Boolean(true),
+            )],
+        };
+        assert!(subscribe_requests(&payload).is_empty());
+        assert!(unsubscribe_requests(&payload).is_empty());
     }
 }

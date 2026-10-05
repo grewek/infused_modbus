@@ -30,7 +30,7 @@ use datafs::{
 };
 use protocol::device_description::{
     CoilDescription, DiscreteInputDescription, FileRecordDescription, InputRegisterDescription,
-    MemLayout, RegisterDescription,
+    MachineDescription, MemLayout, RegisterDescription,
 };
 use protocol::pdu::{
     FileRecordSubRequest, ReadCoilsRequest, ReadCoilsResponse, ReadDiscreteInputsRequest,
@@ -512,6 +512,63 @@ pub async fn run_polling_loop(
         )
         .await;
     }
+}
+
+/// Spawns `machine`'s polling task (`run_polling_loop`) against the shared
+/// `connection`, writing into `stores`, via `runtime_handle` — an explicit
+/// handle rather than the bare `tokio::spawn` every other task-spawning
+/// function in this file could get away with, since this one's first caller
+/// (`client::main`'s own startup spawn loop) runs from plain synchronous
+/// code with no ambient Tokio task context, same reason `client::reconnect::
+/// run_reconnect_loop` already takes an explicit `Handle` too. Factored out
+/// here once the `mqtt` layer's dynamic per-machine subscription handler
+/// (`client::sparkplug_command::run_ncmd_handler`) needed the exact same
+/// spawn shape on a Subscribe request, reusing it instead of duplicating
+/// the setup.
+pub fn spawn_machine_polling_task(
+    machine: &MachineDescription,
+    stores: &datafs::MachineStores,
+    connection: Arc<AsyncMutex<Connection>>,
+    poll_interval: Duration,
+    timeout: Duration,
+    reconnect_signal: Arc<ReconnectSignal>,
+    runtime_handle: &tokio::runtime::Handle,
+) -> tokio::task::JoinHandle<()> {
+    let registers = machine.registers.clone();
+    let store = Arc::clone(&stores.registers);
+    let coils = machine.coils.clone();
+    let coil_store = Arc::clone(&stores.coils);
+    let discrete_inputs = machine.discrete_inputs.clone();
+    let discrete_input_store = Arc::clone(&stores.discrete_inputs);
+    let input_registers = machine.input_registers.clone();
+    let input_register_store = Arc::clone(&stores.input_registers);
+    let file_records = machine.file_records.clone();
+    let file_record_store = Arc::clone(&stores.file_records);
+    let mem_layout = machine.mem_layout;
+    let input_register_mem_layout = machine.input_register_mem_layout;
+    let unit_id = machine.unit_id;
+    runtime_handle.spawn(async move {
+        run_polling_loop(
+            connection,
+            &registers,
+            store,
+            &coils,
+            coil_store,
+            &discrete_inputs,
+            discrete_input_store,
+            &input_registers,
+            input_register_store,
+            &file_records,
+            file_record_store,
+            mem_layout,
+            input_register_mem_layout,
+            unit_id,
+            poll_interval,
+            timeout,
+            reconnect_signal,
+        )
+        .await;
+    })
 }
 
 #[cfg(test)]

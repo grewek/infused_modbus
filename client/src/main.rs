@@ -74,14 +74,12 @@
 use client::connection::Connection;
 use client::device_identification::fetch_device_description;
 use client::edge_node::connect_edge_node;
-use client::polling::run_polling_loop;
+use client::polling::spawn_machine_polling_task;
 use client::reconnect::{ReconnectSignal, run_reconnect_loop};
 use client::sparkplug_alias::AliasAllocator;
-use client::sparkplug_change_tracker::ChangeTracker;
-use client::sparkplug_command::{run_dcmd_forwarder, run_rebirth_handler};
-use client::sparkplug_translator::{
-    build_machine_metrics, build_machine_metrics_null_placeholders,
-};
+use client::sparkplug_command::{run_dcmd_forwarder, run_ncmd_handler};
+use client::sparkplug_translator::build_machine_metrics_null_placeholders;
+use client::subscription_state::SubscriptionState;
 use client::transaction_consumer::{MachineTransactionConfig, run_transaction_consumer};
 use datafs::filesystem::{InfusedFilesystem, WriteMode};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
@@ -511,43 +509,15 @@ fn main() {
     if representation_layer != RepresentationLayer::Mqtt {
         for machine in &description.machines {
             let stores = &machine_stores[&machine.name];
-            let polling_connection = Arc::clone(&connection);
-            let polling_registers = machine.registers.clone();
-            let polling_store = Arc::clone(&stores.registers);
-            let polling_coils = machine.coils.clone();
-            let polling_coil_store = Arc::clone(&stores.coils);
-            let polling_discrete_inputs = machine.discrete_inputs.clone();
-            let polling_discrete_input_store = Arc::clone(&stores.discrete_inputs);
-            let polling_input_registers = machine.input_registers.clone();
-            let polling_input_register_store = Arc::clone(&stores.input_registers);
-            let polling_file_records = machine.file_records.clone();
-            let polling_file_record_store = Arc::clone(&stores.file_records);
-            let mem_layout = machine.mem_layout;
-            let input_register_mem_layout = machine.input_register_mem_layout;
-            let machine_unit_id = machine.unit_id;
-            let polling_reconnect_signal = Arc::clone(&reconnect_signal);
-            runtime.spawn(async move {
-                run_polling_loop(
-                    polling_connection,
-                    &polling_registers,
-                    polling_store,
-                    &polling_coils,
-                    polling_coil_store,
-                    &polling_discrete_inputs,
-                    polling_discrete_input_store,
-                    &polling_input_registers,
-                    polling_input_register_store,
-                    &polling_file_records,
-                    polling_file_record_store,
-                    mem_layout,
-                    input_register_mem_layout,
-                    machine_unit_id,
-                    poll_interval,
-                    POLL_TIMEOUT,
-                    polling_reconnect_signal,
-                )
-                .await;
-            });
+            spawn_machine_polling_task(
+                machine,
+                stores,
+                Arc::clone(&connection),
+                poll_interval,
+                POLL_TIMEOUT,
+                Arc::clone(&reconnect_signal),
+                runtime.handle(),
+            );
         }
     }
 
@@ -738,11 +708,10 @@ fn main() {
             // up front, so every machine is birthed immediately regardless
             // of whether anything ever subscribes to it (see CLAUDE.md's
             // "Planned: dynamic per-machine subscription via Sparkplug B").
-            // Each machine's ChangeTracker is seeded with this same
-            // placeholder metric list right away, so once polling for a
-            // machine does start (C5), the first DDATA only reports what
-            // actually changed from these typed-zero/false defaults.
-            let mut change_trackers: HashMap<String, ChangeTracker> = HashMap::new();
+            // Each machine's own ChangeTracker is created fresh, seeded with
+            // this same placeholder baseline, once it's actually subscribed
+            // (see run_ncmd_handler's handle_subscribe) — not here, since
+            // nothing has a DDATA ticker running until then.
             for machine in &description.machines {
                 runtime
                     .block_on(edge_node.subscribe_dcmd(&machine.name))
@@ -751,9 +720,6 @@ fn main() {
                     });
 
                 let metrics = build_machine_metrics_null_placeholders(machine, &aliases);
-                let mut tracker = ChangeTracker::new();
-                tracker.changed_metrics(&metrics);
-                change_trackers.insert(machine.name.clone(), tracker);
 
                 runtime
                     .block_on(edge_node.publish_dbirth(&machine.name, metrics))
@@ -775,41 +741,36 @@ fn main() {
                 });
             }
 
-            // Node Control/Rebirth handling.
+            // Node Control/Rebirth + Subscribe handling — the sole consumer
+            // of `ncmd_receiver` (only one task may ever drain it). Subscribe
+            // is what actually starts a machine's real Modbus polling task
+            // and DDATA ticker now (see CLAUDE.md's "Planned: dynamic
+            // per-machine subscription via Sparkplug B") — neither runs
+            // unconditionally at startup anymore under mqtt.
+            let subscription_state = Arc::new(SubscriptionState::new());
             {
                 let edge_node = Arc::clone(&edge_node);
                 let machines = description.machines.clone();
                 let stores_by_machine = machine_stores.clone();
                 let aliases = Arc::clone(&aliases);
+                let connection = Arc::clone(&connection);
+                let reconnect_signal = Arc::clone(&reconnect_signal);
+                let subscription_state = Arc::clone(&subscription_state);
+                let runtime_handle = runtime.handle().clone();
                 runtime.spawn(async move {
-                    run_rebirth_handler(&edge_node, &machines, &stores_by_machine, &aliases).await;
-                });
-            }
-
-            // Periodic DDATA publishing per machine, tied to the same
-            // poll_interval the Modbus polling loop above already uses —
-            // there is no point checking for changes to publish faster than
-            // the stores themselves can actually change.
-            for machine in description.machines.clone() {
-                let edge_node = Arc::clone(&edge_node);
-                let stores = machine_stores[&machine.name].clone();
-                let aliases = Arc::clone(&aliases);
-                let mut tracker = change_trackers
-                    .remove(&machine.name)
-                    .expect("seeded above for every configured machine");
-                runtime.spawn(async move {
-                    let mut ticker = tokio::time::interval(poll_interval);
-                    loop {
-                        ticker.tick().await;
-                        let metrics = build_machine_metrics(&machine, &stores, &aliases);
-                        let changed = tracker.changed_metrics(&metrics);
-                        if changed.is_empty() {
-                            continue;
-                        }
-                        if let Err(error) = edge_node.publish_ddata(&machine.name, changed).await {
-                            eprintln!("failed to publish DDATA for {}: {error}", machine.name);
-                        }
-                    }
+                    run_ncmd_handler(
+                        edge_node,
+                        &machines,
+                        &stores_by_machine,
+                        aliases,
+                        connection,
+                        poll_interval,
+                        POLL_TIMEOUT,
+                        reconnect_signal,
+                        subscription_state,
+                        runtime_handle,
+                    )
+                    .await;
                 });
             }
 
