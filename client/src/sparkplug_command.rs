@@ -298,19 +298,53 @@ async fn handle_subscribe(
     println!("Subscribed to machine {machine_name:?} — Modbus polling started.");
 }
 
+/// Deactivates `machine_name` — the Unsubscribe counterpart to
+/// `handle_subscribe`. Aborts the machine's polling task and DDATA ticker
+/// (via `SubscriptionState::deactivate`, idempotent) and publishes `DDEATH`
+/// for it. A no-op if the machine isn't currently active (`deactivate`'s own
+/// return value already says so — nothing to tear down, so no `DDEATH`
+/// either) or if `machine_name` matches no configured machine (logged, not
+/// fatal — same "log and drop" precedent as `handle_subscribe`).
+/// Unsubscribing the last active machine needs no special-case code here —
+/// the Edge Node's own Node session (`NBIRTH`) stays up regardless, since
+/// Node/Device lifecycles are already independent per spec (see CLAUDE.md's
+/// "Planned: dynamic per-machine subscription via Sparkplug B").
+async fn handle_unsubscribe(
+    machine_name: &str,
+    machines: &[MachineDescription],
+    subscription_state: &SubscriptionState,
+    edge_node: &EdgeNodeConnection,
+) {
+    if !machines.iter().any(|machine| machine.name == machine_name) {
+        eprintln!("Unsubscribe for unknown machine {machine_name:?}, ignoring it");
+        return;
+    }
+
+    if !subscription_state.deactivate(machine_name).await {
+        return;
+    }
+
+    if let Err(error) = edge_node.publish_ddeath(machine_name).await {
+        eprintln!("failed to publish DDEATH for {machine_name}: {error}");
+    }
+
+    println!("Unsubscribed from machine {machine_name:?} — Modbus polling stopped.");
+}
+
 /// Drives `edge_node.ncmd_receiver` forever, handling every node-level
 /// control metric this project understands. Named `run_ncmd_handler`, not
 /// `run_rebirth_handler` — it outgrew handling only `Node Control/Rebirth`
-/// once Subscribe needed the same single consumer loop (only one task may
-/// ever drain `ncmd_receiver`, so every `NCMD` concern has to live in one
-/// loop, not a separate task per concern). On a `Rebirth` request,
-/// republishes `NBIRTH` (`EdgeNodeConnection::publish_nbirth` — same
-/// `bdSeq`, `seq` reset to 0) followed by a fresh `DBIRTH` for every machine
-/// in `machines`, built from `stores_by_machine`'s current live values
-/// exactly like the original birth at connect time. On a Subscribe request
-/// (see CLAUDE.md's "Subscribe/Unsubscribe metric convention"), activates
-/// the named machine via `handle_subscribe`. Unsubscribe handling is not
-/// yet wired here (Thread C6). Returns once `ncmd_receiver` closes.
+/// once Subscribe/Unsubscribe needed the same single consumer loop (only
+/// one task may ever drain `ncmd_receiver`, so every `NCMD` concern has to
+/// live in one loop, not a separate task per concern). On a `Rebirth`
+/// request, republishes `NBIRTH` (`EdgeNodeConnection::publish_nbirth` —
+/// same `bdSeq`, `seq` reset to 0) followed by a fresh `DBIRTH` for every
+/// machine in `machines`, built from `stores_by_machine`'s current live
+/// values exactly like the original birth at connect time. On a
+/// Subscribe/Unsubscribe request (see CLAUDE.md's "Subscribe/Unsubscribe
+/// metric convention"), activates/deactivates the named machine via
+/// `handle_subscribe`/`handle_unsubscribe`. Returns once `ncmd_receiver`
+/// closes.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_ncmd_handler(
     edge_node: Arc<EdgeNodeConnection>,
@@ -378,6 +412,10 @@ pub async fn run_ncmd_handler(
                 &runtime_handle,
             )
             .await;
+        }
+
+        for machine_name in unsubscribe_requests(&payload) {
+            handle_unsubscribe(&machine_name, machines, &subscription_state, &edge_node).await;
         }
     }
 }
@@ -848,6 +886,148 @@ mod tests {
             };
             let dbirth = decode_payload(&dbirth_bytes).unwrap();
             assert!(!dbirth.metrics.is_empty());
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_ncmd_handler_unsubscribe_stops_the_machine_and_publishes_ddeath() {
+        use crate::broker::{BrokerConfig, start_embedded_broker};
+        use crate::edge_node::connect_edge_node;
+        use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
+        use sparkplug::payload::encode_payload;
+        use tokio::time::{Duration, timeout};
+
+        timeout(Duration::from_secs(10), async {
+            let port = 18842;
+            start_embedded_broker(BrokerConfig {
+                listen_address: format!("127.0.0.1:{port}"),
+                ..BrokerConfig::default()
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let machines = vec![test_machine("PumpA")];
+
+            let mut external_options = MqttOptions::new("external-subscriber-6", "127.0.0.1", port);
+            external_options.set_keep_alive(Duration::from_secs(30));
+            let (external_client, mut external_eventloop) = AsyncClient::new(external_options, 10);
+            external_client
+                .subscribe("spBv1.0/TestGroup/#", QoS::AtLeastOnce)
+                .await
+                .unwrap();
+            loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::SubAck(_)) => break,
+                    _ => continue,
+                }
+            }
+
+            let edge_node = Arc::new(
+                connect_edge_node("127.0.0.1", port, "TestGroup", "TestEdge", 0, None).await,
+            );
+            edge_node.subscribe_ncmd().await.unwrap();
+
+            // Drain the initial NBIRTH from connect_edge_node itself.
+            loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::Publish(_)) => break,
+                    _ => continue,
+                }
+            }
+
+            // Same dummy-connection trick as the rebirth test above —
+            // Unsubscribe never touches `connection`/`poll_interval`/etc. at
+            // all, so a real-but-inert loopback connection is enough to
+            // satisfy `run_ncmd_handler`'s signature.
+            let dummy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dummy_address = dummy_listener.local_addr().unwrap().to_string();
+            let connection = Arc::new(AsyncMutex::new(
+                Connection::connect_tcp(&dummy_address).await.unwrap(),
+            ));
+            let reconnect_signal = Arc::new(ReconnectSignal::new());
+
+            // "PumpA" starts already active, tracked via two dummy
+            // never-completing tasks — this test exercises only
+            // Unsubscribe's own effect (abort + DDEATH), not a real
+            // Subscribe-triggered polling task.
+            let subscription_state = Arc::new(SubscriptionState::new());
+            subscription_state
+                .activate(
+                    "PumpA".to_string(),
+                    MachineTasks {
+                        polling: tokio::spawn(std::future::pending()),
+                        ddata_ticker: tokio::spawn(std::future::pending()),
+                    },
+                )
+                .await;
+
+            let stores_by_machine = HashMap::new();
+            let aliases = Arc::new(AliasAllocator::build(&machines));
+            let runtime_handle = tokio::runtime::Handle::current();
+            let handler_subscription_state = Arc::clone(&subscription_state);
+            let handler_machines = machines.clone();
+            tokio::spawn(async move {
+                run_ncmd_handler(
+                    edge_node,
+                    &handler_machines,
+                    &stores_by_machine,
+                    aliases,
+                    connection,
+                    Duration::from_millis(100),
+                    Duration::from_secs(5),
+                    reconnect_signal,
+                    handler_subscription_state,
+                    runtime_handle,
+                )
+                .await;
+            });
+
+            let mut host_options = MqttOptions::new("host-application-6", "127.0.0.1", port);
+            host_options.set_keep_alive(Duration::from_secs(30));
+            let (host_client, mut host_eventloop) = AsyncClient::new(host_options, 10);
+            tokio::spawn(async move {
+                loop {
+                    if host_eventloop.poll().await.is_err() {
+                        break;
+                    }
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let unsubscribe_payload = Payload {
+                timestamp: Some(0),
+                seq: None,
+                metrics: vec![control_metric(
+                    "Node Control/Unsubscribe",
+                    MetricValue::String("PumpA".to_string()),
+                )],
+            };
+            let mut unsubscribe_bytes = Vec::new();
+            encode_payload(&unsubscribe_payload, &mut unsubscribe_bytes);
+            host_client
+                .publish(
+                    "spBv1.0/TestGroup/NCMD/TestEdge",
+                    QoS::AtLeastOnce,
+                    false,
+                    unsubscribe_bytes,
+                )
+                .await
+                .unwrap();
+
+            let ddeath_bytes = loop {
+                match external_eventloop.poll().await.unwrap() {
+                    Event::Incoming(Incoming::Publish(publish))
+                        if publish.topic.contains("DDEATH") =>
+                    {
+                        break publish.payload;
+                    }
+                    Event::Incoming(Incoming::Publish(_)) => continue,
+                    _ => continue,
+                }
+            };
+            assert!(decode_payload(&ddeath_bytes).is_ok());
+            assert!(!subscription_state.is_active("PumpA").await);
         })
         .await
         .expect("test timed out");

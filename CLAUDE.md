@@ -353,7 +353,7 @@ Motivation: the manifest+per-machine-fetch idea above has no payoff while `clien
 
 ## Implementation milestone plan for the three design threads above (planned 2026-10-02; Thread B implemented 2026-10-03)
 
-Everything above (FC43 capacity + Sparkplug selective subscription + UN/ECE `unit`) is fully designed. **Threads A and B are done; Thread C is in progress (C1-C3 done, re-split into finer sub-steps during implementation — see below; C4's format decision is done, its decode/wiring is not); Thread D has not started.**
+Everything above (FC43 capacity + Sparkplug selective subscription + UN/ECE `unit`) is fully designed. **Threads A, B, and C are done (C re-split into finer sub-steps during implementation — see below); Thread D has not started.**
 
 **Four largely-independent threads, suggested execution order:**
 
@@ -379,7 +379,7 @@ Re-split into 8 steps during implementation (the original A5 split into "build t
 
 Commits: `226008e` (A1), `1709380` (A2), `ca21490` (A3), `e9e17a3` (A4), `3dba93d` (A5), `da4641a` (A6), `6368749` (A7), see `git log` for A8. 482+ workspace tests pass, clippy/fmt clean at every step.
 
-### Thread C — Sparkplug-driven selective subscription (`mqtt` layer only; needs B1 at minimum) — **in progress, 2026-10-05**
+### Thread C — Sparkplug-driven selective subscription (`mqtt` layer only; needs B1 at minimum) — **done 2026-10-05**
 
 Re-split into finer sub-steps during implementation (same "small, reviewable increments" pattern Thread A used) — same content as the original C1-C6, finer increments, paused for review after each one.
 
@@ -391,7 +391,7 @@ Re-split into finer sub-steps during implementation (same "small, reviewable inc
 - **C4.1.** ✅ Subscribe/Unsubscribe metric format decided — see "Subscribe/Unsubscribe metric convention" above.
 - **C4.2.** Decode functions (`is_subscribe_request`/`is_unsubscribe_request` or equivalent) + unit tests, mirroring `sparkplug_command::is_rebirth_request` — not yet wired.
 - **C5.1.** ✅ Wire Subscribe into the NCMD handler: `client::sparkplug_command::run_ncmd_handler` (renamed from `run_rebirth_handler` — it's now the single consumer of `ncmd_receiver` for every NCMD concern) handles Rebirth as before and, for each name `subscribe_requests` extracts, calls `handle_subscribe`, which spawns the machine's polling task (`client::polling::spawn_machine_polling_task`, extracted from `client::main`'s own fuse/files spawn loop — same shape, reused) and DDATA ticker (`spawn_machine_ddata_ticker`, extracted from `client::main`'s previously-unconditional mqtt DDATA loop, which is now removed entirely), registering both via `SubscriptionState::activate`. Both spawn helpers take an explicit `tokio::runtime::Handle` rather than bare `tokio::spawn`, since `client::main`'s own fuse/files call site runs from plain synchronous code with no ambient Tokio task context (same reason `client::reconnect::run_reconnect_loop` already does this). Unsubscribe is not yet wired (Thread C6).
-- **C6.1.** Wire Unsubscribe into the NCMD handler: `SubscriptionState::deactivate`, publish DDEATH (`edge_node.publish_ddeath` already exists) — unsubscribing the last active machine needs no special-case code, the Node session already stays up regardless per spec.
+- **C6.1.** ✅ Wire Unsubscribe into the NCMD handler: `handle_unsubscribe` (symmetric to `handle_subscribe`) calls `SubscriptionState::deactivate` (aborts the tracked polling+DDATA-ticker pair, idempotent) and publishes DDEATH (`edge_node.publish_ddeath`, already existed). Unknown machine name: logged, not fatal. No special-case code for unsubscribing the last active machine — the Node session already stays up regardless per spec, confirmed by the implementation needing nothing extra for it. **Thread C (C1-C6) is now fully implemented.**
 
 ### Thread D — UN/ECE `unit` field (mostly independent, can slot in anywhere)
 - **D1.** Pull the code list from `datasets/unece-units-of-measure`, build an embedded Rust table (code → name), source comment crediting UN/CEFACT Rec. 20.
