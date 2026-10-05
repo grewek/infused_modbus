@@ -14,6 +14,7 @@ use protocol::device_description::{DataType as ModbusDataType, MachineDescriptio
 use sparkplug::data_type::DataType as SparkplugDataType;
 use sparkplug::metric::Metric;
 use sparkplug::metric_value::MetricValue;
+use sparkplug::property::{Property, PropertyDataType, PropertySet, PropertyValue};
 use std::sync::PoisonError;
 
 /// Maps a register's declared Modbus data type onto the closest Sparkplug B
@@ -71,6 +72,27 @@ pub fn map_register_value(value: RegisterValue) -> MetricValue {
 /// — no width/sign concerns, unlike registers.
 pub fn map_coil_value(value: CoilValue) -> MetricValue {
     MetricValue::Boolean(value.0)
+}
+
+/// Builds a register/input-register's `Metric.properties` from its declared
+/// `unit` (a UN/ECE Recommendation 20 common code, see `protocol::
+/// unit_of_measure`) — `None` when `unit` is `None`, the common case today.
+/// The property key is a plain `"unit"`, not a spec-mandated name (`Metric.
+/// properties` entries are free-form per spec, same "no reserved
+/// vocabulary" reasoning already applied to the Subscribe/Unsubscribe NCMD
+/// metric names) — chosen for directness, matching the TOML field it comes
+/// from rather than inventing separate vocabulary.
+fn unit_property(unit: &Option<String>) -> Option<PropertySet> {
+    let unit = unit.as_ref()?;
+    Some(PropertySet {
+        entries: vec![(
+            "unit".to_string(),
+            Property {
+                data_type: PropertyDataType::String,
+                value: PropertyValue::String(unit.clone()),
+            },
+        )],
+    })
 }
 
 /// Inverts `map_register_value`: given a `MetricValue` received from a
@@ -196,7 +218,7 @@ pub fn build_machine_metrics(
                 timestamp: timestamp_millis,
                 data_type: map_data_type(register.data_type),
                 is_null: false,
-                properties: None,
+                properties: unit_property(&register.unit),
                 value: map_register_value(value),
             });
         }
@@ -254,7 +276,7 @@ pub fn build_machine_metrics(
                 timestamp: timestamp_millis,
                 data_type: map_data_type(input_register.data_type),
                 is_null: false,
-                properties: None,
+                properties: unit_property(&input_register.unit),
                 value: map_register_value(value),
             });
         }
@@ -314,7 +336,7 @@ pub fn build_machine_metrics_null_placeholders(
             timestamp: timestamp_millis,
             data_type: map_data_type(register.data_type),
             is_null: true,
-            properties: None,
+            properties: unit_property(&register.unit),
             value: map_register_value(default_register_value(register.data_type)),
         });
     }
@@ -350,7 +372,7 @@ pub fn build_machine_metrics_null_placeholders(
             timestamp: timestamp_millis,
             data_type: map_data_type(input_register.data_type),
             is_null: true,
-            properties: None,
+            properties: unit_property(&input_register.unit),
             value: map_register_value(default_register_value(input_register.data_type)),
         });
     }
@@ -540,6 +562,106 @@ mod tests {
             mem_layout: MemLayout::Abcd,
             input_register_mem_layout: MemLayout::Abcd,
             server_id: None,
+        }
+    }
+
+    fn test_machine_with_unit() -> MachineDescription {
+        let mut machine = test_machine();
+        machine.registers[0].unit = Some("CEL".to_string());
+        machine.input_registers[0].unit = Some("MQH".to_string());
+        machine
+    }
+
+    fn expected_unit_property(unit: &str) -> PropertySet {
+        PropertySet {
+            entries: vec![(
+                "unit".to_string(),
+                Property {
+                    data_type: PropertyDataType::String,
+                    value: PropertyValue::String(unit.to_string()),
+                },
+            )],
+        }
+    }
+
+    #[test]
+    fn build_machine_metrics_attaches_a_unit_property_when_set() {
+        let machine = test_machine_with_unit();
+        let stores = MachineStores::new();
+        let aliases = crate::sparkplug_alias::AliasAllocator::build(std::slice::from_ref(&machine));
+
+        let metrics = build_machine_metrics(&machine, &stores, &aliases);
+
+        let register_metric = metrics
+            .iter()
+            .find(|metric| metric.name == "Tank_Temperature")
+            .unwrap();
+        assert_eq!(
+            register_metric.properties,
+            Some(expected_unit_property("CEL"))
+        );
+
+        let input_register_metric = metrics
+            .iter()
+            .find(|metric| metric.name == "Flow_Rate")
+            .unwrap();
+        assert_eq!(
+            input_register_metric.properties,
+            Some(expected_unit_property("MQH"))
+        );
+    }
+
+    #[test]
+    fn build_machine_metrics_has_no_properties_when_unit_is_unset() {
+        let machine = test_machine();
+        let stores = MachineStores::new();
+        let aliases = crate::sparkplug_alias::AliasAllocator::build(std::slice::from_ref(&machine));
+
+        let metrics = build_machine_metrics(&machine, &stores, &aliases);
+
+        for name in ["Tank_Temperature", "Flow_Rate"] {
+            let metric = metrics.iter().find(|metric| metric.name == name).unwrap();
+            assert_eq!(metric.properties, None);
+        }
+    }
+
+    #[test]
+    fn null_placeholders_also_attach_a_unit_property_when_set() {
+        let machine = test_machine_with_unit();
+        let aliases = crate::sparkplug_alias::AliasAllocator::build(std::slice::from_ref(&machine));
+
+        let metrics = build_machine_metrics_null_placeholders(&machine, &aliases);
+
+        let register_metric = metrics
+            .iter()
+            .find(|metric| metric.name == "Tank_Temperature")
+            .unwrap();
+        assert_eq!(
+            register_metric.properties,
+            Some(expected_unit_property("CEL"))
+        );
+
+        let input_register_metric = metrics
+            .iter()
+            .find(|metric| metric.name == "Flow_Rate")
+            .unwrap();
+        assert_eq!(
+            input_register_metric.properties,
+            Some(expected_unit_property("MQH"))
+        );
+    }
+
+    #[test]
+    fn coils_and_file_records_never_carry_a_unit_property() {
+        let machine = test_machine_with_unit();
+        let stores = MachineStores::new();
+        let aliases = crate::sparkplug_alias::AliasAllocator::build(std::slice::from_ref(&machine));
+
+        let metrics = build_machine_metrics(&machine, &stores, &aliases);
+
+        for name in ["Motor_Running", "Door_Open", "4:1"] {
+            let metric = metrics.iter().find(|metric| metric.name == name).unwrap();
+            assert_eq!(metric.properties, None);
         }
     }
 

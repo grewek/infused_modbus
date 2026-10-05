@@ -353,7 +353,7 @@ Motivation: the manifest+per-machine-fetch idea above has no payoff while `clien
 
 ## Implementation milestone plan for the three design threads above (planned 2026-10-02; Thread B implemented 2026-10-03)
 
-Everything above (FC43 capacity + Sparkplug selective subscription + UN/ECE `unit`) is fully designed. **Threads A, B, and C are done (C re-split into finer sub-steps during implementation — see below); Thread D has not started.**
+Everything above (FC43 capacity + Sparkplug selective subscription + UN/ECE `unit`) is fully designed, and **all four threads (A, B, C, D) are now fully implemented** (each re-split into finer sub-steps during implementation — see below).
 
 **Four largely-independent threads, suggested execution order:**
 
@@ -393,10 +393,15 @@ Re-split into finer sub-steps during implementation (same "small, reviewable inc
 - **C5.1.** ✅ Wire Subscribe into the NCMD handler: `client::sparkplug_command::run_ncmd_handler` (renamed from `run_rebirth_handler` — it's now the single consumer of `ncmd_receiver` for every NCMD concern) handles Rebirth as before and, for each name `subscribe_requests` extracts, calls `handle_subscribe`, which spawns the machine's polling task (`client::polling::spawn_machine_polling_task`, extracted from `client::main`'s own fuse/files spawn loop — same shape, reused) and DDATA ticker (`spawn_machine_ddata_ticker`, extracted from `client::main`'s previously-unconditional mqtt DDATA loop, which is now removed entirely), registering both via `SubscriptionState::activate`. Both spawn helpers take an explicit `tokio::runtime::Handle` rather than bare `tokio::spawn`, since `client::main`'s own fuse/files call site runs from plain synchronous code with no ambient Tokio task context (same reason `client::reconnect::run_reconnect_loop` already does this). Unsubscribe is not yet wired (Thread C6).
 - **C6.1.** ✅ Wire Unsubscribe into the NCMD handler: `handle_unsubscribe` (symmetric to `handle_subscribe`) calls `SubscriptionState::deactivate` (aborts the tracked polling+DDATA-ticker pair, idempotent) and publishes DDEATH (`edge_node.publish_ddeath`, already existed). Unknown machine name: logged, not fatal. No special-case code for unsubscribing the last active machine — the Node session already stays up regardless per spec, confirmed by the implementation needing nothing extra for it. **Thread C (C1-C6) is now fully implemented.**
 
-### Thread D — UN/ECE `unit` field (mostly independent, can slot in anywhere)
-- **D1.** Pull the code list from `datasets/unece-units-of-measure`, build an embedded Rust table (code → name), source comment crediting UN/CEFACT Rec. 20.
-- **D2.** Add `unit` to the per-value TOML schema, hard-validated against the full embedded table at parse time.
-- **D3. (later, depends on B2):** expose `unit` as a Sparkplug `Metric.properties` entry.
+### Thread D — UN/ECE `unit` field — **done 2026-10-05**
+
+Re-split into finer sub-steps during implementation, same pattern as Threads A/C.
+
+- **D1.1-D1.3.** ✅ `protocol::unit_of_measure`: `UNIT_CODES`, a sorted `&[(&str, &str)]` of 1755 code/name pairs, generated from the `datasets/unece-units-of-measure` GitHub mirror's `data/units-of-measure.csv` (Rev. 17e, PDDL v1.0). Only rows with a blank `Status` column are included — the source file's own `Status=D`/`Status=X` rows mark UN/ECE-deprecated/deleted entries (309+71 of 2136 total rows), which the mirror's own README incorrectly claims are already stripped; validating against a retired code would defeat the point of validating at all, so this project filters them out itself. `unit_name(code) -> Option<&'static str>` (binary search) and `is_valid_unit_code`. Raw CSV not committed, only the generated table.
+- **D2.1-D2.3.** ✅ `unit: Option<String>` added to `RegisterDescription`/`InputRegisterDescription` only (not coils/discrete-inputs — a physical unit has no meaning on a plain boolean), hard-validated at parse time against `unit_of_measure` (new `DeviceDescriptionError::InvalidUnitCode`). Documented in `docs/device-description.md`; `examples/device-description.toml` uses it on its physical measurements, leaves it off its control points to demonstrate it's optional. New regression test parses the shipped example TOML directly via `include_str!` so it can't silently rot. Mechanical fallout: every existing `RegisterDescription`/`InputRegisterDescription` struct literal workspace-wide needed `unit: None` added (fixed via a one-off brace-counting script, ~34 sites).
+- **D3.1-D3.2.** ✅ `client::sparkplug_translator::unit_property` builds a one-entry `PropertySet` (key `"unit"`) from a register's `unit`, wired into both `build_machine_metrics` and `build_machine_metrics_null_placeholders` for registers and input registers. The `"unit"` key is a deliberate, direct choice, not a spec-mandated name — checked the real spec text (local `sparkplug-tck` Docker image) and confirmed `Metric.properties` has no reserved vocabulary for engineering units, same "free-form, not a protocol redefinition" finding Thread C's NCMD convention already relied on.
+
+**All four design threads (A/B/C/D) from the 2026-10-02 planning session are now fully implemented.**
 
 **Cross-thread note:** A and C are independent in principle, but C2 benefits directly from A for genuinely large deployments — build B → A → C in that order to avoid C needing its own throwaway "fetch a big description" before A provides the real one.
 
