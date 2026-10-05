@@ -41,6 +41,7 @@ Each entry's actual Modbus address is `base_address + offset` — `Tank_Temperat
 - `offset` — added to the section's `base_address` to get the register's real Modbus address.
 - `data_type` — one of `u8`, `i8`, `u16`, `i16`, `u24`, `i24`, `u32`, `i32`, `u64`, `i64`, `f32`, `f64`. Anything wider than one 16-bit register (`u24` and up) spans consecutive registers, in the byte order `mem-layout` describes. `u24`/`i24` have no native Modbus width — they occupy two registers (32 bits) with the top byte always zero (`u24`) or sign-extended (`i24`).
 - `access` — `"read_only"` or `"read_write"`.
+- `unit` — optional. The register's engineering unit, as a [UN/ECE Recommendation 20](https://unece.org/trade/uncefact/cl-recommendations) common code (e.g. `"CEL"` for degree Celsius, `"KPA"` for kilopascal, `"MQH"` for cubic metre per hour) — hard-validated at parse time against the currently-active code list, so a typo or a deprecated/retired code is rejected rather than silently accepted. Omit it entirely for a register with no physical unit (a setpoint, a mode flag, ...).
 
 `mem-layout` describes how a device lays a multi-register value's bytes across the wire — real devices vary, and getting this wrong silently produces the wrong number rather than an error. It's one setting for the whole `[machines.registers]` section (a device doesn't mix conventions internally), using the industry-standard four-letter names for a value's bytes A (most significant) through D (least significant):
 
@@ -133,7 +134,7 @@ name = "Door_Open_Sensor"
 offset = 1
 ```
 
-Input registers (FC 0x04) mirror `[machines.registers]` minus `access` (always read-only) — they still need their own `mem-layout`, since a value can span multiple registers exactly like holding registers:
+Input registers (FC 0x04) mirror `[machines.registers]` minus `access` (always read-only) — they still need their own `mem-layout`, since a value can span multiple registers exactly like holding registers. `unit` works identically to `[machines.registers]`'s own:
 
 ```toml
 [machines.input-registers]
@@ -144,6 +145,7 @@ mem-layout = "abcd"
 name = "Flow_Rate"
 offset = 1
 data_type = "f32"
+unit = "MQH"
 ```
 
 All four sections (`[machines.registers]`, `[machines.coils]`, `[machines.discrete-inputs]`, `[machines.input-registers]`) are independently optional per machine — a machine only declares the ones it actually has.

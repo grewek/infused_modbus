@@ -599,6 +599,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_shipped_example_device_description_parses_and_validates() {
+        let toml_source = include_str!("../../examples/device-description.toml");
+        DeviceDescription::parse(toml_source)
+            .expect("examples/device-description.toml must always parse cleanly");
+    }
+
+    #[test]
     fn register_count_matches_each_type_s_wire_width() {
         for data_type in [DataType::U8, DataType::I8, DataType::U16, DataType::I16] {
             assert_eq!(data_type.register_count(), 1);

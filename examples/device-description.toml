@@ -13,6 +13,11 @@
 # of several widths, coils, a discrete input, an input register, a file
 # record, and its own server-id); PumpB is deliberately minimal, to show
 # that a second machine doesn't need to repeat everything PumpA declares.
+# Tank_Temperature/Flow_Rate/Line_Pressure also show the optional `unit`
+# field (a UN/ECE Recommendation 20 common code, e.g. "CEL" for degree
+# Celsius — see the "Device description TOML format" section in the
+# top-level README.md); Stop_Process/Setpoint are control points, not
+# physical measurements, so they're left without one.
 
 [[machines]]
 name = "PumpA"
@@ -28,12 +33,14 @@ name = "Tank_Temperature"
 offset = 1
 data_type = "u16"
 access = "read_only"
+unit = "CEL"
 
 [[machines.registers.entries]]
 name = "Flow_Rate"
 offset = 2
 data_type = "f32"
 access = "read_only"
+unit = "MQH"
 
 [[machines.registers.entries]]
 name = "Stop_Process"
@@ -73,6 +80,7 @@ mem-layout = "abcd"
 name = "Line_Pressure"
 offset = 1
 data_type = "f32"
+unit = "KPA"
 
 [[machines.file-records]]
 file_number = 20
