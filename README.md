@@ -18,7 +18,7 @@ This project is under active development and has **not** had a security review. 
 
 ## What this is
 
-- **Data is exposed over MQTT, using Sparkplug B.** `client` embeds its own MQTT broker and publishes each machine as a Sparkplug B Device under its own Edge Node (`NBIRTH`/`DBIRTH` once at startup, `NDATA`/`DDATA` on change); a write arrives as a `DCMD`. `server` exposes a small local socket an external system can use to read/update its own dataset directly. See [MQTT (Sparkplug B) layer](docs/mqtt-sparkplug.md).
+- **Data is exposed over MQTT, using Sparkplug B.** `client` connects to an already-running MQTT broker (this project doesn't run one itself) as a Sparkplug B Edge Node, publishing each machine as its own Device (`NBIRTH`/`DBIRTH` once at startup, `NDATA`/`DDATA` on change); a write arrives as a `DCMD`. `server` exposes a small local socket an external system can use to read/update its own dataset directly. See [MQTT (Sparkplug B) layer](docs/mqtt-sparkplug.md).
 - **Writes are confirmed, not optimistic.** The client only updates its own view of a register once a write is actually confirmed by the device; the server, having no separate device to confirm against, applies a direct write to its own state immediately.
 - **TCP and RTU use the same code paths**, and the server can advertise its own register description to the client over the wire (FC 43) instead of relying on a hand-kept copy staying in sync.
 - **Modbus implemented from scratch** — the `protocol` crate implements TCP/RTU framing, CRC16, and PDU encode/decode directly, rather than wrapping an existing crate.
