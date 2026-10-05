@@ -286,6 +286,91 @@ pub fn build_machine_metrics(
     metrics
 }
 
+/// Builds the same full metric list `build_machine_metrics` would for
+/// `machine` — every register/coil/discrete-input/input-register/file-record
+/// it declares, with its assigned alias and mapped `DataType` — but with
+/// every metric marked `is_null: true` and no store access at all (unlike
+/// `build_machine_metrics`, this never locks `stores` — see CLAUDE.md's
+/// "Planned: dynamic per-machine subscription via Sparkplug B": the spec
+/// requires a `DBIRTH` to declare every metric a Device will ever publish up
+/// front, so this is how the client births a machine's full shape before any
+/// real Modbus polling for it has started, `is_null` standing in for "no
+/// current value yet"). The `value` field is still populated with the same
+/// typed zero/empty placeholder `build_machine_metrics` uses for an unset
+/// value — Sparkplug B's wire format has no "value absent" representation,
+/// only `is_null` flagging that whatever concrete value is present should be
+/// ignored.
+pub fn build_machine_metrics_null_placeholders(
+    machine: &MachineDescription,
+    aliases: &AliasAllocator,
+) -> Vec<Metric> {
+    let mut metrics = Vec::new();
+    let timestamp_millis = Some(crate::edge_node::current_timestamp_millis());
+
+    for register in &machine.registers {
+        metrics.push(Metric {
+            name: register.name.clone(),
+            alias: aliases.alias_for(&machine.name, &register.name),
+            timestamp: timestamp_millis,
+            data_type: map_data_type(register.data_type),
+            is_null: true,
+            properties: None,
+            value: map_register_value(default_register_value(register.data_type)),
+        });
+    }
+
+    for coil in &machine.coils {
+        metrics.push(Metric {
+            name: coil.name.clone(),
+            alias: aliases.alias_for(&machine.name, &coil.name),
+            timestamp: timestamp_millis,
+            data_type: SparkplugDataType::Boolean,
+            is_null: true,
+            properties: None,
+            value: map_coil_value(CoilValue(false)),
+        });
+    }
+
+    for discrete_input in &machine.discrete_inputs {
+        metrics.push(Metric {
+            name: discrete_input.name.clone(),
+            alias: aliases.alias_for(&machine.name, &discrete_input.name),
+            timestamp: timestamp_millis,
+            data_type: SparkplugDataType::Boolean,
+            is_null: true,
+            properties: None,
+            value: map_coil_value(CoilValue(false)),
+        });
+    }
+
+    for input_register in &machine.input_registers {
+        metrics.push(Metric {
+            name: input_register.name.clone(),
+            alias: aliases.alias_for(&machine.name, &input_register.name),
+            timestamp: timestamp_millis,
+            data_type: map_data_type(input_register.data_type),
+            is_null: true,
+            properties: None,
+            value: map_register_value(default_register_value(input_register.data_type)),
+        });
+    }
+
+    for file_record in &machine.file_records {
+        let name = file_record_metric_name(file_record.file_number, file_record.record_number);
+        metrics.push(Metric {
+            name: name.clone(),
+            alias: aliases.alias_for(&machine.name, &name),
+            timestamp: timestamp_millis,
+            data_type: SparkplugDataType::Bytes,
+            is_null: true,
+            properties: None,
+            value: MetricValue::Bytes(vec![0u8; 2 * file_record.record_length as usize]),
+        });
+    }
+
+    metrics
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +633,60 @@ mod tests {
             file_record.value,
             MetricValue::Bytes(vec![0x0D, 0xFE, 0x00, 0x20])
         );
+    }
+
+    #[test]
+    fn null_placeholders_cover_the_same_metrics_as_build_machine_metrics() {
+        let machine = test_machine();
+        let stores = MachineStores::new();
+        let aliases = crate::sparkplug_alias::AliasAllocator::build(std::slice::from_ref(&machine));
+
+        let real_metrics = build_machine_metrics(&machine, &stores, &aliases);
+        let placeholder_metrics = build_machine_metrics_null_placeholders(&machine, &aliases);
+
+        let mut real_names: Vec<&str> = real_metrics
+            .iter()
+            .map(|metric| metric.name.as_str())
+            .collect();
+        let mut placeholder_names: Vec<&str> = placeholder_metrics
+            .iter()
+            .map(|metric| metric.name.as_str())
+            .collect();
+        real_names.sort_unstable();
+        placeholder_names.sort_unstable();
+        assert_eq!(real_names, placeholder_names);
+    }
+
+    #[test]
+    fn every_null_placeholder_metric_is_marked_null_and_aliased() {
+        let machine = test_machine();
+        let aliases = crate::sparkplug_alias::AliasAllocator::build(std::slice::from_ref(&machine));
+
+        let metrics = build_machine_metrics_null_placeholders(&machine, &aliases);
+        assert!(!metrics.is_empty());
+        for metric in &metrics {
+            assert!(metric.is_null);
+            assert_eq!(metric.alias, aliases.alias_for(&machine.name, &metric.name));
+            assert!(metric.alias.is_some());
+        }
+    }
+
+    #[test]
+    fn null_placeholder_data_types_match_build_machine_metrics() {
+        let machine = test_machine();
+        let stores = MachineStores::new();
+        let aliases = crate::sparkplug_alias::AliasAllocator::build(std::slice::from_ref(&machine));
+
+        let real_metrics = build_machine_metrics(&machine, &stores, &aliases);
+        let placeholder_metrics = build_machine_metrics_null_placeholders(&machine, &aliases);
+
+        for real_metric in &real_metrics {
+            let placeholder_metric = placeholder_metrics
+                .iter()
+                .find(|metric| metric.name == real_metric.name)
+                .unwrap();
+            assert_eq!(placeholder_metric.data_type, real_metric.data_type);
+        }
     }
 
     #[test]

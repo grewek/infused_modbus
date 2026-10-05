@@ -343,6 +343,8 @@ Motivation: the manifest+per-machine-fetch idea above has no payoff while `clien
 
 **Granularity: per-machine for v1, explicitly not the final word** — matches `run_polling_loop`'s existing one-task-per-machine architecture (subscribed just gates whether that task is spawned). The user has flagged per-register/per-value granularity as a near-certain future direction; the Subscribe payload shape should leave room for it (`{machine, points: [...]}` with empty/omitted `points` meaning "the whole machine") without building per-point activation now.
 
+**Subscribe/Unsubscribe metric convention, decided 2026-10-05 (C4.1):** two node-level control metrics, `"Node Control/Subscribe"` and `"Node Control/Unsubscribe"` — same fixed-name, never-aliased convention `"Node Control/Rebirth"` already established (`client::sparkplug_command::REBIRTH_METRIC_NAME`), not a new mechanism. Value: `MetricValue::String` carrying the target machine's exact `name` — v1 is whole-machine-only, so a bare machine name is the entire payload, no `{machine, points}` structure needed yet. A Host Application wanting to (un)subscribe several machines at once simply includes several Subscribe/Unsubscribe metrics in the one NCMD payload — Sparkplug payloads already carry a metric array, so this needs no new batching mechanism. **Forward-compatible extension point for later per-point granularity (not built now):** swap the value from a bare `String` to a `DataSet` (columns `machine`/`point`, one row per selected point; an absent/empty row set still means "the whole machine") — `sparkplug::data_set` (B3) already has everything this would need, so reaching per-point granularity later is purely `client`-side decode work, no `sparkplug` crate change. Subscribing an already-active machine or unsubscribing an inactive one is a no-op, not an error — mirrors `SubscriptionState::activate`/`deactivate`'s own idempotent behavior. An unresolvable machine name (no configured machine with that `name`) is logged and skipped, same "log and drop" precedent as every other unrecognized-machine-name path in this project.
+
 **Unsubscribe/DDEATH:** implemented symmetrically — stops that machine's polling task, publishes DDEATH. Unsubscribing the *last* subscribed machine returns the whole client to the dormant bootstrap state (zero Modbus traffic, waiting for a new Subscribe); the Edge Node's own Node session (NBIRTH) stays up throughout, since Node/Device lifecycles are already independent per spec.
 
 **DataSet metric type: implement as a general `sparkplug` crate capability**, not scoped narrowly to the manifest — this project will need richer metric types regardless (per-value metadata, custom-FC structured fields); the manifest is simply its first concrete consumer.
@@ -351,7 +353,7 @@ Motivation: the manifest+per-machine-fetch idea above has no payoff while `clien
 
 ## Implementation milestone plan for the three design threads above (planned 2026-10-02; Thread B implemented 2026-10-03)
 
-Everything above (FC43 capacity + Sparkplug selective subscription + UN/ECE `unit`) is fully designed. **Threads A and B are done; Threads C/D have not started** — Thread C is next per the suggested order below (C2 now has Thread A to build on).
+Everything above (FC43 capacity + Sparkplug selective subscription + UN/ECE `unit`) is fully designed. **Threads A and B are done; Thread C is in progress (C1-C3 done, re-split into finer sub-steps during implementation — see below; C4's format decision is done, its decode/wiring is not); Thread D has not started.**
 
 **Four largely-independent threads, suggested execution order:**
 
@@ -377,13 +379,19 @@ Re-split into 8 steps during implementation (the original A5 split into "build t
 
 Commits: `226008e` (A1), `1709380` (A2), `ca21490` (A3), `e9e17a3` (A4), `3dba93d` (A5), `da4641a` (A6), `6368749` (A7), see `git log` for A8. 482+ workspace tests pass, clippy/fmt clean at every step.
 
-### Thread C — Sparkplug-driven selective subscription (`mqtt` layer only; needs B1 at minimum)
-- **C1.** `--machines <names>` for `fuse`/`files` — simple, no dependency on anything else here; could land first if a quick win is wanted.
-- **C2.** Client (`mqtt`): fetch every machine's full definition at startup (via Thread A once it exists, or today's plain FC43 fetch for small descriptions) and build each machine's full metric list.
-- **C3.** Client: publish full DBIRTH per machine immediately with `is_null=true` (needs B1) — no polling yet.
-- **C4.** Define the Subscribe/Unsubscribe NCMD metric convention — forward-compatible payload shape for later per-point granularity.
-- **C5.** Wire Subscribe → spawn that machine's existing polling task (no changes to its batching logic).
-- **C6.** Wire Unsubscribe → stop the polling task, publish DDEATH; unsubscribing the last machine returns to the dormant state.
+### Thread C — Sparkplug-driven selective subscription (`mqtt` layer only; needs B1 at minimum) — **in progress, 2026-10-05**
+
+Re-split into finer sub-steps during implementation (same "small, reviewable increments" pattern Thread A used) — same content as the original C1-C6, finer increments, paused for review after each one.
+
+- **C1.1.** ✅ `--machines <name1,name2,...>` CLI parsing (`client::main::extract_machines`) — order-independent flag, same shape as `--mqtt-broker`.
+- **C1.2.** ✅ `client::main::apply_machines_allowlist` filters `description.machines` down to the allowlist for `fuse`/`files` only; unknown names logged and skipped; ignored (with a one-line notice) under `mqtt`.
+- **C2.1.** ✅ `client::sparkplug_translator::build_machine_metrics_null_placeholders` — the same metric list `build_machine_metrics` builds (name/alias/`DataType`), every entry `is_null: true`, no store access at all.
+- **C2.2.** ✅ `mqtt`'s initial DBIRTH per machine now uses the placeholder builder instead of real store values; the shared pre-match Modbus-polling-spawn loop is now skipped entirely under `mqtt` (unchanged for `fuse`/`files`) — no machine polls until subscribed. The periodic DDATA ticker and the rebirth handler still run unconditionally per machine for now (harmless no-op against unchanging store defaults) — their own subscription-gating is C5/C6's job, not re-touched here.
+- **C3.1.** ✅ `client::subscription_state::SubscriptionState`/`MachineTasks` — tracks, per machine, the running polling+DDATA-ticker task pair; `activate`/`deactivate`/`is_active`/`is_dormant`, idempotent either direction. Not yet wired into `main.rs`.
+- **C4.1.** ✅ Subscribe/Unsubscribe metric format decided — see "Subscribe/Unsubscribe metric convention" above.
+- **C4.2.** Decode functions (`is_subscribe_request`/`is_unsubscribe_request` or equivalent) + unit tests, mirroring `sparkplug_command::is_rebirth_request` — not yet wired.
+- **C5.1.** Wire Subscribe into the NCMD handler: spawn the machine's polling task + DDATA ticker (reusing the existing `run_polling_loop` call site currently skipped under `mqtt`), register via `SubscriptionState::activate`.
+- **C6.1.** Wire Unsubscribe into the NCMD handler: `SubscriptionState::deactivate`, publish DDEATH (`edge_node.publish_ddeath` already exists) — unsubscribing the last active machine needs no special-case code, the Node session already stays up regardless per spec.
 
 ### Thread D — UN/ECE `unit` field (mostly independent, can slot in anywhere)
 - **D1.** Pull the code list from `datasets/unece-units-of-measure`, build an embedded Rust table (code → name), source comment crediting UN/CEFACT Rec. 20.
