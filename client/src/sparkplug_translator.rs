@@ -516,6 +516,7 @@ mod tests {
                 address: 0,
                 data_type: ModbusDataType::U16,
                 access: AccessRight::ReadOnly,
+                unit: None,
             }],
             coils: vec![CoilDescription {
                 name: "Motor_Running".to_string(),
@@ -529,6 +530,7 @@ mod tests {
                 name: "Flow_Rate".to_string(),
                 address: 0,
                 data_type: ModbusDataType::F32,
+                unit: None,
             }],
             file_records: vec![FileRecordDescription {
                 file_number: 4,

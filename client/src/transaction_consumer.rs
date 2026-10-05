@@ -450,6 +450,7 @@ mod tests {
             address: 40001,
             data_type: DataType::U16,
             access: AccessRight::ReadWrite,
+            unit: None,
         }
     }
 
@@ -459,6 +460,7 @@ mod tests {
             address: 40002,
             data_type: DataType::U16,
             access: AccessRight::ReadWrite,
+            unit: None,
         }
     }
 
@@ -482,6 +484,7 @@ mod tests {
             address: 40020,
             data_type: DataType::F32,
             access: AccessRight::ReadWrite,
+            unit: None,
         }
     }
 

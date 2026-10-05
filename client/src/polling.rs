@@ -584,6 +584,7 @@ mod tests {
             address,
             data_type,
             access: AccessRight::ReadOnly,
+            unit: None,
         }
     }
 
@@ -606,6 +607,7 @@ mod tests {
             name: name.to_string(),
             address,
             data_type,
+            unit: None,
         }
     }
 

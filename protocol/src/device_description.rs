@@ -1,11 +1,12 @@
+use crate::unit_of_measure::is_valid_unit_code;
 use serde::Deserialize;
 use std::fmt;
 
-// Only the fields needed to identify and access a register are modeled so
-// far. CLAUDE.md flags scaling/units as part of the eventual schema too, but
-// nothing concretely needs them yet (per Extraction-Based Programming) — add
-// them once a real consumer, like the in-memory register store, needs to
-// apply a scale factor.
+// CLAUDE.md flags per-value metadata (unit, device_class, display_name, ...)
+// as part of the eventual schema — `unit` (see `RegisterDescription::unit`)
+// is the first of these to actually land, per Extraction-Based Programming;
+// the rest stay unmodeled until a real consumer needs them too (e.g. a scale
+// factor applied by the in-memory register store).
 //
 // U24/I24 exist because some real devices use them (audio-style 24-bit
 // values), even though Modbus has no native 24-bit register — they occupy
@@ -87,6 +88,15 @@ pub struct RegisterDescription {
     pub address: u16,
     pub data_type: DataType,
     pub access: AccessRight,
+    // Engineering unit, as a UN/ECE Recommendation 20 common code (e.g.
+    // `"CEL"` for degree Celsius) — see `protocol::unit_of_measure`'s own
+    // doc comment for why this standard was chosen over free text, and
+    // CLAUDE.md's "UN/ECE `unit` field, decided". `None` means "not
+    // configured" (the common case today — every TOML written before this
+    // field existed keeps parsing unchanged). Scoped to registers/input
+    // registers only for now — a physical unit has little meaning on a
+    // single-bit coil/discrete-input, so neither gets this field.
+    pub unit: Option<String>,
 }
 
 // Input registers (FC 4) are always read-only per the Modbus spec — no
@@ -97,6 +107,8 @@ pub struct InputRegisterDescription {
     pub name: String,
     pub address: u16,
     pub data_type: DataType,
+    // Same `unit` field and reasoning as `RegisterDescription::unit` above.
+    pub unit: Option<String>,
 }
 
 // Coils have no `data_type` (always 1 bit) and no `access` (assumed always
@@ -210,6 +222,8 @@ struct RawRegisterEntry {
     offset: u16,
     data_type: DataType,
     access: AccessRight,
+    #[serde(default)]
+    unit: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -225,6 +239,8 @@ struct RawInputRegisterEntry {
     name: String,
     offset: u16,
     data_type: DataType,
+    #[serde(default)]
+    unit: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -330,6 +346,16 @@ pub enum DeviceDescriptionError {
         machine: String,
         file_number: u16,
     },
+    // A register/input-register `unit` naming something other than a
+    // currently-active UN/ECE Recommendation 20 common code — see
+    // `crate::unit_of_measure`'s own doc comment for why this standard was
+    // chosen, and why only currently-active codes (not deprecated/deleted
+    // ones) validate successfully.
+    InvalidUnitCode {
+        machine: String,
+        name: String,
+        unit: String,
+    },
 }
 
 impl fmt::Display for DeviceDescriptionError {
@@ -358,6 +384,14 @@ impl fmt::Display for DeviceDescriptionError {
             } => write!(
                 formatter,
                 "machine '{machine}': file_number {file_number} is reserved for the server's own compressed-description transfer and cannot be used in [[file-records]]"
+            ),
+            DeviceDescriptionError::InvalidUnitCode {
+                machine,
+                name,
+                unit,
+            } => write!(
+                formatter,
+                "machine '{machine}': '{name}' has unit '{unit}', which is not a currently-active UN/ECE Recommendation 20 common code"
             ),
         }
     }
@@ -413,6 +447,25 @@ fn resolve_addresses<Entry>(
         .collect()
 }
 
+// Shared by both register-bearing entry types (`RegisterDescription`,
+// `InputRegisterDescription`) — the only two with a `unit` field at all, see
+// `RegisterDescription::unit`'s own doc comment for why coils/discrete-
+// inputs don't get one. A `None` unit (the common case) always passes.
+fn validate_unit_code(
+    machine_name: &str,
+    name: &str,
+    unit: &Option<String>,
+) -> Result<(), DeviceDescriptionError> {
+    match unit {
+        Some(code) if !is_valid_unit_code(code) => Err(DeviceDescriptionError::InvalidUnitCode {
+            machine: machine_name.to_string(),
+            name: name.to_string(),
+            unit: code.clone(),
+        }),
+        _ => Ok(()),
+    }
+}
+
 fn resolve_machine(raw: RawMachine) -> Result<MachineDescription, DeviceDescriptionError> {
     let machine_name = raw.name.as_str();
     let mem_layout = raw.registers.mem_layout;
@@ -430,8 +483,12 @@ fn resolve_machine(raw: RawMachine) -> Result<MachineDescription, DeviceDescript
         address,
         data_type: entry.data_type,
         access: entry.access,
+        unit: entry.unit,
     })
-    .collect();
+    .collect::<Vec<_>>();
+    for register in &registers {
+        validate_unit_code(machine_name, &register.name, &register.unit)?;
+    }
 
     let coils = resolve_addresses(
         machine_name,
@@ -461,8 +518,12 @@ fn resolve_machine(raw: RawMachine) -> Result<MachineDescription, DeviceDescript
         name: entry.name,
         address,
         data_type: entry.data_type,
+        unit: entry.unit,
     })
-    .collect();
+    .collect::<Vec<_>>();
+    for input_register in &input_registers {
+        validate_unit_code(machine_name, &input_register.name, &input_register.unit)?;
+    }
 
     let discrete_inputs = resolve_addresses(
         machine_name,
@@ -605,12 +666,14 @@ mod tests {
                             address: 40001,
                             data_type: DataType::U16,
                             access: AccessRight::ReadOnly,
+                            unit: None,
                         },
                         RegisterDescription {
                             name: "Stop_Process".to_string(),
                             address: 40002,
                             data_type: DataType::F32,
                             access: AccessRight::ReadWrite,
+                            unit: None,
                         },
                     ],
                     coils: vec![
@@ -818,6 +881,146 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_a_register_with_a_valid_unit_code() {
+        let toml_source = r#"
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.registers]
+            base_address = 40000
+            mem-layout = "abcd"
+
+            [[machines.registers.entries]]
+            name = "Tank_Temperature"
+            offset = 1
+            data_type = "u16"
+            access = "read_only"
+            unit = "CEL"
+        "#;
+
+        let description = DeviceDescription::parse(toml_source).unwrap();
+        assert_eq!(
+            description.machines[0].registers[0].unit,
+            Some("CEL".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_accepts_a_register_without_a_unit() {
+        let toml_source = r#"
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.registers]
+            base_address = 40000
+            mem-layout = "abcd"
+
+            [[machines.registers.entries]]
+            name = "Tank_Temperature"
+            offset = 1
+            data_type = "u16"
+            access = "read_only"
+        "#;
+
+        let description = DeviceDescription::parse(toml_source).unwrap();
+        assert_eq!(description.machines[0].registers[0].unit, None);
+    }
+
+    #[test]
+    fn parse_rejects_a_register_with_an_invalid_unit_code() {
+        let toml_source = r#"
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.registers]
+            base_address = 40000
+            mem-layout = "abcd"
+
+            [[machines.registers.entries]]
+            name = "Tank_Temperature"
+            offset = 1
+            data_type = "u16"
+            access = "read_only"
+            unit = "NOT_A_REAL_UNIT_CODE"
+        "#;
+
+        let error = DeviceDescription::parse(toml_source).unwrap_err();
+        match error {
+            DeviceDescriptionError::InvalidUnitCode {
+                machine,
+                name,
+                unit,
+            } => {
+                assert_eq!(machine, "PumpA");
+                assert_eq!(name, "Tank_Temperature");
+                assert_eq!(unit, "NOT_A_REAL_UNIT_CODE");
+            }
+            other => panic!("expected InvalidUnitCode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_an_input_register_with_an_invalid_unit_code() {
+        let toml_source = r#"
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.input-registers]
+            base_address = 30000
+            mem-layout = "abcd"
+
+            [[machines.input-registers.entries]]
+            name = "Flow_Rate"
+            offset = 1
+            data_type = "f32"
+            unit = "NOT_A_REAL_UNIT_CODE"
+        "#;
+
+        let error = DeviceDescription::parse(toml_source).unwrap_err();
+        match error {
+            DeviceDescriptionError::InvalidUnitCode {
+                machine,
+                name,
+                unit,
+            } => {
+                assert_eq!(machine, "PumpA");
+                assert_eq!(name, "Flow_Rate");
+                assert_eq!(unit, "NOT_A_REAL_UNIT_CODE");
+            }
+            other => panic!("expected InvalidUnitCode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_an_input_register_with_a_valid_unit_code() {
+        let toml_source = r#"
+            [[machines]]
+            name = "PumpA"
+            unit_id = 1
+
+            [machines.input-registers]
+            base_address = 30000
+            mem-layout = "abcd"
+
+            [[machines.input-registers.entries]]
+            name = "Flow_Rate"
+            offset = 1
+            data_type = "f32"
+            unit = "MTQ"
+        "#;
+
+        let description = DeviceDescription::parse(toml_source).unwrap();
+        assert_eq!(
+            description.machines[0].input_registers[0].unit,
+            Some("MTQ".to_string())
+        );
+    }
+
+    #[test]
     fn parse_accepts_a_file_record_one_below_the_reserved_file_number() {
         let toml_source = r#"
             [[machines]]
@@ -921,6 +1124,7 @@ mod tests {
                 name: "Flow_Rate".to_string(),
                 address: 30001,
                 data_type: DataType::F32,
+                unit: None,
             }]
         );
         assert_eq!(machine.input_register_mem_layout, MemLayout::Cdab);

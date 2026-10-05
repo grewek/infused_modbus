@@ -2419,6 +2419,7 @@ mod tests {
             address: 40001,
             data_type: DataType::U16,
             access: AccessRight::ReadWrite,
+            unit: None,
         }];
         let coils = vec![CoilDescription {
             name: "Motor_Running".to_string(),
@@ -2464,6 +2465,7 @@ mod tests {
             address: 40001,
             data_type: DataType::U16,
             access: AccessRight::ReadOnly,
+            unit: None,
         }];
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         let coil_store = Arc::new(Mutex::new(CoilStore::new()));
@@ -3547,6 +3549,7 @@ mod tests {
                 address: 40001,
                 data_type: DataType::U16,
                 access: AccessRight::ReadWrite,
+                unit: None,
             }],
             coils: Vec::new(),
             discrete_inputs: Vec::new(),

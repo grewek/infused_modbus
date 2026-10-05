@@ -1258,6 +1258,7 @@ mod tests {
             address: 40001,
             data_type: DataType::U16,
             access: AccessRight::ReadOnly,
+            unit: None,
         }
     }
 
@@ -1280,6 +1281,7 @@ mod tests {
             name: name.to_string(),
             address: 30001,
             data_type: DataType::U16,
+            unit: None,
         }
     }
 

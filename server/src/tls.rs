@@ -559,6 +559,7 @@ mod tests {
             address: 40001,
             data_type: DataType::U16,
             access: AccessRight::ReadOnly,
+            unit: None,
         }]);
         let store = Arc::new(Mutex::new(RegisterStore::new()));
         store

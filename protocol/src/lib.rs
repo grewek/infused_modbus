@@ -6,6 +6,7 @@ pub mod pdu;
 pub mod rtu;
 pub mod tcp;
 pub mod tls;
+pub mod unit_of_measure;
 
 use std::future::Future;
 use std::io;

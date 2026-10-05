@@ -128,12 +128,14 @@ mod tests {
                 address: 40001,
                 data_type: DataType::U16,
                 access: AccessRight::ReadOnly,
+                unit: None,
             },
             RegisterDescription {
                 name: "Stop_Process".to_string(),
                 address: 40002,
                 data_type: DataType::U16,
                 access: AccessRight::ReadWrite,
+                unit: None,
             },
         ]
     }

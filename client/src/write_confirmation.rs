@@ -280,6 +280,7 @@ mod tests {
             address: 40001,
             data_type: DataType::U16,
             access: AccessRight::ReadWrite,
+            unit: None,
         }
     }
 
@@ -302,6 +303,7 @@ mod tests {
             address: 40002,
             data_type: DataType::F32,
             access: AccessRight::ReadWrite,
+            unit: None,
         }
     }
 
@@ -319,6 +321,7 @@ mod tests {
             address: 40003,
             data_type: DataType::I16,
             access: AccessRight::ReadWrite,
+            unit: None,
         };
         let pdu = encode_write_request(&register, RegisterValue::I16(-5), MemLayout::Abcd).unwrap();
         assert_eq!(pdu, vec![0x06, 0x9C, 0x43, 0xFF, 0xFB]);

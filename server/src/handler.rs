@@ -1165,36 +1165,42 @@ mod tests {
                 address: 40001,
                 data_type: DataType::U16,
                 access: AccessRight::ReadOnly,
+                unit: None,
             },
             RegisterDescription {
                 name: "Stop_Process".to_string(),
                 address: 40002,
                 data_type: DataType::U16,
                 access: AccessRight::ReadWrite,
+                unit: None,
             },
             RegisterDescription {
                 name: "Flow_Rate".to_string(),
                 address: 40003,
                 data_type: DataType::F32,
                 access: AccessRight::ReadOnly,
+                unit: None,
             },
             RegisterDescription {
                 name: "Valve_1".to_string(),
                 address: 40010,
                 data_type: DataType::U16,
                 access: AccessRight::ReadWrite,
+                unit: None,
             },
             RegisterDescription {
                 name: "Valve_2".to_string(),
                 address: 40011,
                 data_type: DataType::U16,
                 access: AccessRight::ReadWrite,
+                unit: None,
             },
             RegisterDescription {
                 name: "Precise_Value".to_string(),
                 address: 40020,
                 data_type: DataType::F64,
                 access: AccessRight::ReadWrite,
+                unit: None,
             },
         ]
     }
@@ -1231,11 +1237,13 @@ mod tests {
                 name: "Pressure".to_string(),
                 address: 30001,
                 data_type: DataType::U16,
+                unit: None,
             },
             InputRegisterDescription {
                 name: "Flow_Rate".to_string(),
                 address: 30002,
                 data_type: DataType::F32,
+                unit: None,
             },
         ]
     }

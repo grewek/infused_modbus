@@ -440,6 +440,7 @@ mod tests {
                 address: 0,
                 data_type: protocol::device_description::DataType::U16,
                 access: AccessRight::ReadWrite,
+                unit: None,
             }],
             coils: vec![CoilDescription {
                 name: "Motor_Running".to_string(),

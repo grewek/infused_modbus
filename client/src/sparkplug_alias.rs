@@ -112,6 +112,7 @@ mod tests {
                 address: 0,
                 data_type: DataType::U16,
                 access: AccessRight::ReadOnly,
+                unit: None,
             }],
             coils: vec![CoilDescription {
                 name: coil_name.to_string(),
@@ -125,6 +126,7 @@ mod tests {
                 name: "Flow_Rate".to_string(),
                 address: 0,
                 data_type: DataType::F32,
+                unit: None,
             }],
             file_records: vec![FileRecordDescription {
                 file_number: 4,
