@@ -2,9 +2,7 @@
 //! `EdgeNodeConnection::dcmd_receiver` by `client::edge_node`, keyed by
 //! `device_id`) into `StagedValue`s and forwards them into the exact same
 //! `(machine_name, HashMap<String, StagedValue>)` channel `client::
-//! transaction_consumer` already reads from — the same "new frontend, zero
-//! changes to the Modbus-facing half" bet that held for `datafs::flatfile`
-//! (see CLAUDE.md).
+//! transaction_consumer` already reads from.
 
 use crate::connection::Connection;
 use crate::edge_node::EdgeNodeConnection;

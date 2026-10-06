@@ -15,87 +15,73 @@ and [`CLAUDE.md`](../CLAUDE.md) for the design behind any of this.
 - [`server-options.toml`](server-options.toml) — enables exactly the
   function codes `device-description.toml`'s data needs. Without
   `--server-options`, every function code defaults to disabled.
-- [`fuse-permissions.toml`](fuse-permissions.toml) — optional; shown here
-  purely to demonstrate the format (locks `transactions/` down to its
-  owner). Leave off `--fuse-permissions` entirely to skip this.
 
-Run from the repository root. Both commands below default to
-`--data-representation-layer files` — the same commands work identically
-with `--data-representation-layer fuse` appended, mounting a real FUSE
-filesystem instead of writing plain files; see [Directory
-permissions](../docs/directory-permissions.md) and `CLAUDE.md`'s
-"Pluggable data-representation layer" section for the difference.
+Both binaries expose their data over MQTT/Sparkplug B — see [MQTT
+(Sparkplug B) layer](../docs/mqtt-sparkplug.md) — so you'll need an
+already-running broker; [`mqtt-broker/`](mqtt-broker/README.md) has a
+disposable one for exactly this.
 
-## 1. Start the server
+## 1. Start a broker
 
 ```sh
-mkdir -p /tmp/infused-modbus-server
-cargo run -p server -- /tmp/infused-modbus-server examples/device-description.toml tcp://127.0.0.1:15020 --server-options examples/server-options.toml
+docker build -t infused-modbus-mqtt-broker examples/mqtt-broker
+docker run -d --name infused-modbus-mqtt-broker --network host \
+    --restart unless-stopped infused-modbus-mqtt-broker
 ```
 
-```
-Mounting infused_modbus server (Files) at /tmp/infused-modbus-server, serving via tcp://127.0.0.1:15020 — machines: PumpA, PumpB
-```
+See [`mqtt-broker/README.md`](mqtt-broker/README.md) for details/teardown.
 
-## 2. Start the client, in another terminal
+## 2. Start the server
 
 ```sh
-mkdir -p /tmp/infused-modbus-client
-cargo run -p client -- /tmp/infused-modbus-client examples/device-description.toml tcp://127.0.0.1:15020 1 500
+cargo run -p server -- examples/device-description.toml tcp://127.0.0.1:15020 --server-options examples/server-options.toml
+```
+
+```
+Starting infused_modbus server, serving via tcp://127.0.0.1:15020 — machines: PumpA, PumpB
+Data socket listening at server-data.sock
+```
+
+## 3. Start the client, in another terminal
+
+```sh
+cargo run -p client -- examples/device-description.toml tcp://127.0.0.1:15020 1 500 --mqtt-broker 127.0.0.1:1883
 ```
 
 The client fetches the device description from the server itself over FC 43
 (printing progress as it does), so it ends up with the identical two-machine
 setup without needing to trust its own local copy of the TOML stayed in
-sync — see [Device description discovery](../docs/filesystem.md#device-description-discovery-fc-43).
+sync — see [Device description discovery](../docs/getting-started.md#device-description-discovery-fc-43).
+Nobody has subscribed to either machine yet, so both are birthed (`DBIRTH`)
+with placeholder values but neither is actually polled over Modbus — see
+[Subscribe/Unsubscribe](../docs/mqtt-sparkplug.md#subscribeunsubscribe-activating-a-machine-at-runtime).
 
-## 3. Poke at it, in a third terminal
+## 4. Poke at it, in a third terminal
 
-Every machine gets its own top-level directory — `PumpA/`, `PumpB/` — see
-[Interacting with the filesystem](../docs/filesystem.md)
-for the full picture. A few things to try:
+The server's own writes are the easiest to try from a plain shell — its
+local data socket speaks a small text protocol, no Sparkplug decoding
+needed:
 
 ```sh
-# Write directly on the server (applies immediately, no staging) —
 # Setpoint is read_write, so this works:
-echo 72 > /tmp/infused-modbus-server/PumpA/holding-registers/Setpoint
-echo 1 > /tmp/infused-modbus-server/PumpA/coils/Motor_Running
-
-# ...and see it show up on the client's mirror after its next poll (< 1s later):
-cat /tmp/infused-modbus-client/PumpA/holding-registers/Setpoint
+echo "SET PumpA Setpoint 72" | socat - UNIX-CONNECT:server-data.sock
+echo "GET PumpA Setpoint" | socat - UNIX-CONNECT:server-data.sock
 
 # Tank_Temperature is declared read_only — a real device would be the only
-# thing that ever sets it, so even the server itself refuses a direct write.
-# Under --data-representation-layer fuse the kernel rejects the write
-# outright (echo itself fails with "Permission denied"); under files (the
-# default here) a real filesystem has no such hook, so echo succeeds but
-# the rejected value is discarded and the file goes back to empty within
-# a couple hundred milliseconds — same end state, briefer window either way:
-echo 72 > /tmp/infused-modbus-server/PumpA/holding-registers/Tank_Temperature
-sleep 1
-cat /tmp/infused-modbus-server/PumpA/holding-registers/Tank_Temperature        # empty — nothing has set it
-
-# Stage and commit a write from the client — this actually round-trips
-# over the wire to the server and back:
-echo 55 > /tmp/infused-modbus-client/PumpA/transactions/Stop_Process
-touch /tmp/infused-modbus-client/PumpA/transactions/TRANSACTION_END
-cat /tmp/infused-modbus-client/PumpA/report/Stop_Process     # OK, or FAILED: <reason>
-cat /tmp/infused-modbus-server/PumpA/holding-registers/Stop_Process   # 55
-
-# A machine's server-id, mirrored read-only on the client:
-cat /tmp/infused-modbus-client/PumpA/server-id               # infused_modbus-pump-a
-
-# PumpB is independent of PumpA — same directory shape, different Unit ID:
-echo 1 > /tmp/infused-modbus-server/PumpB/coils/Motor_Running
-cat /tmp/infused-modbus-client/PumpB/coils/Motor_Running
-
-# An unconfigured machine name simply doesn't exist:
-ls /tmp/infused-modbus-client/PumpC                          # No such file or directory
+# thing that ever sets it, so even the server itself refuses this:
+echo "SET PumpA Tank_Temperature 72" | socat - UNIX-CONNECT:server-data.sock   # ERROR ...
 ```
 
-## 4. Shut down
+Sparkplug B payloads are protobuf-encoded, not human-readable through a
+plain MQTT client — to actually watch/send decoded traffic (subscribe a
+machine, see `DDATA` as values change, send a `DCMD` write from the client
+side), use [`nodered/`](nodered/README.md)'s generic listener/sender tab
+against a real, independent Sparkplug B implementation.
 
-Ctrl+C (or `SIGTERM`) either process — both clean up after themselves (unmounting, or removing the `files` root directory) on their own.
+## 5. Shut down
+
+Ctrl+C (or `SIGTERM`) either `client` or `server` — both disconnect
+cleanly from the broker on their own.
 
 ## Trying it over RTU or TLS instead
 
@@ -106,16 +92,6 @@ works identically regardless of transport. See
 [Connecting over TLS](../docs/tls.md) for the details
 (TLS additionally needs an approval step before the client's first
 connection succeeds).
-
-## Trying the MQTT/Sparkplug B layer instead
-
-`client` doesn't run an MQTT broker itself — see
-[`mqtt-broker/`](mqtt-broker/README.md) for a disposable one to test
-against, then swap `--data-representation-layer mqtt --mqtt-broker
-127.0.0.1:1883` into the `client` command above. See
-[`nodered/`](nodered/README.md) for a Docker-based Node-RED test rig to
-watch/send Sparkplug B traffic from a real, independent Sparkplug
-implementation.
 
 ## A custom Modbus server built on `ServerHandle`
 

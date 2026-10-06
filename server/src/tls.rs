@@ -6,7 +6,6 @@
 // built from this config) works with it as-is. No new serve-loop needed.
 
 use crate::client_trust::ApprovedClients;
-use datafs::client_trust::ClientTrustState;
 use protocol::tls::{Fingerprint, Identity};
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::WebPkiSupportedAlgorithms;
@@ -86,22 +85,13 @@ impl SignatureVerification {
 #[derive(Debug)]
 struct ApprovedFingerprintClientCertVerifier {
     approved: Arc<Mutex<ApprovedClients>>,
-    // Every attempt is logged here for `client-trust/connection_attempts/`
-    // to display (O3) — the *same* state the FUSE side reads, not a
-    // separate copy (see server::main's own comment on why: this is what
-    // closes O2's "known gap").
-    client_trust: Arc<Mutex<ClientTrustState>>,
     signature_verification: SignatureVerification,
 }
 
 impl ApprovedFingerprintClientCertVerifier {
-    fn new(
-        approved: Arc<Mutex<ApprovedClients>>,
-        client_trust: Arc<Mutex<ClientTrustState>>,
-    ) -> Self {
+    fn new(approved: Arc<Mutex<ApprovedClients>>) -> Self {
         Self {
             approved,
-            client_trust,
             signature_verification: SignatureVerification::new(),
         }
     }
@@ -151,12 +141,11 @@ impl ClientCertVerifier for ApprovedFingerprintClientCertVerifier {
         let Some(presented_fingerprint) = fingerprint_of_certificate(end_entity) else {
             // No fingerprint to log here — parsing failed before one could
             // be computed at all, a genuinely different failure mode from
-            // "valid certificate, just not approved" (see `log_rejected`'s
-            // own doc comment for why this goes there, not `log_pending`).
-            self.client_trust
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .log_rejected(format!("{} malformed certificate", unix_timestamp()));
+            // "valid certificate, just not approved" (rejected below).
+            eprintln!(
+                "[client-trust] {} rejected: malformed certificate",
+                unix_timestamp()
+            );
             return Err(TlsError::InvalidCertificate(
                 rustls::CertificateError::BadEncoding,
             ));
@@ -166,17 +155,21 @@ impl ClientCertVerifier for ApprovedFingerprintClientCertVerifier {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains(&presented_fingerprint);
-        let mut client_trust = self
-            .client_trust
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if is_approved {
-            client_trust.log_approved(format!("{} {presented_fingerprint}", unix_timestamp()));
-            drop(client_trust);
+            eprintln!(
+                "[client-trust] {} approved: {presented_fingerprint}",
+                unix_timestamp()
+            );
             Ok(ClientCertVerified::assertion())
         } else {
-            client_trust.log_pending(format!("{} {presented_fingerprint}", unix_timestamp()));
-            drop(client_trust);
+            // Logged as "pending", not "rejected" — a technician might
+            // still approve this fingerprint later via `server admin
+            // approve`, a genuinely different outcome from a malformed
+            // certificate that can never be approved as-is.
+            eprintln!(
+                "[client-trust] {} pending (not approved): {presented_fingerprint}",
+                unix_timestamp()
+            );
             Err(TlsError::General(format!(
                 "client TLS fingerprint {presented_fingerprint} is not approved"
             )))
@@ -222,13 +215,11 @@ fn unix_timestamp() -> u64 {
 /// Builds a `rustls::ServerConfig` presenting `identity`. **Requires** a
 /// client certificate (mTLS on) and checks it against `approved` — see
 /// `ApprovedFingerprintClientCertVerifier`. Fail-closed: an empty
-/// `approved` set (the default until Milestone P's admin channel adds
-/// something) rejects every client. Every attempt is also logged into
-/// `client_trust` (`client-trust/connection_attempts/*.log`, Milestone O3).
+/// `approved` set (the default until the admin channel adds something)
+/// rejects every client. Every attempt is also logged to stderr.
 pub fn build_server_config(
     identity: &Identity,
     approved: Arc<Mutex<ApprovedClients>>,
-    client_trust: Arc<Mutex<ClientTrustState>>,
 ) -> Result<ServerConfig, String> {
     ensure_crypto_provider_installed();
     let certificate = CertificateDer::from(identity.certificate_der.clone());
@@ -237,7 +228,6 @@ pub fn build_server_config(
     ServerConfig::builder()
         .with_client_cert_verifier(Arc::new(ApprovedFingerprintClientCertVerifier::new(
             approved,
-            client_trust,
         )))
         .with_single_cert(vec![certificate], private_key)
         .map_err(|error| error.to_string())
@@ -338,26 +328,18 @@ mod tests {
         }
     }
 
-    fn test_client_trust() -> Arc<Mutex<ClientTrustState>> {
-        Arc::new(Mutex::new(ClientTrustState::new()))
-    }
-
     #[test]
     fn builds_a_server_config_from_a_generated_identity() {
         let identity = protocol::tls::generate_self_signed_identity().unwrap();
         let approved = Arc::new(Mutex::new(ApprovedClients::new()));
-        assert!(build_server_config(&identity, approved, test_client_trust()).is_ok());
+        assert!(build_server_config(&identity, approved).is_ok());
     }
 
     #[tokio::test]
     async fn accept_with_timeout_returns_none_if_the_peer_never_completes_the_handshake() {
         let identity = protocol::tls::generate_self_signed_identity().unwrap();
-        let server_config = build_server_config(
-            &identity,
-            Arc::new(Mutex::new(ApprovedClients::new())),
-            test_client_trust(),
-        )
-        .unwrap();
+        let server_config =
+            build_server_config(&identity, Arc::new(Mutex::new(ApprovedClients::new()))).unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
         // Nothing is ever written to this end, so the acceptor never even
@@ -377,12 +359,8 @@ mod tests {
         let client_identity = protocol::tls::generate_self_signed_identity().unwrap();
         let mut approved_clients = ApprovedClients::new();
         approved_clients.insert(Fingerprint::of(&client_identity.public_key_der));
-        let server_config = build_server_config(
-            &identity,
-            Arc::new(Mutex::new(approved_clients)),
-            test_client_trust(),
-        )
-        .unwrap();
+        let server_config =
+            build_server_config(&identity, Arc::new(Mutex::new(approved_clients))).unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -422,10 +400,8 @@ mod tests {
         let fingerprint = Fingerprint::of(&identity.public_key_der);
         let mut approved_clients = ApprovedClients::new();
         approved_clients.insert(fingerprint);
-        let verifier = ApprovedFingerprintClientCertVerifier::new(
-            Arc::new(Mutex::new(approved_clients)),
-            test_client_trust(),
-        );
+        let verifier =
+            ApprovedFingerprintClientCertVerifier::new(Arc::new(Mutex::new(approved_clients)));
 
         let end_entity = CertificateDer::from(identity.certificate_der);
         let result = verifier.verify_client_cert(&end_entity, &[], UnixTime::now());
@@ -437,11 +413,10 @@ mod tests {
     fn approved_fingerprint_client_cert_verifier_rejects_an_unapproved_fingerprint() {
         let identity = protocol::tls::generate_self_signed_identity().unwrap();
         // Empty — nothing approved, matching the fail-closed default before
-        // Milestone P's admin channel ever inserts anything.
-        let verifier = ApprovedFingerprintClientCertVerifier::new(
-            Arc::new(Mutex::new(ApprovedClients::new())),
-            test_client_trust(),
-        );
+        // the admin channel ever inserts anything.
+        let verifier = ApprovedFingerprintClientCertVerifier::new(Arc::new(Mutex::new(
+            ApprovedClients::new(),
+        )));
 
         let end_entity = CertificateDer::from(identity.certificate_der);
         let result = verifier.verify_client_cert(&end_entity, &[], UnixTime::now());
@@ -456,86 +431,13 @@ mod tests {
         let other_identity = protocol::tls::generate_self_signed_identity().unwrap();
         let mut approved_clients = ApprovedClients::new();
         approved_clients.insert(Fingerprint::of(&approved_identity.public_key_der));
-        let verifier = ApprovedFingerprintClientCertVerifier::new(
-            Arc::new(Mutex::new(approved_clients)),
-            test_client_trust(),
-        );
+        let verifier =
+            ApprovedFingerprintClientCertVerifier::new(Arc::new(Mutex::new(approved_clients)));
 
         let end_entity = CertificateDer::from(other_identity.certificate_der);
         let result = verifier.verify_client_cert(&end_entity, &[], UnixTime::now());
 
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn approved_attempt_is_logged_to_the_approved_log() {
-        let identity = protocol::tls::generate_self_signed_identity().unwrap();
-        let fingerprint = Fingerprint::of(&identity.public_key_der);
-        let mut approved_clients = ApprovedClients::new();
-        approved_clients.insert(fingerprint);
-        let client_trust = test_client_trust();
-        let verifier = ApprovedFingerprintClientCertVerifier::new(
-            Arc::new(Mutex::new(approved_clients)),
-            Arc::clone(&client_trust),
-        );
-
-        let end_entity = CertificateDer::from(identity.certificate_der);
-        verifier
-            .verify_client_cert(&end_entity, &[], UnixTime::now())
-            .unwrap();
-
-        let state = client_trust.lock().unwrap();
-        assert!(
-            state
-                .approved_log_content()
-                .contains(&fingerprint.to_string())
-        );
-        assert_eq!(state.pending_log_content(), "");
-        assert_eq!(state.rejected_log_content(), "");
-    }
-
-    #[test]
-    fn unapproved_attempt_is_logged_to_the_pending_log() {
-        let identity = protocol::tls::generate_self_signed_identity().unwrap();
-        let fingerprint = Fingerprint::of(&identity.public_key_der);
-        let client_trust = test_client_trust();
-        let verifier = ApprovedFingerprintClientCertVerifier::new(
-            Arc::new(Mutex::new(ApprovedClients::new())),
-            Arc::clone(&client_trust),
-        );
-
-        let end_entity = CertificateDer::from(identity.certificate_der);
-        // Rejected, but logged as "pending" — a technician might still
-        // approve it later; see `ClientTrustState::log_pending`'s own doc
-        // comment for why this is distinct from `log_rejected`.
-        let _ = verifier.verify_client_cert(&end_entity, &[], UnixTime::now());
-
-        let state = client_trust.lock().unwrap();
-        assert!(
-            state
-                .pending_log_content()
-                .contains(&fingerprint.to_string())
-        );
-        assert_eq!(state.approved_log_content(), "");
-        assert_eq!(state.rejected_log_content(), "");
-    }
-
-    #[test]
-    fn unparseable_certificate_is_logged_to_the_rejected_log() {
-        let client_trust = test_client_trust();
-        let verifier = ApprovedFingerprintClientCertVerifier::new(
-            Arc::new(Mutex::new(ApprovedClients::new())),
-            Arc::clone(&client_trust),
-        );
-
-        let bogus_end_entity = CertificateDer::from(b"not a real certificate".to_vec());
-        let result = verifier.verify_client_cert(&bogus_end_entity, &[], UnixTime::now());
-
-        assert!(result.is_err());
-        let state = client_trust.lock().unwrap();
-        assert!(!state.rejected_log_content().is_empty());
-        assert_eq!(state.approved_log_content(), "");
-        assert_eq!(state.pending_log_content(), "");
     }
 
     #[tokio::test]
@@ -548,7 +450,7 @@ mod tests {
         let mut approved_clients = ApprovedClients::new();
         approved_clients.insert(Fingerprint::of(&client_identity.public_key_der));
         let approved = Arc::new(Mutex::new(approved_clients));
-        let server_config = build_server_config(&identity, approved, test_client_trust()).unwrap();
+        let server_config = build_server_config(&identity, approved).unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -652,7 +554,7 @@ mod tests {
         let mut approved_clients = ApprovedClients::new();
         approved_clients.insert(client_fingerprint);
         let approved = Arc::new(Mutex::new(approved_clients));
-        let server_config = build_server_config(&identity, approved, test_client_trust()).unwrap();
+        let server_config = build_server_config(&identity, approved).unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -689,7 +591,7 @@ mod tests {
         // Empty on purpose — this test is about presenting *no* certificate
         // at all, which fails regardless of what's approved.
         let approved = Arc::new(Mutex::new(ApprovedClients::new()));
-        let server_config = build_server_config(&identity, approved, test_client_trust()).unwrap();
+        let server_config = build_server_config(&identity, approved).unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -746,7 +648,7 @@ mod tests {
                 .public_key_der,
         ));
         let approved = Arc::new(Mutex::new(approved_clients));
-        let server_config = build_server_config(&identity, approved, test_client_trust()).unwrap();
+        let server_config = build_server_config(&identity, approved).unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

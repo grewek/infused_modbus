@@ -1,10 +1,9 @@
-// Modbus master: mounts a FUSE projection of a device description at
-// `mountpoint`, backed by a real device reachable over TCP or RTU (see
-// `<connection>` below). Staging a transaction and creating
-// TRANSACTION_END sends the real write(s) to that device;
-// `holding-registers/`/`report/` only update once the device actually
-// confirms them (see CLAUDE.md's "TRANSACTION_END confirmation
-// semantics").
+// Modbus master: talks to a real device reachable over TCP or RTU (see
+// `<connection>` below) and exposes its data as a Sparkplug B Edge Node
+// over an external MQTT broker (see CLAUDE.md's "MQTT (Sparkplug B)
+// representation layer" section) — no filesystem of any kind. A write
+// arrives as a Sparkplug DCMD and is confirmed against the real device
+// before anything is reported back as succeeded.
 //
 // The device description itself is preferably fetched from the server
 // over the wire (FC 43 / MEI 0x0E — see client/src/device_identification.rs)
@@ -14,31 +13,7 @@
 // otherwise fails.
 //
 // Usage:
-//   cargo run -p client -- <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files] [--machines <name1,name2,...>]
-//
-// --machines restricts which configured machines are mounted, under "fuse"
-// and "files" only — absent, every machine is mounted (the original
-// default). Under "mqtt", machine activation happens at runtime via a
-// Subscribe/Unsubscribe NCMD instead (see CLAUDE.md's "Planned: dynamic
-// per-machine subscription via Sparkplug B"), so this flag has no effect
-// there.
-//
-// --data-representation-layer picks how the machines' data is exposed:
-// "files" (the default, see CLAUDE.md's "Planned: pluggable data-
-// representation layer") writes real files under <root>, updated via
-// atomic rename() and a background inotify watch on transactions/ — no
-// FUSE driver involved at all. "fuse" mounts <root> as a synthetic FUSE
-// filesystem, this project's original mechanism. Both present the exact
-// same directory shape at <root>.
-//
-// --fuse-permissions sets custom mode/uid/gid for holding-registers/,
-// transactions/, report/, and coils/ (see datafs::permissions) — under
-// "fuse", enforced by the kernel via the `default_permissions` mount
-// option; under "files", applied as real chmod/chown on the underlying
-// directories (datafs::flatfile::apply_directory_permissions). Without
-// it, every directory keeps its historical hardcoded behavior (mode
-// 0o755, owned by whichever uid/gid made a given FUSE request, or the
-// process's own real uid/gid under "files").
+//   cargo run -p client -- <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--mqtt-broker <host:port>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>] [--mqtt-primary-host-id <id>]
 //
 // <connection> is one of:
 //   tcp://<address:port>                e.g. tcp://127.0.0.1:502
@@ -74,16 +49,14 @@
 use client::connection::Connection;
 use client::device_identification::fetch_device_description;
 use client::edge_node::connect_edge_node;
-use client::polling::spawn_machine_polling_task;
 use client::reconnect::{ReconnectSignal, run_reconnect_loop};
 use client::sparkplug_alias::AliasAllocator;
 use client::sparkplug_command::{run_dcmd_forwarder, run_ncmd_handler};
 use client::sparkplug_translator::build_machine_metrics_null_placeholders;
 use client::subscription_state::SubscriptionState;
 use client::transaction_consumer::{MachineTransactionConfig, run_transaction_consumer};
-use datafs::filesystem::{InfusedFilesystem, WriteMode};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
-use protocol::device_description::{DeviceDescription, MachineDescription};
+use protocol::device_description::DeviceDescription;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
@@ -109,78 +82,30 @@ const MQTT_BD_SEQ_PATH: &str = "client-mqtt-bdseq";
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: client <root> <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--fuse-permissions <fuse-permissions.toml>] [--data-representation-layer fuse|files|mqtt] [--machines <name1,name2,...>] [--mqtt-broker <host:port>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>] [--mqtt-primary-host-id <id>]\n\
+        "Usage: client <device-description.toml> <connection> [unit-id] [poll-interval-ms] [--expect-server-fingerprint <fingerprint>] [--mqtt-broker <host:port>] [--mqtt-group-id <id>] [--mqtt-edge-node-id <id>] [--mqtt-primary-host-id <id>]\n\
          <connection> is tcp://<address:port>, tls+tcp://<address:port>, or rtu://<serial-path>:<baud-rate>\n\
          --expect-server-fingerprint pins the server's TLS identity (tls+tcp:// only) — \
          without it, the server's identity is not verified at all (see CLAUDE.md's TLS design).\n\
-         --fuse-permissions sets custom mode/uid/gid per top-level directory — \
-         without it, every directory keeps its historical hardcoded behavior. Ignored under \
-         --data-representation-layer mqtt, which has no directories to permission.\n\
-         --data-representation-layer picks fuse (a synthetic FUSE mount), files \
-         (real files, the default), or mqtt (a Sparkplug B Edge Node connected to an external \
-         MQTT broker — see CLAUDE.md's \"MQTT (Sparkplug B) representation layer\"). \
-         <root> is ignored under mqtt, which has nothing to mount/write to disk.\n\
-         --machines <name1,name2,...> restricts which configured machines are mounted, under \
-         fuse/files only — without it, every machine is mounted. Under mqtt, machine activation \
-         happens at runtime via a Subscribe/Unsubscribe NCMD instead, so this flag has no \
-         effect there.\n\
          --mqtt-broker <host:port> is the already-running MQTT broker this Edge Node connects \
-         to (e.g. Mosquitto) — required under --data-representation-layer mqtt, this project \
-         does not run a broker itself. See examples/mqtt-broker for a disposable broker to test \
-         against.\n\
+         to (e.g. Mosquitto) — required, this project does not run a broker itself. See \
+         examples/mqtt-broker for a disposable broker to test against.\n\
          --mqtt-group-id/--mqtt-edge-node-id set this Edge Node's Sparkplug B identity \
          (defaults: {DEFAULT_MQTT_GROUP_ID:?}/{DEFAULT_MQTT_EDGE_NODE_ID:?} — override \
          --mqtt-edge-node-id for any deployment running more than one client instance against \
-         the same broker/host application, since it must be unique per Edge Node). mqtt layer \
-         only.\n\
+         the same broker/host application, since it must be unique per Edge Node).\n\
          --mqtt-primary-host-id <id> makes this Edge Node wait for the named Primary Host \
          Application to come online (via its retained spBv1.0/STATE/<id> message) before \
          publishing NBIRTH — without it, NBIRTH is published immediately, with no Primary Host \
-         awareness at all (the common case). mqtt layer only."
+         awareness at all (the common case)."
     );
     std::process::exit(1);
 }
 
-/// Pulls `--data-representation-layer <fuse|files|mqtt>` out of `args` if
-/// present (order-independent, same shape as `--fuse-permissions`), leaving
-/// the rest of `args` untouched. Absent entirely, defaults to `Files` — a
-/// deliberate breaking change to this project's original all-FUSE default,
-/// same "explicit/simple over preserving existing behavior while nothing
-/// is deployed" stance as every other breaking default in this project.
-fn extract_representation_layer(args: &mut Vec<String>) -> RepresentationLayer {
-    let Some(flag_index) = args
-        .iter()
-        .position(|arg| arg == "--data-representation-layer")
-    else {
-        return RepresentationLayer::Files;
-    };
-    if flag_index + 1 >= args.len() {
-        panic!("--data-representation-layer requires a value (fuse, files, or mqtt)");
-    }
-    args.remove(flag_index);
-    let value = args.remove(flag_index);
-    match value.as_str() {
-        "fuse" => RepresentationLayer::Fuse,
-        "files" => RepresentationLayer::Files,
-        "mqtt" => RepresentationLayer::Mqtt,
-        other => panic!(
-            "invalid --data-representation-layer value {other:?}: expected fuse, files, or mqtt"
-        ),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RepresentationLayer {
-    Fuse,
-    Files,
-    Mqtt,
-}
-
 /// Pulls `--mqtt-broker <host:port>` out of `args` if present, leaving the
 /// rest of `args` untouched. Absent entirely, `None` — the caller rejects
-/// that under `--data-representation-layer mqtt`, since this project no
-/// longer runs a broker itself (see CLAUDE.md's "MQTT (Sparkplug B)
-/// representation layer" for why the embedded broker was removed).
+/// that, since this project no longer runs a broker itself (see
+/// CLAUDE.md's "MQTT (Sparkplug B) representation layer" for why the
+/// embedded broker was removed).
 fn extract_mqtt_broker(args: &mut Vec<String>) -> Option<(String, u16)> {
     let flag_index = args.iter().position(|arg| arg == "--mqtt-broker")?;
     if flag_index + 1 >= args.len() {
@@ -228,28 +153,6 @@ fn extract_mqtt_primary_host_id(args: &mut Vec<String>) -> Option<String> {
     Some(args.remove(flag_index))
 }
 
-/// Pulls `--machines <name1,name2,...>` out of `args` if present, leaving
-/// the rest of `args` untouched. Absent entirely, `None` — every configured
-/// machine is mounted, the original all-machines default. Only meaningful
-/// under `fuse`/`files` (see CLAUDE.md's "Planned: dynamic per-machine
-/// subscription via Sparkplug B" — under `mqtt`, machine selection happens
-/// at runtime via a Subscribe/Unsubscribe NCMD instead, so this flag has no
-/// effect there).
-fn extract_machines(args: &mut Vec<String>) -> Option<Vec<String>> {
-    let flag_index = args.iter().position(|arg| arg == "--machines")?;
-    if flag_index + 1 >= args.len() {
-        panic!("--machines requires a value (comma-separated machine names)");
-    }
-    args.remove(flag_index);
-    let value = args.remove(flag_index);
-    Some(
-        value
-            .split(',')
-            .map(|name| name.trim().to_string())
-            .collect(),
-    )
-}
-
 /// Pulls `--expect-server-fingerprint <value>` out of `args` if present
 /// (order-independent relative to the positional arguments), leaving the
 /// rest of `args` untouched.
@@ -267,49 +170,6 @@ fn extract_expected_server_fingerprint(
     Some(value.parse().unwrap_or_else(|error: String| {
         panic!("invalid --expect-server-fingerprint value: {error}")
     }))
-}
-
-/// Pulls `--fuse-permissions <path>` out of `args` if present
-/// (order-independent, same shape as `--expect-server-fingerprint`),
-/// leaving the rest of `args` untouched. Absent entirely, every directory
-/// keeps its historical hardcoded behavior (`FusePermissions::default()`).
-fn extract_fuse_permissions(args: &mut Vec<String>) -> datafs::permissions::FusePermissions {
-    let Some(flag_index) = args.iter().position(|arg| arg == "--fuse-permissions") else {
-        return datafs::permissions::FusePermissions::default();
-    };
-    if flag_index + 1 >= args.len() {
-        panic!("--fuse-permissions requires a path");
-    }
-    args.remove(flag_index);
-    let path = args.remove(flag_index);
-    let toml_source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
-    datafs::permissions::FusePermissions::parse(&toml_source)
-        .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
-}
-
-/// Filters `machines` down to `--machines`'s allowlist, if one was given.
-/// `None` (the flag was absent) leaves `machines` untouched — every
-/// configured machine is mounted, the original default. An allowlist entry
-/// matching no configured machine is logged and skipped, not a hard error —
-/// same "log and drop" precedent `client::transaction_consumer` already
-/// uses for an unrecognized machine name on the write path.
-fn apply_machines_allowlist(
-    machines: Vec<MachineDescription>,
-    allowlist: Option<&[String]>,
-) -> Vec<MachineDescription> {
-    let Some(allowlist) = allowlist else {
-        return machines;
-    };
-    for name in allowlist {
-        if !machines.iter().any(|machine| &machine.name == name) {
-            eprintln!("--machines: unknown machine {name:?}, ignoring it");
-        }
-    }
-    machines
-        .into_iter()
-        .filter(|machine| allowlist.contains(&machine.name))
-        .collect()
 }
 
 fn open_connection(
@@ -348,8 +208,6 @@ fn open_connection(
 fn main() {
     let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
     let expected_server_fingerprint = extract_expected_server_fingerprint(&mut raw_args);
-    let fuse_permissions = extract_fuse_permissions(&mut raw_args);
-    let representation_layer = extract_representation_layer(&mut raw_args);
     let mqtt_broker = extract_mqtt_broker(&mut raw_args);
     let mqtt_group_id =
         extract_string_flag(&mut raw_args, "--mqtt-group-id", DEFAULT_MQTT_GROUP_ID);
@@ -359,11 +217,7 @@ fn main() {
         DEFAULT_MQTT_EDGE_NODE_ID,
     );
     let mqtt_primary_host_id = extract_mqtt_primary_host_id(&mut raw_args);
-    let machines_allowlist = extract_machines(&mut raw_args);
     let mut args = raw_args.into_iter();
-    let Some(root) = args.next() else {
-        usage();
-    };
     let Some(device_description_path) = args.next() else {
         usage();
     };
@@ -418,19 +272,8 @@ fn main() {
             println!("Using the local device description ({device_description_path}).");
             local_toml_source
         });
-    let mut description = DeviceDescription::parse(&toml_source)
+    let description = DeviceDescription::parse(&toml_source)
         .unwrap_or_else(|error| panic!("failed to parse device description: {error}"));
-    if representation_layer == RepresentationLayer::Mqtt {
-        if machines_allowlist.is_some() {
-            println!(
-                "--machines is ignored under --data-representation-layer mqtt — machine \
-                 activation happens at runtime via a Subscribe/Unsubscribe NCMD instead."
-            );
-        }
-    } else {
-        description.machines =
-            apply_machines_allowlist(description.machines, machines_allowlist.as_deref());
-    }
 
     // Shared, not owned outright: the polling loop(s) and the transaction
     // consumer both need to talk to the device over this same connection,
@@ -497,29 +340,10 @@ fn main() {
         );
     });
 
-    // One polling task per machine — `run_polling_loop` is already fully
-    // parameterized per-machine (its own unit_id/descriptions/stores), so
-    // multi-machine polling is just spawning it once per configured
-    // machine, all sharing the one connection. Skipped entirely under mqtt:
-    // a machine's polling task only starts once a Host Application actually
+    // A machine's polling task only starts once a Host Application actually
     // subscribes to it (see CLAUDE.md's "Planned: dynamic per-machine
-    // subscription via Sparkplug B") — fuse/files have no such concept and
-    // keep mounting/polling every configured machine unconditionally, same
-    // as before.
-    if representation_layer != RepresentationLayer::Mqtt {
-        for machine in &description.machines {
-            let stores = &machine_stores[&machine.name];
-            spawn_machine_polling_task(
-                machine,
-                stores,
-                Arc::clone(&connection),
-                poll_interval,
-                POLL_TIMEOUT,
-                Arc::clone(&reconnect_signal),
-                runtime.handle(),
-            );
-        }
-    }
+    // subscription via Sparkplug B") — spawned on demand by
+    // `run_ncmd_handler`'s subscribe handling below, never eagerly here.
 
     let machine_names: Vec<&str> = description
         .machines
@@ -527,256 +351,109 @@ fn main() {
         .map(|machine| machine.name.as_str())
         .collect();
     println!(
-        "Starting infused_modbus ({representation_layer:?}), connected via {connection_string} — machines: {}",
+        "Starting infused_modbus, connected via {connection_string} — machines: {}",
         machine_names.join(", ")
     );
-    if representation_layer != RepresentationLayer::Mqtt {
-        std::fs::create_dir_all(&root).ok();
-        println!("Data root: {root}");
+
+    // This project doesn't run a broker itself — see CLAUDE.md's "MQTT
+    // (Sparkplug B) representation layer" for why the embedded broker was
+    // removed. examples/mqtt-broker has a disposable one for local testing.
+    let (broker_host, broker_port) =
+        mqtt_broker.unwrap_or_else(|| panic!("--mqtt-broker <host:port> is required"));
+
+    let bd_seq = client::bd_seq_persistence::next_bd_seq(std::path::Path::new(MQTT_BD_SEQ_PATH));
+    if let Some(host_id) = &mqtt_primary_host_id {
+        println!(
+            "Waiting for Primary Host Application {host_id:?} to come online before publishing NBIRTH..."
+        );
     }
+    let edge_node = Arc::new(runtime.block_on(connect_edge_node(
+        &broker_host,
+        broker_port,
+        &mqtt_group_id,
+        &mqtt_edge_node_id,
+        bd_seq,
+        mqtt_primary_host_id.as_deref(),
+    )));
+    println!(
+        "Sparkplug B Edge Node connected (group_id={mqtt_group_id:?}, edge_node_id={mqtt_edge_node_id:?}), broker at {broker_host}:{broker_port}"
+    );
 
-    match representation_layer {
-        RepresentationLayer::Fuse => {
-            let mut machine_stores = machine_stores;
-            let machines_for_fs: Vec<datafs::filesystem::MachineConfig> = description
-                .machines
-                .into_iter()
-                .map(|machine| {
-                    let stores = machine_stores
-                        .remove(&machine.name)
-                        .expect("machine_stores was built from the same machine list");
-                    datafs::filesystem::MachineConfig {
-                        name: machine.name,
-                        registers: machine.registers,
-                        coils: machine.coils,
-                        discrete_inputs: machine.discrete_inputs,
-                        input_registers: machine.input_registers,
-                        file_records: machine.file_records,
-                        store: stores.registers,
-                        coil_store: stores.coils,
-                        discrete_input_store: stores.discrete_inputs,
-                        input_register_store: stores.input_registers,
-                        file_record_store: stores.file_records,
-                        report: stores.report,
-                        permissions: fuse_permissions,
-                        server_id: machine.server_id,
-                    }
-                })
-                .collect();
+    let aliases = Arc::new(AliasAllocator::build(&description.machines));
 
-            let filesystem = InfusedFilesystem::new(
-                machines_for_fs,
-                transaction_sender,
-                WriteMode::Staged,
-                // client-trust/ only exists on the server — see CLAUDE.md's
-                // TLS design and datafs::client_trust::ClientTrustState.
-                None,
-            );
-            // spawn_mount (not the blocking mount()) so Ctrl+C/SIGTERM below
-            // can unmount cleanly instead of just killing the process and
-            // leaving a stale mountpoint behind. default_permissions makes
-            // the kernel actually enforce what getattr reports (see
-            // datafs::permissions) instead of every request being allowed
-            // regardless of mode/uid/gid.
-            let mut mount_config = fuser::Config::default();
-            mount_config.mount_options = vec![fuser::MountOption::DefaultPermissions];
-            let session = fuser::spawn_mount(filesystem, &root, &mount_config)
-                .unwrap_or_else(|error| panic!("mount failed: {error}"));
+    runtime
+        .block_on(edge_node.subscribe_ncmd())
+        .unwrap_or_else(|error| panic!("failed to subscribe to NCMD: {error}"));
 
-            wait_for_shutdown_signal(&runtime);
-
-            session
-                .umount_and_join()
-                .unwrap_or_else(|error| panic!("failed to unmount cleanly: {error}"));
-        }
-        RepresentationLayer::Files => {
-            let root_path = std::path::Path::new(&root);
-
-            let readers = datafs::flatfile::build_machine_readers(
-                root_path,
-                &description.machines,
-                &machine_stores,
-            );
-            for (name, reader) in &readers {
-                reader.initialize().unwrap_or_else(|error| {
-                    panic!("failed to initialize {name}'s data directory: {error}")
-                });
-                if let Err(error) = reader.apply_permissions(&fuse_permissions) {
-                    eprintln!("warning: failed to apply permissions for {name}: {error}");
-                }
-            }
-            for machine in &description.machines {
-                datafs::flatfile::write_machine_server_id_file(root_path, machine).unwrap_or_else(
-                    |error| panic!("failed to write {}'s server-id file: {error}", machine.name),
-                );
-            }
-
-            // One FlatfileTransactionWatcher per machine, each blocking its
-            // own dedicated thread on inotify — mirrors how the FUSE branch
-            // above gets its write path for free from the mounted
-            // filesystem's own write()/release() callbacks; here nothing
-            // calls into this crate at all until a watcher thread notices a
-            // real file event.
-            for machine in &description.machines {
-                let watcher = Arc::new(datafs::flatfile::build_machine_transaction_watcher(
-                    root_path,
-                    machine,
-                    transaction_sender.clone(),
-                ));
-                watcher.initialize().unwrap_or_else(|error| {
-                    panic!(
-                        "failed to initialize {}'s transactions/ directory: {error}",
-                        machine.name
-                    )
-                });
-                if let Err(error) = watcher.apply_permissions(fuse_permissions.transactions) {
-                    eprintln!(
-                        "warning: failed to apply permissions for {}'s transactions/: {error}",
-                        machine.name
-                    );
-                }
-                std::thread::spawn(move || {
-                    if let Err(error) = watcher.run_forever() {
-                        eprintln!("transactions/ watcher stopped: {error}");
-                    }
-                });
-            }
-
-            // No push-based change notification yet (see datafs::flatfile's
-            // own module doc comment) — a plain periodic re-render is the
-            // deliberately simple mechanism for now, purely local so it's
-            // never gated on a Modbus round trip.
-            runtime.spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_millis(200));
-                loop {
-                    interval.tick().await;
-                    for reader in readers.values() {
-                        let _ = reader.render_once();
-                    }
-                }
+    // Initial DBIRTH per machine, every metric an `is_null: true`
+    // placeholder — no real Modbus access has happened for any machine yet
+    // (polling only starts once a Host Application subscribes). The spec
+    // requires a DBIRTH to declare a Device's full metric shape up front, so
+    // every machine is birthed immediately regardless of whether anything
+    // ever subscribes to it (see CLAUDE.md's "Planned: dynamic per-machine
+    // subscription via Sparkplug B"). Each machine's own ChangeTracker is
+    // created fresh, seeded with this same placeholder baseline, once it's
+    // actually subscribed (see run_ncmd_handler's handle_subscribe) — not
+    // here, since nothing has a DDATA ticker running until then.
+    for machine in &description.machines {
+        runtime
+            .block_on(edge_node.subscribe_dcmd(&machine.name))
+            .unwrap_or_else(|error| {
+                panic!("failed to subscribe to DCMD for {}: {error}", machine.name)
             });
 
-            wait_for_shutdown_signal(&runtime);
+        let metrics = build_machine_metrics_null_placeholders(machine, &aliases);
 
-            // Mirrors the FUSE branch's unmount-on-shutdown: a real
-            // directory doesn't disappear on its own the way a FUSE mount
-            // does, so this has to remove it explicitly.
-            std::fs::remove_dir_all(&root)
-                .unwrap_or_else(|error| eprintln!("warning: failed to clean up {root}: {error}"));
-        }
-        RepresentationLayer::Mqtt => {
-            // This project doesn't run a broker itself — see CLAUDE.md's
-            // "MQTT (Sparkplug B) representation layer" for why the
-            // embedded broker was removed. examples/mqtt-broker has a
-            // disposable one for local testing.
-            let (broker_host, broker_port) = mqtt_broker.unwrap_or_else(|| {
-                panic!(
-                    "--mqtt-broker <host:port> is required under --data-representation-layer mqtt"
-                )
+        runtime
+            .block_on(edge_node.publish_dbirth(&machine.name, metrics))
+            .unwrap_or_else(|error| {
+                panic!("failed to publish DBIRTH for {}: {error}", machine.name)
             });
-
-            let bd_seq =
-                client::bd_seq_persistence::next_bd_seq(std::path::Path::new(MQTT_BD_SEQ_PATH));
-            if let Some(host_id) = &mqtt_primary_host_id {
-                println!(
-                    "Waiting for Primary Host Application {host_id:?} to come online before publishing NBIRTH..."
-                );
-            }
-            let edge_node = Arc::new(runtime.block_on(connect_edge_node(
-                &broker_host,
-                broker_port,
-                &mqtt_group_id,
-                &mqtt_edge_node_id,
-                bd_seq,
-                mqtt_primary_host_id.as_deref(),
-            )));
-            println!(
-                "Sparkplug B Edge Node connected (group_id={mqtt_group_id:?}, edge_node_id={mqtt_edge_node_id:?}), broker at {broker_host}:{broker_port}"
-            );
-
-            let aliases = Arc::new(AliasAllocator::build(&description.machines));
-
-            runtime
-                .block_on(edge_node.subscribe_ncmd())
-                .unwrap_or_else(|error| panic!("failed to subscribe to NCMD: {error}"));
-
-            // Initial DBIRTH per machine, every metric an `is_null: true`
-            // placeholder — no real Modbus access has happened for any
-            // machine yet (polling only starts once a Host Application
-            // subscribes, see the skipped polling-spawn loop above). The
-            // spec requires a DBIRTH to declare a Device's full metric shape
-            // up front, so every machine is birthed immediately regardless
-            // of whether anything ever subscribes to it (see CLAUDE.md's
-            // "Planned: dynamic per-machine subscription via Sparkplug B").
-            // Each machine's own ChangeTracker is created fresh, seeded with
-            // this same placeholder baseline, once it's actually subscribed
-            // (see run_ncmd_handler's handle_subscribe) — not here, since
-            // nothing has a DDATA ticker running until then.
-            for machine in &description.machines {
-                runtime
-                    .block_on(edge_node.subscribe_dcmd(&machine.name))
-                    .unwrap_or_else(|error| {
-                        panic!("failed to subscribe to DCMD for {}: {error}", machine.name)
-                    });
-
-                let metrics = build_machine_metrics_null_placeholders(machine, &aliases);
-
-                runtime
-                    .block_on(edge_node.publish_dbirth(&machine.name, metrics))
-                    .unwrap_or_else(|error| {
-                        panic!("failed to publish DBIRTH for {}: {error}", machine.name)
-                    });
-            }
-
-            // DCMD write path — forwards resolved writes into the exact
-            // same transaction_sender/transaction_consumer every other
-            // representation layer already uses.
-            {
-                let edge_node = Arc::clone(&edge_node);
-                let machines = description.machines.clone();
-                let aliases = Arc::clone(&aliases);
-                let transaction_sender = transaction_sender.clone();
-                runtime.spawn(async move {
-                    run_dcmd_forwarder(&edge_node, &machines, &aliases, &transaction_sender).await;
-                });
-            }
-
-            // Node Control/Rebirth + Subscribe handling — the sole consumer
-            // of `ncmd_receiver` (only one task may ever drain it). Subscribe
-            // is what actually starts a machine's real Modbus polling task
-            // and DDATA ticker now (see CLAUDE.md's "Planned: dynamic
-            // per-machine subscription via Sparkplug B") — neither runs
-            // unconditionally at startup anymore under mqtt.
-            let subscription_state = Arc::new(SubscriptionState::new());
-            {
-                let edge_node = Arc::clone(&edge_node);
-                let machines = description.machines.clone();
-                let stores_by_machine = machine_stores.clone();
-                let aliases = Arc::clone(&aliases);
-                let connection = Arc::clone(&connection);
-                let reconnect_signal = Arc::clone(&reconnect_signal);
-                let subscription_state = Arc::clone(&subscription_state);
-                let runtime_handle = runtime.handle().clone();
-                runtime.spawn(async move {
-                    run_ncmd_handler(
-                        edge_node,
-                        &machines,
-                        &stores_by_machine,
-                        aliases,
-                        connection,
-                        poll_interval,
-                        POLL_TIMEOUT,
-                        reconnect_signal,
-                        subscription_state,
-                        runtime_handle,
-                    )
-                    .await;
-                });
-            }
-
-            wait_for_shutdown_signal(&runtime);
-        }
     }
+
+    // DCMD write path — forwards resolved writes into
+    // transaction_sender/transaction_consumer.
+    {
+        let edge_node = Arc::clone(&edge_node);
+        let machines = description.machines.clone();
+        let aliases = Arc::clone(&aliases);
+        let transaction_sender = transaction_sender.clone();
+        runtime.spawn(async move {
+            run_dcmd_forwarder(&edge_node, &machines, &aliases, &transaction_sender).await;
+        });
+    }
+
+    // Node Control/Rebirth + Subscribe handling — the sole consumer of
+    // `ncmd_receiver` (only one task may ever drain it). Subscribe is what
+    // actually starts a machine's real Modbus polling task and DDATA ticker.
+    let subscription_state = Arc::new(SubscriptionState::new());
+    {
+        let edge_node = Arc::clone(&edge_node);
+        let machines = description.machines.clone();
+        let stores_by_machine = machine_stores.clone();
+        let aliases = Arc::clone(&aliases);
+        let connection = Arc::clone(&connection);
+        let reconnect_signal = Arc::clone(&reconnect_signal);
+        let subscription_state = Arc::clone(&subscription_state);
+        let runtime_handle = runtime.handle().clone();
+        runtime.spawn(async move {
+            run_ncmd_handler(
+                edge_node,
+                &machines,
+                &stores_by_machine,
+                aliases,
+                connection,
+                poll_interval,
+                POLL_TIMEOUT,
+                reconnect_signal,
+                subscription_state,
+                runtime_handle,
+            )
+            .await;
+        });
+    }
+
+    wait_for_shutdown_signal(&runtime);
 }
 
 fn wait_for_shutdown_signal(runtime: &tokio::runtime::Runtime) {
@@ -788,61 +465,4 @@ fn wait_for_shutdown_signal(runtime: &tokio::runtime::Runtime) {
             _ = sigterm.recv() => println!("Received SIGTERM, shutting down..."),
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use protocol::device_description::MemLayout;
-
-    fn test_machine(name: &str) -> MachineDescription {
-        MachineDescription {
-            name: name.to_string(),
-            unit_id: 1,
-            registers: Vec::new(),
-            coils: Vec::new(),
-            discrete_inputs: Vec::new(),
-            input_registers: Vec::new(),
-            file_records: Vec::new(),
-            mem_layout: MemLayout::Abcd,
-            input_register_mem_layout: MemLayout::Abcd,
-            server_id: None,
-        }
-    }
-
-    #[test]
-    fn apply_machines_allowlist_passes_everything_through_when_absent() {
-        let machines = vec![test_machine("PumpA"), test_machine("PumpB")];
-        let filtered = apply_machines_allowlist(machines.clone(), None);
-        assert_eq!(
-            filtered.iter().map(|m| &m.name).collect::<Vec<_>>(),
-            vec!["PumpA", "PumpB"]
-        );
-    }
-
-    #[test]
-    fn apply_machines_allowlist_keeps_only_listed_machines() {
-        let machines = vec![
-            test_machine("PumpA"),
-            test_machine("PumpB"),
-            test_machine("PumpC"),
-        ];
-        let allowlist = vec!["PumpC".to_string(), "PumpA".to_string()];
-        let filtered = apply_machines_allowlist(machines, Some(&allowlist));
-        assert_eq!(
-            filtered.iter().map(|m| &m.name).collect::<Vec<_>>(),
-            vec!["PumpA", "PumpC"]
-        );
-    }
-
-    #[test]
-    fn apply_machines_allowlist_ignores_an_unknown_name() {
-        let machines = vec![test_machine("PumpA")];
-        let allowlist = vec!["PumpA".to_string(), "DoesNotExist".to_string()];
-        let filtered = apply_machines_allowlist(machines, Some(&allowlist));
-        assert_eq!(
-            filtered.iter().map(|m| &m.name).collect::<Vec<_>>(),
-            vec!["PumpA"]
-        );
-    }
 }

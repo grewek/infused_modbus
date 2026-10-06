@@ -1,12 +1,11 @@
 # Disposable MQTT test broker
 
-`client --data-representation-layer mqtt` connects to an already-running
-MQTT broker (`--mqtt-broker <host:port>`) — it does not run one itself, see
-`CLAUDE.md`'s "Embedded MQTT broker removed" section for why. Any real
-deployment is expected to already have a broker; this container is just a
-disposable one for local testing, plain [Eclipse
-Mosquitto](https://mosquitto.org/) with anonymous access on 1883. No auth,
-no TLS — not for production use.
+`client` connects to an already-running MQTT broker (`--mqtt-broker
+<host:port>`) — it does not run one itself, see `CLAUDE.md`'s "Embedded
+MQTT broker removed" section for why. Any real deployment is expected to
+already have a broker; this container is just a disposable one for local
+testing, plain [Eclipse Mosquitto](https://mosquitto.org/) with anonymous
+access on 1883. No auth, no TLS — not for production use.
 
 ## 1. Build and run
 
@@ -24,8 +23,8 @@ project.
 ## 2. Point `client` at it
 
 ```sh
-cargo run -p client -- ignored examples/device-description.toml tcp://127.0.0.1:15020 \
-    --data-representation-layer mqtt --mqtt-broker 127.0.0.1:1883 \
+cargo run -p client -- examples/device-description.toml tcp://127.0.0.1:15020 \
+    --mqtt-broker 127.0.0.1:1883 \
     --mqtt-group-id MyPlant --mqtt-edge-node-id Line1
 ```
 

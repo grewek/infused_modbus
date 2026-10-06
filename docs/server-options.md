@@ -25,8 +25,8 @@ read_fifo_queue = false                # 0x18 (not implemented yet — the key e
 read_device_identification = true      # 0x2B / MEI 0x0E
 ```
 
-Every key is optional and defaults to `false` — only list what actually needs enabling. An unknown key anywhere under `[function-codes]` (or any other top-level key in the file) is a hard parse error at startup, not a silently-ignored setting, same discipline `fuse-permissions.toml` uses for an unrecognized `[client-trust]` section — a typo shouldn't leave a technician wrongly believing a function code is enabled.
+Every key is optional and defaults to `false` — only list what actually needs enabling. An unknown key anywhere under `[function-codes]` (or any other top-level key in the file) is a hard parse error at startup, not a silently-ignored setting — a typo shouldn't leave a technician wrongly believing a function code is enabled.
 
-A disabled function code and one that was never implemented at all respond with the exact same `ILLEGAL_FUNCTION` exception — deliberately indistinguishable on the wire, so a remote peer can't tell "implemented but turned off" apart from "doesn't exist here" just from the response. This composes cleanly with [device description discovery](filesystem.md#device-description-discovery-fc-43): disabling `read_device_identification` needs no special handling on the client side, since its FC 43 fetch already falls back to the local TOML on any failure, `ILLEGAL_FUNCTION` included.
+A disabled function code and one that was never implemented at all respond with the exact same `ILLEGAL_FUNCTION` exception — deliberately indistinguishable on the wire, so a remote peer can't tell "implemented but turned off" apart from "doesn't exist here" just from the response. This composes cleanly with [device description discovery](getting-started.md#device-description-discovery-fc-43): disabling `read_device_identification` needs no special handling on the client side, since its FC 43 fetch already falls back to the local TOML on any failure, `ILLEGAL_FUNCTION` included.
 
 See [the function code table](function-codes.md) for every available key name.

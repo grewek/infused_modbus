@@ -152,14 +152,15 @@ pub async fn confirm_write_multiple(
 }
 
 /// Sends a Mask Write Register (FC 0x16) request for `register` — the
-/// counterpart of `confirm_write` for a `transactions/<name>` file staged
-/// with the `MASK <and_mask> <or_mask>` content form (see
-/// datafs::filesystem::InfusedFilesystem::parse_masked_register_value)
-/// instead of a plain value. Unlike a plain write, this can never be
-/// batched with anything else — Modbus has no "mask write multiple
-/// registers" function code — so `client::transaction_consumer` sends one
-/// of these per staged mask, never through `build_register_write_batches`.
-/// Callers are expected to have already checked
+/// counterpart of `confirm_write` for a `StagedValue::MaskedRegister`
+/// instead of a plain value (not currently reachable from any production
+/// write path since the FUSE/files `MASK <and_mask> <or_mask>` staging
+/// mechanism was removed — see `datafs::StagedValue`'s own doc comment).
+/// Unlike a plain write, this can never be batched with anything else —
+/// Modbus has no "mask write multiple registers" function code — so
+/// `client::transaction_consumer` sends one of these per staged mask, never
+/// through `build_register_write_batches`. Callers are expected to have
+/// already checked
 /// `register.data_type.register_count() == 1`: the function code
 /// physically can't address more than one wire word, the same restriction
 /// `encode_write_request` enforces for Write Single Register.

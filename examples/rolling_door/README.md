@@ -46,30 +46,20 @@ Commands: estop | estop-clear | block | block-clear | status | help | quit (Ctrl
 ```
 
 Leave it running and, in another terminal, point this project's own
-`client` at it (see the top-level `examples/README.md` for the full
-walkthrough style). For a real point-and-click UI instead of shell commands,
-see [`examples/nodered/`](../nodered/README.md)'s "Rolling Door" dashboard
-tab — gauges/buttons wired to this exact server over Sparkplug B
-(`--data-representation-layer mqtt`).
+`client` at it — needs an already-running MQTT broker (see
+[`examples/mqtt-broker/`](../mqtt-broker/README.md) for a disposable one):
 
 ```sh
-mkdir -p /tmp/rolling-door-client
-cargo run -p client -- /tmp/rolling-door-client examples/rolling_door/device-description.toml tcp://127.0.0.1:15502 1 300
+cargo run -p client -- examples/rolling_door/device-description.toml tcp://127.0.0.1:15502 1 300 --mqtt-broker 127.0.0.1:1883
 ```
 
-```sh
-# Request the door open — a real Modbus write:
-echo 1 > /tmp/rolling-door-client/RollingDoor/transactions/Open_Command
-touch /tmp/rolling-door-client/RollingDoor/transactions/TRANSACTION_END
-
-# Watch it move:
-watch cat /tmp/rolling-door-client/RollingDoor/input-registers/Door_Position
-
-# Try closing, then block the light barrier from the server's own console
-# (type `block` there) while it's mid-travel — the door reverses back open:
-echo 1 > /tmp/rolling-door-client/RollingDoor/transactions/Close_Command
-touch /tmp/rolling-door-client/RollingDoor/transactions/TRANSACTION_END
-```
+For a real point-and-click UI, see [`examples/nodered/`](../nodered/README.md)'s
+"Rolling Door" dashboard tab — gauges/buttons wired to this exact server
+over Sparkplug B: **Open**/**Close** buttons send a real Modbus write (a
+Sparkplug `DCMD`), **Door Position** is a live gauge, and the limit
+switches/motor/safety state show up as soon as they change. Try closing,
+then block the light barrier from the server's own console (type `block`
+there) while the door is mid-travel — it reverses back open.
 
 Typing `estop` at the `rolling_door_server` console halts the motor
 immediately regardless of what it was doing — `estop-clear` releases it.

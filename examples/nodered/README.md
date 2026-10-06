@@ -1,8 +1,8 @@
 # Node-RED Sparkplug B test rig
 
 A Docker image + a ready-to-import flow for exercising infused_modbus's
-MQTT/Sparkplug B layer (`client --data-representation-layer mqtt`) against a
-real, independent Sparkplug B implementation — Node-RED's
+MQTT/Sparkplug B layer against a real, independent Sparkplug B
+implementation — Node-RED's
 [`node-red-contrib-mqtt-sparkplug-plus`](https://flows.nodered.org/node/node-red-contrib-mqtt-sparkplug-plus)
 palette, built on `sparkplug-payload` (the Eclipse reference codec). See
 `CLAUDE.md`'s "MQTT (Sparkplug B) representation layer" section for why this
@@ -38,9 +38,7 @@ docker run -d --name nodered-sparkplug-test --network host \
 ```
 
 `--network host` is what lets the container reach `127.0.0.1:1883` — where
-the test broker above listens — without any port-mapping setup. This is
-Linux-only, same constraint as the rest of this project (FUSE is
-Linux-only too).
+the test broker above listens — without any port-mapping setup.
 
 The editor is now at **http://localhost:1880**.
 
@@ -59,14 +57,13 @@ curl -s -X POST http://127.0.0.1:1880/flows \
 ## 4. Point `client` at it
 
 ```sh
-cargo run -p client -- ignored examples/device-description.toml tcp://127.0.0.1:15020 \
-    --data-representation-layer mqtt --mqtt-broker 127.0.0.1:1883 \
+cargo run -p client -- examples/device-description.toml tcp://127.0.0.1:15020 \
+    --mqtt-broker 127.0.0.1:1883 \
     --mqtt-group-id MyPlant --mqtt-edge-node-id Line1
 ```
 
 (Needs a running `server` too — see the top-level `examples/README.md` for
-a complete server+client walkthrough; swap in `--data-representation-layer
-mqtt` on the client command there.)
+a complete server+client walkthrough.)
 
 **Before anything shows up**, open the two function nodes on the canvas
 ("build Rebirth NCMD" and "set DCMD topic") and edit their `GROUP_ID`/
@@ -97,8 +94,8 @@ once deployed:
 
 ```sh
 cargo run -p rolling_door_server
-cargo run -p client -- ignored examples/rolling_door/device-description.toml tcp://127.0.0.1:15502 \
-    --data-representation-layer mqtt --mqtt-broker 127.0.0.1:1883 \
+cargo run -p client -- examples/rolling_door/device-description.toml tcp://127.0.0.1:15502 \
+    --mqtt-broker 127.0.0.1:1883 \
     --mqtt-group-id NodeRedTest --mqtt-edge-node-id ClaudeClient
 ```
 
@@ -114,9 +111,9 @@ The dashboard shows:
 - **Motor / Fully Open / Fully Closed / Emergency Stop / Light Barrier** —
   plain-text status, refreshed as soon as a metric changes (`DDATA`) or on
   a full snapshot (`DBIRTH`/Rebirth).
-- **Open / Close** buttons — send a real, momentary `DCMD` exactly like
-  writing to `transactions/Open_Command` on a filesystem-backed `client`;
-  watch **Door Position** move and the limit switches update in response.
+- **Open / Close** buttons — send a real, momentary `DCMD` that `client`
+  resolves to a real Modbus write; watch **Door Position** move and the
+  limit switches update in response.
 - **Request Rebirth** — same purpose as Tab 1's version, scoped to this
   device: use it if you deployed this flow (or opened the dashboard) after
   `client` already published its one-time birth.

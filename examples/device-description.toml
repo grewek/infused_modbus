@@ -1,13 +1,14 @@
 # Example multi-machine device description — two pumps sharing one link,
 # each answering its own Modbus Unit ID (see the "Device description TOML
 # format" section in the top-level README.md, and CLAUDE.md's "Multi-machine
-# device description & FUSE layout" for the design behind it).
+# device description & FUSE layout" for the design behind it — the section
+# name is historical, the schema itself is representation-layer-agnostic).
 #
 # Run it directly, no edits needed — see examples/README.md for the full
 # walkthrough:
 #
-#   cargo run -p server -- /tmp/infused-modbus-server examples/device-description.toml tcp://127.0.0.1:15020 --server-options examples/server-options.toml
-#   cargo run -p client -- /tmp/infused-modbus-client examples/device-description.toml tcp://127.0.0.1:15020
+#   cargo run -p server -- examples/device-description.toml tcp://127.0.0.1:15020 --server-options examples/server-options.toml
+#   cargo run -p client -- examples/device-description.toml tcp://127.0.0.1:15020 --mqtt-broker 127.0.0.1:1883
 #
 # PumpA exercises every data type this project supports (holding registers
 # of several widths, coils, a discrete input, an input register, a file

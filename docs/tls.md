@@ -5,7 +5,7 @@
 **1. Start the server.** It generates its identity on first run and prints its fingerprint:
 
 ```sh
-cargo run -p server -- /tmp/modbus-server device.toml tls+tcp://0.0.0.0:502
+cargo run -p server -- device.toml tls+tcp://0.0.0.0:502
 ```
 
 ```
@@ -17,22 +17,26 @@ Note this value down — in a real deployment, a technician commissioning the se
 **2. Start the client, pinning that fingerprint:**
 
 ```sh
-cargo run -p client -- /tmp/modbus-client device.toml tls+tcp://127.0.0.1:502 --expect-server-fingerprint 86:3f:7f:d5:06:06:0f:5e:26:8d:bd:a8:1e:15:14:38:39:f3:f4:ba:0a:a4:a9:6a:da:c6:9a:60:dd:7f:a4:74
+cargo run -p client -- device.toml tls+tcp://127.0.0.1:502 --mqtt-broker 127.0.0.1:1883 --expect-server-fingerprint 86:3f:7f:d5:06:06:0f:5e:26:8d:bd:a8:1e:15:14:38:39:f3:f4:ba:0a:a4:a9:6a:da:c6:9a:60:dd:7f:a4:74
 ```
 
 Without `--expect-server-fingerprint`, the client accepts **any** server certificate unconditionally and prints a warning saying so — useful only for local testing, never for a real deployment. With it, the connection is rejected outright if the server presents a different certificate than expected.
 
 **3. The client also generates (and prints) its own identity** the first time it runs, and presents it to the server as part of a mutual TLS (mTLS) handshake — both sides authenticate to each other, not just the client authenticating the server. Until the client's fingerprint has been approved (next step), the server rejects the handshake — this first connection attempt is expected to fail.
 
-**4. Approve the client.** The server logs every connection attempt (approved, still-pending, or outright rejected) by fingerprint under its own root, in `client-trust/connection_attempts/{approved,pending,rejected}.log`. An unapproved-but-otherwise-valid certificate lands in `pending.log` — read the fingerprint from there (or from the client's own startup output, which prints the same value), then approve it from another terminal:
+**4. Approve the client.** The server logs every connection attempt (approved, still-pending, or outright rejected) by fingerprint to stderr, prefixed `[client-trust]`. An unapproved-but-otherwise-valid certificate logs as "pending" — read the fingerprint from there (or from the client's own startup output, which prints the same value), then approve it from another terminal:
 
 ```sh
 cargo run -p server -- admin approve <client-fingerprint>
 ```
 
-This talks to a Unix domain socket the server always serves in the background, regardless of connection type (`server-admin.sock`, relative to wherever the server was started; mode `0600`, additionally checked against the server process's own UID via `SO_PEERCRED` — only the local user account actually running the server can approve/revoke/list). The currently approved set is also visible read-only under `client-trust/approved/` at the server's root (one file per fingerprint).
+This talks to a Unix domain socket the server always serves in the background, regardless of connection type (`server-admin.sock`, relative to wherever the server was started; mode `0600`, additionally checked against the server process's own UID via `SO_PEERCRED` — only the local user account actually running the server can approve/revoke/list). The currently approved set is also visible via:
 
-**5. Reconnect the client** with the same command as step 2 — the identical certificate now completes the mTLS handshake, and the client mounts and polls normally.
+```sh
+cargo run -p server -- admin list
+```
+
+**5. Reconnect the client** with the same command as step 2 — the identical certificate now completes the mTLS handshake, and the client connects and polls normally.
 
 **6. Revoke a client** when it should no longer connect:
 

@@ -2,12 +2,12 @@
 
 A device description is a `[[machines]]` array — one entry per machine sharing the link this `client`/`server` instance connects to (a single-machine deployment is just an array with one entry). Each `[[machines]]` entry requires:
 
-- `name` — a unique (across the file), ASCII-alphanumeric-plus-`_`/`-` string, used directly as that machine's top-level FUSE directory name (`PumpA/`, `PumpB/`, ...) — a parse error if it collides with another machine's name or uses any other character.
+- `name` — a unique (across the file), ASCII-alphanumeric-plus-`_`/`-` string, used directly as that machine's Sparkplug B Device name — a parse error if it collides with another machine's name or uses any other character.
 - `unit_id` — the Modbus Unit ID this machine answers to on the shared link. `client` dispatches each machine's register/coil/etc. traffic to its own `unit_id`; `server` resolves an incoming request's Unit ID back to the matching machine and stays silent (no response at all, mirroring how an unaddressed device on a real RTU bus behaves) if none matches.
 
 and optionally:
 
-- `server-id` — identifies this machine to a Modbus master asking via FC 0x11 (Report Server ID) — set once and not meant to be changed at runtime. `server` answers real FC 0x11 requests for this machine's Unit ID with it (and rejects the function code with `ILLEGAL_FUNCTION` if absent); `client` mirrors it read-only into that machine's own mount as `server-id` — see [Interacting with the filesystem](filesystem.md).
+- `server-id` — identifies this machine to a Modbus master asking via FC 0x11 (Report Server ID) — set once and not meant to be changed at runtime. `server` answers real FC 0x11 requests for this machine's Unit ID with it (and rejects the function code with `ILLEGAL_FUNCTION` if absent); `client` does not currently expose it over MQTT (see `CLAUDE.md`'s "FC 0x11 (Report Server ID)" section).
 
 Every other section below is nested one level under `[[machines]]` (e.g. `[machines.registers]` instead of a top-level `[registers]`) and otherwise unchanged in shape.
 
@@ -37,7 +37,7 @@ access = "read_write"
 
 Each entry's actual Modbus address is `base_address + offset` — `Tank_Temperature` above lives at 40001.
 
-- `name` — the human-readable name used as the filename under `holding-registers/` and, on the client, `transactions/`/`report/` too.
+- `name` — the human-readable name used as this register's Sparkplug B metric name.
 - `offset` — added to the section's `base_address` to get the register's real Modbus address.
 - `data_type` — one of `u8`, `i8`, `u16`, `i16`, `u24`, `i24`, `u32`, `i32`, `u64`, `i64`, `f32`, `f64`. Anything wider than one 16-bit register (`u24` and up) spans consecutive registers, in the byte order `mem-layout` describes. `u24`/`i24` have no native Modbus width — they occupy two registers (32 bits) with the top byte always zero (`u24`) or sign-extended (`i24`).
 - `access` — `"read_only"` or `"read_write"`.
@@ -150,7 +150,7 @@ unit = "MQH"
 
 All four sections (`[machines.registers]`, `[machines.coils]`, `[machines.discrete-inputs]`, `[machines.input-registers]`) are independently optional per machine — a machine only declares the ones it actually has.
 
-File records (FC 0x14/0x15) are a different shape from every other section: no `base_address`/`offset` and no `name` — `file_number`/`record_number` *are* the address, and the FUSE path itself (`file-records/<file_number>/<record_number>`) is the identifier. `record_length` is in 16-bit words, matching the wire field's own unit:
+File records (FC 0x14/0x15) are a different shape from every other section: no `base_address`/`offset` and no `name` — `file_number`/`record_number` *are* the address, and the synthetic `<file_number>:<record_number>` identifier (a Sparkplug metric name under `mqtt`) is built from them directly. `record_length` is in 16-bit words, matching the wire field's own unit:
 
 ```toml
 [[machines.file-records]]

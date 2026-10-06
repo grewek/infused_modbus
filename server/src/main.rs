@@ -1,24 +1,17 @@
-// Modbus slave: mounts a FUSE projection of `device-description.toml` at
-// `mountpoint` and serves real Modbus masters over TCP or RTU (see
-// `<connection>` below). This process's own RegisterStore is the
-// authoritative state being served — an external write applies directly
-// (see server/src/handler.rs), and a locally staged transaction
-// (transactions/ + TRANSACTION_END) applies directly too (see
-// transaction_consumer.rs) — unlike the client, there's no separate real
-// device to round-trip with, so there's no "wait for confirmation" step on
-// either side.
+// Modbus slave: serves real Modbus masters over TCP or RTU (see
+// `<connection>` below) and exposes its own data over MQTT/Sparkplug B (see
+// CLAUDE.md's "MQTT (Sparkplug B) representation layer" section) — no
+// filesystem of any kind. This process's own RegisterStore is the
+// authoritative state being served — an external Modbus write applies
+// directly (see server/src/handler.rs), and a local write via the data
+// socket (see server_handle.rs/data_daemon.rs) applies directly too —
+// unlike the client, there's no separate real device to round-trip with, so
+// there's no "wait for confirmation" step on either side.
 //
 // Usage:
-//   cargo run -p server -- <root> <device-description.toml> <connection> [--data-representation-layer fuse|files]
+//   cargo run -p server -- <device-description.toml> <connection>
 //   cargo run -p server -- admin approve|revoke <fingerprint>
 //   cargo run -p server -- admin list
-//
-// --data-representation-layer picks how machines' data (and client-trust/)
-// is exposed: "files" (the default) writes real files under <root>, kept
-// current via atomic rename() and inotify-watched direct writes — no FUSE
-// driver. "fuse" mounts <root> as a synthetic FUSE filesystem, this
-// project's original mechanism. See CLAUDE.md's "Planned: pluggable
-// data-representation layer".
 //
 // <connection> is one of:
 //   tcp://<bind-address:port>          e.g. tcp://0.0.0.0:502
@@ -47,17 +40,15 @@
 // over the wire instead of needing its own local copy — see
 // device_identification.rs for the object layout.
 
-use datafs::filesystem::{InfusedFilesystem, MachineConfig, WriteMode};
 use protocol::connection_string::{ConnectionTarget, parse_connection_string};
 use protocol::device_description::DeviceDescription;
 use protocol::device_description_manifest::ManifestMachine;
 use server::connection::{serve_rtu_connection, serve_tcp_connection};
 use server::fc43_bulk_transfer::Fc43BulkTransfer;
 use server::handler::ServerMachineState;
-use server::transaction_consumer::run_transaction_consumer;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_serial::SerialPortBuilderExt;
@@ -88,26 +79,19 @@ const MAX_CONNECTIONS_PER_FINGERPRINT: usize = 5;
 const TLS_IDENTITY_DIRECTORY: &str = "server-tls-identity";
 const ADMIN_SOCKET_PATH: &str = "server-admin.sock";
 const APPROVED_CLIENTS_PATH: &str = "approved-clients.toml";
-// `--data-representation-layer mqtt` only — same "fixed, not yet
-// CLI-configurable" precedent as ADMIN_SOCKET_PATH above.
+// Fixed, not yet CLI-configurable — same precedent as ADMIN_SOCKET_PATH
+// above.
 const DATA_SOCKET_PATH: &str = "server-data.sock";
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: server <root> <device-description.toml> <connection> [--fuse-permissions <fuse-permissions.toml>] [--max-clients <n>] [--server-options <server-options.toml>] [--data-representation-layer fuse|files]\n\
+        "Usage: server <device-description.toml> <connection> [--max-clients <n>] [--server-options <server-options.toml>]\n\
          <connection> is tcp://<bind-address:port>, tls+tcp://<bind-address:port>, or rtu://<serial-path>:<baud-rate>\n\
-         --fuse-permissions sets custom mode/uid/gid per top-level directory — \
-         without it, every directory keeps its historical hardcoded behavior.\n\
          --max-clients bounds how many TLS client fingerprints can be approved at once \
          (tls+tcp:// only) — without it, there is no limit.\n\
          --server-options explicitly enables function codes this server will answer — \
          without it (or with an empty file), every function code is disabled and every \
          request gets ILLEGAL_FUNCTION.\n\
-         --data-representation-layer picks fuse (a synthetic FUSE mount), files \
-         (real files, the default), or mqtt (no filesystem at all — a local Unix socket, \
-         server-data.sock, speaking ServerHandle's SET/GET line protocol; see CLAUDE.md's \
-         \"Option C\" design). <root> is ignored under mqtt, which has nothing to mount or \
-         write to disk.\n\
          \n\
          Usage: server admin approve|revoke <fingerprint>\n\
          Usage: server admin list"
@@ -115,66 +99,9 @@ fn usage() -> ! {
     std::process::exit(1);
 }
 
-/// Pulls `--data-representation-layer <fuse|files>` out of `args` if
-/// present (order-independent, same shape as `--fuse-permissions`), leaving
-/// the rest of `args` untouched. Absent entirely, defaults to `Files` —
-/// same breaking-default stance as `client`'s own copy of this function
-/// (kept separate, not shared, matching this project's existing pattern of
-/// each binary owning its own CLI-extraction helpers rather than a shared
-/// module).
-fn extract_representation_layer(args: &mut Vec<String>) -> RepresentationLayer {
-    let Some(flag_index) = args
-        .iter()
-        .position(|arg| arg == "--data-representation-layer")
-    else {
-        return RepresentationLayer::Files;
-    };
-    if flag_index + 1 >= args.len() {
-        panic!("--data-representation-layer requires a value (fuse, files, or mqtt)");
-    }
-    args.remove(flag_index);
-    let value = args.remove(flag_index);
-    match value.as_str() {
-        "fuse" => RepresentationLayer::Fuse,
-        "files" => RepresentationLayer::Files,
-        "mqtt" => RepresentationLayer::Mqtt,
-        other => panic!(
-            "invalid --data-representation-layer value {other:?}: expected fuse, files, or mqtt"
-        ),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RepresentationLayer {
-    Fuse,
-    Files,
-    Mqtt,
-}
-
-/// Pulls `--fuse-permissions <path>` out of `args` if present
-/// (order-independent), leaving the rest of `args` untouched. Absent
-/// entirely, every directory keeps its historical hardcoded behavior
-/// (`FusePermissions::default()`). Extracted before the `admin` subcommand
-/// check, so it's harmless (simply unused) if given alongside `admin`.
-fn extract_fuse_permissions(args: &mut Vec<String>) -> datafs::permissions::FusePermissions {
-    let Some(flag_index) = args.iter().position(|arg| arg == "--fuse-permissions") else {
-        return datafs::permissions::FusePermissions::default();
-    };
-    if flag_index + 1 >= args.len() {
-        panic!("--fuse-permissions requires a path");
-    }
-    args.remove(flag_index);
-    let path = args.remove(flag_index);
-    let toml_source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
-    datafs::permissions::FusePermissions::parse(&toml_source)
-        .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
-}
-
-/// Pulls `--max-clients <n>` out of `args` if present (order-independent,
-/// same shape as `--fuse-permissions`), leaving the rest of `args`
-/// untouched. Absent entirely, `None` means unlimited — matches every
-/// pre-Q server's behavior exactly (see `ApprovedClients::new`).
+/// Pulls `--max-clients <n>` out of `args` if present (order-independent),
+/// leaving the rest of `args` untouched. Absent entirely, `None` means
+/// unlimited (see `ApprovedClients::new`).
 fn extract_max_clients(args: &mut Vec<String>) -> Option<usize> {
     let flag_index = args.iter().position(|arg| arg == "--max-clients")?;
     if flag_index + 1 >= args.len() {
@@ -189,11 +116,11 @@ fn extract_max_clients(args: &mut Vec<String>) -> Option<usize> {
     )
 }
 
-/// Pulls `--server-options <path>` out of `args` if present (order-
-/// independent, same shape as `--fuse-permissions`), leaving the rest of
-/// `args` untouched. Absent entirely, behaves exactly like a present-but-
-/// empty file (`ServerOptions::default()`) — every function code disabled,
-/// not a startup error (CLAUDE.md's "server-options.toml" section).
+/// Pulls `--server-options <path>` out of `args` if present
+/// (order-independent), leaving the rest of `args` untouched. Absent
+/// entirely, behaves exactly like a present-but-empty file
+/// (`ServerOptions::default()`) — every function code disabled, not a
+/// startup error (CLAUDE.md's "server-options.toml" section).
 fn extract_server_options(args: &mut Vec<String>) -> server::server_options::ServerOptions {
     let Some(flag_index) = args.iter().position(|arg| arg == "--server-options") else {
         return server::server_options::ServerOptions::default();
@@ -254,7 +181,6 @@ fn start_serving(
     machines: Arc<HashMap<u8, ServerMachineState>>,
     toml_source: Arc<String>,
     fc43_bulk_transfer: Arc<Fc43BulkTransfer>,
-    client_trust: Arc<Mutex<datafs::client_trust::ClientTrustState>>,
     approved_clients: Arc<Mutex<server::client_trust::ApprovedClients>>,
     live_connections: Arc<Mutex<server::live_connections::LiveConnections>>,
 ) {
@@ -312,12 +238,8 @@ fn start_serving(
             // starts empty on every run (not persisted yet, Milestone S),
             // so tls+tcp:// is fail-closed against every client until at
             // least one has been approved via the admin subcommand.
-            let server_config = server::tls::build_server_config(
-                &identity,
-                approved_clients,
-                Arc::clone(&client_trust),
-            )
-            .unwrap_or_else(|error| panic!("failed to build TLS server config: {error}"));
+            let server_config = server::tls::build_server_config(&identity, approved_clients)
+                .unwrap_or_else(|error| panic!("failed to build TLS server config: {error}"));
             let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
             let listener = runtime
@@ -462,10 +384,8 @@ fn start_serving(
 
 fn main() {
     let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
-    let fuse_permissions = extract_fuse_permissions(&mut raw_args);
     let max_clients = extract_max_clients(&mut raw_args);
     let server_options = extract_server_options(&mut raw_args);
-    let representation_layer = extract_representation_layer(&mut raw_args);
     let mut args = raw_args.into_iter();
     let Some(first_argument) = args.next() else {
         usage();
@@ -488,10 +408,7 @@ fn main() {
              this server will answer ILLEGAL_FUNCTION to every request."
         );
     }
-    let root = first_argument;
-    let Some(device_description_path) = args.next() else {
-        usage();
-    };
+    let device_description_path = first_argument;
     let Some(connection_string) = args.next() else {
         usage();
     };
@@ -523,22 +440,11 @@ fn main() {
     ));
 
     // One fresh set of stores per configured machine, name-keyed — shared
-    // by the transaction consumer (below) and the FUSE tree (further down).
-    // See datafs::build_machine_stores.
+    // by the wire-facing Modbus handler (via `machines` below) and
+    // `ServerHandle`'s own direct store access (further down). See
+    // datafs::build_machine_stores.
     let machine_stores: HashMap<String, datafs::MachineStores> =
         datafs::build_machine_stores(&description.machines);
-
-    let (transaction_sender, transaction_receiver) = mpsc::channel();
-
-    // One consumer thread services every machine's direct writes, reading a
-    // single shared channel tagged with the originating machine's name (see
-    // datafs's multi-machine `InfusedFilesystem`).
-    std::thread::spawn({
-        let machine_stores = machine_stores.clone();
-        move || {
-            run_transaction_consumer(&machine_stores, transaction_receiver);
-        }
-    });
 
     // Unit-ID-keyed, separate from `machine_stores` above (which is
     // name-keyed) — this is what `handle_request`/`start_serving` use to
@@ -574,16 +480,9 @@ fn main() {
             .collect(),
     );
 
-    // Shared between the TLS handshake path (which logs connection
-    // attempts and, later, checks approvals) and the FUSE `client-trust/`
-    // subtree (which displays that same state) — one `ClientTrustState`,
-    // not two independently-populated copies. See O2's "known gap" note:
-    // this is what closes it.
-    let client_trust = Arc::new(Mutex::new(datafs::client_trust::ClientTrustState::new()));
     // Shared between the TLS client-cert verifier (which enforces it) and
     // the admin socket below (which is the only thing that ever mutates
-    // it) — same one-writer-per-piece-of-state precedent as `client_trust`
-    // just above. `--max-clients` (Milestone Q) is stored here too.
+    // it). `--max-clients` is stored here too.
     let mut approved_clients = match max_clients {
         Some(max_clients) => server::client_trust::ApprovedClients::with_max_clients(max_clients),
         None => server::client_trust::ApprovedClients::new(),
@@ -593,22 +492,12 @@ fn main() {
     // before this restart must not silently vanish just because the limit
     // was lowered in the meantime. Read once, here, at startup only — see
     // server::persistence's module doc comment for why this file is never
-    // hot-reloaded afterwards. Also seeds `client_trust`'s own mirror in
-    // the same loop — otherwise `admin list`/`client-trust/approved/`
-    // would show nothing approved right after a restart even though the
-    // TLS verifier (which only consults `approved_clients`) would already
-    // accept a previously-approved client; the same "two stores, one
-    // writer" discipline O2/P2 established for the admin channel applies
-    // here too.
+    // hot-reloaded afterwards.
     let approved_clients_path = Path::new(APPROVED_CLIENTS_PATH);
     for fingerprint in server::persistence::load(approved_clients_path)
         .unwrap_or_else(|error| panic!("failed to load {approved_clients_path:?}: {error}"))
     {
         approved_clients.seed(fingerprint);
-        client_trust
-            .lock()
-            .unwrap()
-            .insert_approved(fingerprint.to_string());
     }
     let approved_clients = Arc::new(Mutex::new(approved_clients));
     // Shared between the TLS accept loop (which registers/deregisters each
@@ -627,19 +516,16 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");
 
     // Always served, regardless of connection type — approving/revoking
-    // clients is meaningful only under tls+tcp://, but `client-trust/`'s
-    // FUSE presence is likewise unconditional (see datafs O1), so the
-    // admin channel that manages it follows the same precedent rather than
-    // depending on which transport was chosen.
+    // clients is meaningful only under tls+tcp://, but the admin channel
+    // that manages them runs unconditionally rather than depending on which
+    // transport was chosen.
     runtime.spawn({
         let approved_clients = Arc::clone(&approved_clients);
-        let client_trust = Arc::clone(&client_trust);
         let live_connections = Arc::clone(&live_connections);
         async move {
             if let Err(error) = server::admin::run_admin_socket(
                 Path::new(ADMIN_SOCKET_PATH),
                 approved_clients,
-                client_trust,
                 live_connections,
                 approved_clients_path.to_path_buf(),
             )
@@ -659,7 +545,6 @@ fn main() {
         Arc::clone(&machines),
         Arc::clone(&toml_source),
         Arc::clone(&fc43_bulk_transfer),
-        Arc::clone(&client_trust),
         approved_clients,
         live_connections,
     );
@@ -670,163 +555,33 @@ fn main() {
         .map(|machine| machine.name.as_str())
         .collect();
     println!(
-        "Starting infused_modbus server ({representation_layer:?}), serving via {connection_string} — machines: {}",
+        "Starting infused_modbus server, serving via {connection_string} — machines: {}",
         machine_names.join(", ")
     );
-    if representation_layer != RepresentationLayer::Mqtt {
-        std::fs::create_dir_all(&root).ok();
-        println!("Data root: {root}");
-    }
 
-    match representation_layer {
-        RepresentationLayer::Fuse => {
-            let machines_for_fs: Vec<MachineConfig> = description
-                .machines
-                .into_iter()
-                .map(|machine| {
-                    let stores = machine_stores
-                        .get(&machine.name)
-                        .expect("machine_stores was built from the same machine list");
-                    MachineConfig {
-                        name: machine.name,
-                        registers: machine.registers,
-                        coils: machine.coils,
-                        discrete_inputs: machine.discrete_inputs,
-                        input_registers: machine.input_registers,
-                        file_records: machine.file_records,
-                        store: Arc::clone(&stores.registers),
-                        coil_store: Arc::clone(&stores.coils),
-                        discrete_input_store: Arc::clone(&stores.discrete_inputs),
-                        input_register_store: Arc::clone(&stores.input_registers),
-                        file_record_store: Arc::clone(&stores.file_records),
-                        report: Arc::clone(&stores.report),
-                        permissions: fuse_permissions,
-                        // Deliberately not `machine.server_id` — the server
-                        // never mirrors its own configured server-id into
-                        // its FUSE tree, only answers real FC11 requests
-                        // with it (already carried into
-                        // `ServerMachineState.server_id` above). See
-                        // CLAUDE.md's "FC 0x11 (Report Server ID)" section.
-                        server_id: None,
-                    }
-                })
-                .collect();
-
-            let filesystem = InfusedFilesystem::new(
-                machines_for_fs,
-                transaction_sender,
-                WriteMode::Direct,
-                Some(client_trust),
-            );
-            // default_permissions makes the kernel actually enforce what
-            // getattr reports (see datafs::permissions) instead of every
-            // request being allowed regardless of mode/uid/gid.
-            let mut mount_config = fuser::Config::default();
-            mount_config.mount_options = vec![fuser::MountOption::DefaultPermissions];
-            let session = fuser::spawn_mount(filesystem, &root, &mount_config)
-                .unwrap_or_else(|error| panic!("mount failed: {error}"));
-
-            wait_for_shutdown_signal(&runtime);
-
-            session
-                .umount_and_join()
-                .unwrap_or_else(|error| panic!("failed to unmount cleanly: {error}"));
-        }
-        RepresentationLayer::Files => {
-            let root_path = Path::new(&root);
-
-            let readers = datafs::flatfile::build_machine_readers(
-                root_path,
-                &description.machines,
-                &machine_stores,
-            );
-            for (name, reader) in &readers {
-                reader.initialize().unwrap_or_else(|error| {
-                    panic!("failed to initialize {name}'s data directory: {error}")
-                });
-                if let Err(error) = reader.apply_permissions(&fuse_permissions) {
-                    eprintln!("warning: failed to apply permissions for {name}: {error}");
-                }
-            }
-
-            let client_trust_renderer = datafs::flatfile::FlatfileClientTrustRenderer::new(
-                root_path.join("client-trust"),
-                Arc::clone(&client_trust),
-            );
-            client_trust_renderer
-                .initialize()
-                .unwrap_or_else(|error| panic!("failed to initialize client-trust/: {error}"));
-
-            // One FlatfileDirectWriteWatcher per machine, each blocking its
-            // own dedicated thread on inotify — the server-side counterpart
-            // of the client's FlatfileTransactionWatcher (no staging/commit
-            // ritual here, see WriteMode::Direct's own reasoning above).
-            for machine in &description.machines {
-                let watcher = Arc::new(datafs::flatfile::build_machine_direct_write_watcher(
-                    root_path,
-                    machine,
-                    transaction_sender.clone(),
-                ));
-                std::thread::spawn(move || {
-                    if let Err(error) = watcher.run_forever() {
-                        eprintln!("direct-write watcher stopped: {error}");
-                    }
-                });
-            }
-
-            // No push-based change notification yet (see datafs::flatfile's
-            // own module doc comment) — a plain periodic re-render is the
-            // deliberately simple mechanism for now.
-            runtime.spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_millis(200));
-                loop {
-                    interval.tick().await;
-                    for reader in readers.values() {
-                        let _ = reader.render_once();
-                    }
-                    let _ = client_trust_renderer.render_once();
-                }
-            });
-
-            wait_for_shutdown_signal(&runtime);
-
-            // Mirrors the FUSE branch's unmount-on-shutdown: a real
-            // directory doesn't disappear on its own the way a FUSE mount
-            // does, so this has to remove it explicitly.
-            std::fs::remove_dir_all(&root)
-                .unwrap_or_else(|error| eprintln!("warning: failed to clean up {root}: {error}"));
-        }
-        RepresentationLayer::Mqtt => {
-            // The "Option C" design from CLAUDE.md's MQTT/Sparkplug B
-            // section: no filesystem tree at all, just ServerHandle behind
-            // a local Unix socket — see server::server_handle/data_daemon.
-            // Reads the same machine_stores every other layer would have
-            // (and the wire-facing Modbus handler in handler.rs already
-            // always writes into, regardless of representation layer), so
-            // an external Modbus master's write and a SET over this socket
-            // are always looking at the same data.
-            let server_handle = Arc::new(server::server_handle::ServerHandle::new(
-                &description.machines,
-                &machine_stores,
-            ));
-            runtime.spawn({
-                let server_handle = Arc::clone(&server_handle);
-                async move {
-                    if let Err(error) = server::data_daemon::run_data_socket(
-                        Path::new(DATA_SOCKET_PATH),
-                        server_handle,
-                    )
+    // No filesystem tree at all, just ServerHandle behind a local Unix
+    // socket — see server::server_handle/data_daemon. Reads the same
+    // machine_stores the wire-facing Modbus handler in handler.rs already
+    // always writes into, so an external Modbus master's write and a SET
+    // over this socket are always looking at the same data.
+    let server_handle = Arc::new(server::server_handle::ServerHandle::new(
+        &description.machines,
+        &machine_stores,
+    ));
+    runtime.spawn({
+        let server_handle = Arc::clone(&server_handle);
+        async move {
+            if let Err(error) =
+                server::data_daemon::run_data_socket(Path::new(DATA_SOCKET_PATH), server_handle)
                     .await
-                    {
-                        eprintln!("data socket at {DATA_SOCKET_PATH} failed: {error}");
-                    }
-                }
-            });
-            println!("Data socket listening at {DATA_SOCKET_PATH}");
-
-            wait_for_shutdown_signal(&runtime);
+            {
+                eprintln!("data socket at {DATA_SOCKET_PATH} failed: {error}");
+            }
         }
-    }
+    });
+    println!("Data socket listening at {DATA_SOCKET_PATH}");
+
+    wait_for_shutdown_signal(&runtime);
 }
 
 fn wait_for_shutdown_signal(runtime: &tokio::runtime::Runtime) {

@@ -6,7 +6,7 @@ Both **Modbus TCP** and **Modbus RTU** (serial) are supported, symmetrically, fo
 
 ## Why "infused_modbus"?
 
-The name comes from this project's original design: a live-updating **FUSE** filesystem projection of Modbus data — register values as readable files, writes as file writes, no client library required ("infused" referring to Modbus data infused into the filesystem). Two representation layers were built on that idea, a real FUSE mount and later a plain-files-on-disk variant meant to avoid some of FUSE's own overhead — both worked, but in practice both still carried real races and round-trip overhead that proved hard to eliminate cleanly (see `CLAUDE.md`'s "Pluggable data-representation layer" section for the specifics). Rather than continuing to chase that, development now focuses entirely on the MQTT/Sparkplug B layer instead — the filesystem-based layers still exist in the codebase for now (bugfixes only, not under active development) but are no longer this project's primary interface or direction. The name stuck anyway.
+The name comes from this project's original design: a live-updating **FUSE** filesystem projection of Modbus data — register values as readable files, writes as file writes, no client library required ("infused" referring to Modbus data infused into the filesystem). Two representation layers were built on that idea, a real FUSE mount and later a plain-files-on-disk variant meant to avoid some of FUSE's own overhead — both worked, but in practice both still carried real races and round-trip overhead that proved hard to eliminate cleanly. Rather than continuing to chase that, development moved to the MQTT/Sparkplug B layer instead — and once that layer had fully proven itself out, both filesystem-based layers were removed outright (see `CLAUDE.md`'s "FUSE and `files` representation layers removed" section for the full rationale). The name stuck anyway.
 
 ## ⚠️ This project was built entirely with AI assistance
 
@@ -62,8 +62,6 @@ Requires Linux. [`examples/`](examples/) has a ready-to-use, two-machine setup w
 - [server-options.toml](docs/server-options.md) — explicitly enabling which function codes `server` answers.
 - [Current limitations](docs/limitations.md).
 - `CLAUDE.md` — full architecture and design-decision history.
-
-Legacy, bugfixes only (see [Why "infused_modbus"?](#why-infused_modbus) above): [Interacting with the filesystem](docs/filesystem.md), [Directory permissions](docs/directory-permissions.md).
 
 ## Development
 

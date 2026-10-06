@@ -1,7 +1,3 @@
-pub mod client_trust;
-pub mod filesystem;
-pub mod flatfile;
-pub mod permissions;
 pub mod register_encoding;
 
 use protocol::device_description::{DataType, MachineDescription};
@@ -13,9 +9,8 @@ use std::sync::{Arc, Mutex};
 // whichever of these its TOML description declares it to be. U24/I24 have
 // no native Rust type, so they're stored in the next-larger native integer
 // (u32/i32) with the value always kept within the 24-bit range — see
-// datafs::filesystem::InfusedFilesystem::parse_register_value, the one
-// place that constructs a RegisterValue from user/text input and enforces
-// that range.
+// parse_register_value below, the one place that constructs a RegisterValue
+// from user/text input and enforces that range.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RegisterValue {
     U8(u8),
@@ -57,7 +52,6 @@ impl RegisterValue {
     }
 }
 
-// How a register's value is rendered as the content of its FUSE file.
 impl fmt::Display for RegisterValue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -101,10 +95,9 @@ pub fn default_register_value(data_type: DataType) -> RegisterValue {
 }
 
 // The shared state between protocol I/O (which updates values from what a
-// real device reports) and the FUSE layer (which reads/writes them by name).
-// Not thread-safe on its own — how it gets wrapped for concurrent access
-// depends on how the FUSE integration (Milestone G) ends up calling into it,
-// which isn't decided yet.
+// real device reports) and whichever representation layer reads/writes them
+// by name. Not thread-safe on its own — callers wrap it in `Arc<Mutex<_>>`
+// via `MachineStores`.
 #[derive(Debug, Default)]
 pub struct RegisterStore {
     values: HashMap<String, RegisterValue>,
@@ -122,23 +115,6 @@ impl RegisterStore {
     pub fn set(&mut self, name: impl Into<String>, value: RegisterValue) {
         self.values.insert(name.into(), value);
     }
-}
-
-// How a value is rendered as file content, shared by every store-backed data
-// type and every presentation layer that needs to show one: empty until the
-// store has a value (nothing polled/written yet), `"<value>\n"` once it
-// does. Extracted once a second, non-FUSE consumer (`flatfile`) needed the
-// exact same rendering `filesystem::MachineFs`'s own per-type `*_content`
-// methods already had.
-fn file_content<T: fmt::Display>(value: Option<T>) -> String {
-    match value {
-        Some(value) => format!("{value}\n"),
-        None => String::new(),
-    }
-}
-
-pub fn register_file_content(store: &RegisterStore, name: &str) -> String {
-    file_content(store.get(name))
 }
 
 // Mirrors RegisterStore exactly, keyed by input-register name instead of
@@ -167,16 +143,11 @@ impl InputRegisterStore {
     }
 }
 
-pub fn input_register_file_content(store: &InputRegisterStore, name: &str) -> String {
-    file_content(store.get(name))
-}
-
 // A coil's value. Always exactly one bit — unlike RegisterValue there's only
 // ever one shape, since protocol::device_description::CoilDescription has no
-// data_type — but still a newtype rather than a bare `bool`, so its FUSE file
-// rendering ("0"/"1", not Rust's "true"/"false" — see CLAUDE.md's FUSE
-// layout section) has one canonical place to live, same as RegisterValue's
-// Display below.
+// data_type — but still a newtype rather than a bare `bool`, so its rendering
+// ("0"/"1", not Rust's "true"/"false") has one canonical place to live, same
+// as RegisterValue's Display below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoilValue(pub bool);
 
@@ -209,10 +180,6 @@ impl CoilStore {
     }
 }
 
-pub fn coil_file_content(store: &CoilStore, name: &str) -> String {
-    file_content(store.get(name))
-}
-
 // Mirrors CoilStore exactly, keyed by discrete-input name instead of coil
 // name. Reuses CoilValue rather than a new single-bit type, for the same
 // reason InputRegisterStore reuses RegisterValue above — discrete inputs
@@ -235,10 +202,6 @@ impl DiscreteInputStore {
     pub fn set(&mut self, name: impl Into<String>, value: CoilValue) {
         self.values.insert(name.into(), value);
     }
-}
-
-pub fn discrete_input_file_content(store: &DiscreteInputStore, name: &str) -> String {
-    file_content(store.get(name))
 }
 
 // Keyed by (file_number, record_number) rather than a name — file records
@@ -264,31 +227,6 @@ impl FileRecordStore {
     pub fn set(&mut self, file_number: u16, record_number: u16, value: Vec<u8>) {
         self.values.insert((file_number, record_number), value);
     }
-}
-
-// How a file record's file content is rendered: a space-separated uppercase
-// hex dump, defaulting to `2 * record_length` zero bytes until directly
-// written — same "declared but unset = zero" precedent as every other
-// store-backed data type, just with a record's own declared width standing
-// in for a fixed per-DataType default. Extracted for the same reason
-// `register_file_content` was: a second, non-FUSE consumer needs the exact
-// same rendering `filesystem::MachineFs::file_record_content` already had.
-pub fn file_record_file_content(
-    store: &FileRecordStore,
-    file_number: u16,
-    record_number: u16,
-    record_length: u16,
-) -> String {
-    let bytes = store
-        .get(file_number, record_number)
-        .cloned()
-        .unwrap_or_else(|| vec![0u8; record_length as usize * 2]);
-    let hex = bytes
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("{hex}\n")
 }
 
 // U24/I24 are stored in the next-larger native integer (u32/i32 — see
@@ -318,11 +256,8 @@ fn parse_hex_or_decimal<T>(
     }
 }
 
-// Parses a `transactions/<name>` file's content into the RegisterValue its
-// register's own declared DataType calls for — shared by every presentation
-// layer that stages a plain register write, not just FUSE's `create`/
-// `write`/`release` (which is where this used to live before the `flatfile`
-// backend needed the exact same parsing).
+// Parses a staged register write's text content into the RegisterValue its
+// register's own declared DataType calls for.
 pub fn parse_register_value(data_type: DataType, text: &str) -> Option<RegisterValue> {
     let text = text.trim();
     match data_type {
@@ -369,37 +304,6 @@ pub fn parse_register_value(data_type: DataType, text: &str) -> Option<RegisterV
     }
 }
 
-// `MASK <and_mask> <or_mask>` (case-insensitive keyword, whitespace
-// separated, each mask a plain `0x`-hex or decimal u16 exactly like a
-// U16 register value) — the one-file syntax for staging a Mask Write
-// Register (FC 0x16) instead of a plain overwrite. Deliberately doesn't
-// check the target register's DataType here (this function only sees
-// text, not which register it's for): a MASK staged against a register
-// wider than one wire word parses fine but is rejected later, with a
-// real reason, by client::transaction_consumer when it tries to send
-// it — matching how encode_write_request already rejects an
-// over-wide plain write at send time rather than at parse time.
-pub fn parse_masked_register_value(text: &str) -> Option<(u16, u16)> {
-    let mut tokens = text.split_whitespace();
-    if !tokens.next()?.eq_ignore_ascii_case("MASK") {
-        return None;
-    }
-    let and_mask = parse_hex_or_decimal(
-        tokens.next()?,
-        |hex| u16::from_str_radix(hex, 16),
-        |decimal| decimal.parse(),
-    )?;
-    let or_mask = parse_hex_or_decimal(
-        tokens.next()?,
-        |hex| u16::from_str_radix(hex, 16),
-        |decimal| decimal.parse(),
-    )?;
-    if tokens.next().is_some() {
-        return None;
-    }
-    Some((and_mask, or_mask))
-}
-
 pub fn parse_coil_value(text: &str) -> Option<CoilValue> {
     match text.trim() {
         "0" => Some(CoilValue(false)),
@@ -417,15 +321,14 @@ pub fn parse_coil_value(text: &str) -> Option<CoilValue> {
 // in between) parse identically. No length check against the
 // register's own declared `record_length` here — that's enforced at
 // the wire-response boundary (`server::handler::handle_read_file_record`),
-// not the FUSE write boundary, so what a technician wrote is always
-// visible exactly as typed via a subsequent read, even if it doesn't
-// match.
-// The `transactions/<file_number>:<record_number>` naming a client
-// stages a Write File Record (FC 0x15) through — same colon-separated
-// synthetic identifier as `file_record_report_name`, but parsed back
-// here rather than just constructed, since this is the one place a
-// human actually types it in. Not itself a membership check — callers
-// still verify the parsed numbers name a real configured file record.
+// not at write time, so what was written is always visible exactly as
+// given via a subsequent read, even if it doesn't match.
+// The `<file_number>:<record_number>` naming a client stages a Write File
+// Record (FC 0x15) through — a Sparkplug metric name under `mqtt`, see
+// `client::sparkplug_translator::metric_value_to_staged_value`, the one
+// place it's decoded from external input. Not itself a membership check —
+// callers still verify the parsed numbers name a real configured file
+// record.
 pub fn parse_file_record_name(name: &str) -> Option<(u16, u16)> {
     let (file_number, record_number) = name.split_once(':')?;
     Some((file_number.parse().ok()?, record_number.parse().ok()?))
@@ -442,41 +345,38 @@ pub fn parse_file_record_value(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-// A value staged in `transactions/`, before TRANSACTION_END hands it off to
-// be confirmed against the real device. Wraps whichever of RegisterValue or
-// CoilValue matches the name being staged — CLAUDE.md's transactions design
-// describes one directory shared across Modbus data types, not one per
-// type, so PendingTransaction (and the TRANSACTION_END hand-off channel)
-// need one value type that can hold either.
+// A value staged for a write, handed off via `transaction_sender` to be
+// confirmed against the real device (client) or applied to the local store
+// (server). Wraps whichever of RegisterValue or CoilValue matches the name
+// being staged, or one of the other per-write-kind shapes below.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StagedValue {
     Register(RegisterValue),
     Coil(CoilValue),
-    // Only ever produced by the server's direct-write path (WriteMode::
-    // Direct) — see datafs::filesystem's "server direct-write model" doc
-    // comment. The client never constructs these: it has no write path at
-    // all for discrete inputs/input registers, staged or direct.
+    // Not currently constructed by any production code path — its only
+    // producer was the server's old FUSE/files direct-write mechanism
+    // (removed 2026-10-06). Mqtt's own DCMD write path deliberately
+    // rejects writes to discrete inputs/input registers (see
+    // `client::sparkplug_translator::metric_value_to_staged_value`), same
+    // as every write path before it — no Modbus function code lets a
+    // master write either anyway.
     DiscreteInput(CoilValue),
     InputRegister(RegisterValue),
-    // Staged via `transactions/<name>`'s `MASK <and_mask> <or_mask>`
-    // content form (see InfusedFilesystem::parse_masked_register_value) —
-    // client-only, mirroring Modbus's own Mask Write Register (FC 0x16),
-    // which only a master ever sends. The server never constructs this:
-    // its direct-write path (WriteMode::Direct) has no `transactions/` to
-    // stage one from, and doesn't try MASK-parsing on a plain
-    // `holding-registers/<name>` write either.
+    // Not currently constructed by any production code path — its only
+    // producer was the client's old FUSE/files `MASK <and_mask> <or_mask>`
+    // text-staging mechanism (removed 2026-10-06), mirroring Modbus's own
+    // Mask Write Register (FC 0x16). Mqtt's DCMD convention has no
+    // equivalent yet.
     MaskedRegister {
         and_mask: u16,
         or_mask: u16,
     },
-    // Only ever produced by the server's direct-write path
-    // (`file-records/<file_number>/<record_number>`), same "server-only,
-    // client has no write path at all" story as `DiscreteInput`/
-    // `InputRegister` above — no Modbus function code lets a master write
-    // one either (FC 0x15/Write File Record isn't implemented). Carries
-    // `file_number`/`record_number` directly rather than relying on the
-    // channel's own String key to identify which record this is, since
-    // `FileRecordStore::set` needs both numbers, not a name.
+    // Constructed by the client's mqtt DCMD write path
+    // (`client::sparkplug_translator::metric_value_to_staged_value`) for
+    // Write File Record (FC 0x15). Carries `file_number`/`record_number`
+    // directly rather than relying on the channel's own String key to
+    // identify which record this is, since `FileRecordStore::set` needs
+    // both numbers, not a name.
     FileRecord {
         file_number: u16,
         record_number: u16,
@@ -504,12 +404,15 @@ impl fmt::Display for StagedValue {
     }
 }
 
-// Staged writes for one in-progress transaction: creating a file in
-// `transactions/` and writing a value to it stages a name=value entry here;
-// creating `TRANSACTION_END` (Milestone H2, not implemented yet) drains this
-// and applies it to a RegisterStore/CoilStore. Plain data structure, no FUSE
-// awareness — mirrors how RegisterStore (F1) preceded its own FUSE wiring
-// (G1).
+// Staged writes for one in-progress transaction, name -> value, drained all
+// at once and applied to a RegisterStore/CoilStore. Not currently wired into
+// any production code path — mqtt's DCMD write path builds its
+// `HashMap<String, StagedValue>` directly per request rather than staging
+// into one of these first (see `client::sparkplug_command::
+// run_dcmd_forwarder`); this type's only former caller was the FUSE/files
+// `transactions/`+`TRANSACTION_END` mechanism (removed 2026-10-06). Kept for
+// now since removing it is a separate decision — see the 2026-10-06
+// FUSE/files-removal memory note.
 #[derive(Debug, Default)]
 pub struct PendingTransaction {
     staged: HashMap<String, StagedValue>,
@@ -592,25 +495,14 @@ impl WriteReport {
     }
 }
 
-// How a `report/<name>` file's content is rendered: empty until a write has
-// been attempted for that name, `"<status>\n"` once one has — same "empty
-// until set" shape every other store-backed data type's file content
-// already has. Extracted for the same reason `register_file_content` etc.
-// were: a second, non-FUSE consumer needed the exact same rendering
-// `filesystem::MachineFs::report_content` already had.
-pub fn report_file_content(report: &WriteReport, name: &str) -> String {
-    file_content(report.get(name))
-}
-
 // Bundles one instance of every per-machine store type + its write report —
-// see CLAUDE.md's "Planned: multi-machine device description & FUSE layout"
-// section. A multi-machine deployment holds one of these per configured
-// machine name rather than each of `InfusedFilesystem`'s constructor/
-// polling/transaction-consumer call sites separately threading five (now
-// six) individual stores through per machine. Every field is already
+// see CLAUDE.md's "Multi-machine device description & FUSE layout" section.
+// A multi-machine deployment holds one of these per configured machine name
+// rather than threading five (now six) individual stores through per
+// machine at every call site that needs them. Every field is already
 // `Arc<Mutex<_>>` exactly as it was before this bundling, so cloning a
 // `MachineStores` handle is cheap and every clone still refers to the same
-// underlying data — needed since `InfusedFilesystem`, polling, and the
+// underlying data — needed since the mqtt translator, polling, and the
 // transaction consumer all need to see the same machine's stores.
 #[derive(Debug, Clone)]
 pub struct MachineStores {
@@ -643,9 +535,8 @@ impl Default for MachineStores {
 
 // One fresh `MachineStores` per configured machine, keyed by machine name —
 // the construction step both `client` and `server` need identically once
-// they build their `InfusedFilesystem`/polling/transaction-consumer setup
-// per machine, so it's extracted here rather than duplicated in both
-// binaries' `main.rs`.
+// they build their polling/transaction-consumer setup per machine, so it's
+// extracted here rather than duplicated in both binaries' `main.rs`.
 pub fn build_machine_stores(machines: &[MachineDescription]) -> HashMap<String, MachineStores> {
     machines
         .iter()

@@ -76,12 +76,9 @@ pub fn run_transaction_consumer(
                     report.set(name, WriteStatus::Ok);
                 }
                 // Never actually produced on the server: MASK-format
-                // staging only happens inside the transactions/ write path
-                // (datafs::filesystem::release), and transactions/ only
-                // exists at all in WriteMode::Staged, which the server
-                // never runs (see CLAUDE.md's "server direct-write
-                // model"). Handled defensively rather than assumed
-                // unreachable.
+                // staging is a client-only concept (see
+                // `datafs::StagedValue::MaskedRegister`'s own doc comment).
+                // Handled defensively rather than assumed unreachable.
                 StagedValue::MaskedRegister { .. } => {
                     report.set(
                         name,
