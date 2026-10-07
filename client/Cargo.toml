@@ -25,9 +25,6 @@ rustls-webpki = "0.103.15"
 # rumqttc's own TLS feature (which transitively pulls in a second rustls
 # crypto provider, aws-lc-rs, alongside our own pinned `ring`) is unused.
 rumqttc = { version = "0.25", default-features = false }
-config = "0.14"
-serde = { version = "1", features = ["derive"] }
-toml = "1"
 miniz_oxide = "0.8"
 
 [dev-dependencies]
@@ -36,5 +33,9 @@ tempfile = "3.27.0"
 # Only used by the MQTT/Sparkplug test suite to spin up a real in-process
 # broker — this project connects to an already-running external broker in
 # production and never runs one itself (see CLAUDE.md's "MQTT (Sparkplug B)
-# representation layer").
+# representation layer"). config/serde/toml are only needed to build that
+# broker's own TOML-based config, same test-only scope as rumqttd itself.
 rumqttd = "0.20"
+config = "0.14"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
