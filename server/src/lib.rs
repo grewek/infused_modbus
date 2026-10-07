@@ -6,6 +6,7 @@ pub mod device_description_compression;
 pub mod device_identification;
 pub mod fc43_bulk_transfer;
 pub mod handler;
+pub mod line_socket;
 pub mod live_connections;
 pub mod peer_auth;
 pub mod persistence;

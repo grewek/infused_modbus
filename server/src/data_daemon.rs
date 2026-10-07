@@ -5,23 +5,16 @@
 //! replacement for `files`' file-watching approach on the server side, using
 //! the "REST/socket API" pattern real Modbus-slave prior art (`ModbusSim`,
 //! `gplug-ems`) actually converged on, not `files`' own file-watching
-//! pattern. Deliberately mirrors `admin.rs`'s socket shape line for line
-//! (line protocol, `SO_PEERCRED`-gated, `0600`-mode socket file) — this is
-//! the second local-socket daemon this server runs, not a new pattern.
+//! pattern. Shares its socket shape (line protocol, `SO_PEERCRED`-gated,
+//! `0600`-mode socket file) with `admin.rs` via `line_socket::run_line_socket`
+//! — this is the second local-socket daemon this server runs, not a new
+//! pattern.
 
-use crate::peer_auth::is_authorized_uid;
+use crate::line_socket::run_line_socket;
 use crate::server_handle::ServerHandle;
 use std::fmt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
-
-/// Same discipline as `admin.rs`'s own socket file — owned by the server's
-/// own service account, nobody else can even open it; `SO_PEERCRED` is
-/// defense in depth on top, not a substitute.
-const SOCKET_FILE_MODE: u32 = 0o600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataCommand {
@@ -136,45 +129,13 @@ fn handle_line(line: &str, handle: &ServerHandle) -> String {
     }
 }
 
-/// Binds the data socket at `socket_path` (removing any stale leftover file
-/// first) and serves the line protocol above on every connection, forever —
-/// mirrors `admin::run_admin_socket` exactly, including the `SO_PEERCRED`
-/// gate applied before a single byte of the protocol is read.
+/// Binds the data socket at `socket_path` and serves the line protocol
+/// above on every connection, forever — see `line_socket::run_line_socket`
+/// for the shared bind/chmod/accept-loop/SO_PEERCRED-gate machinery (this
+/// used to duplicate `admin::run_admin_socket` line for line before that
+/// was pulled out).
 pub async fn run_data_socket(socket_path: &Path, handle: Arc<ServerHandle>) -> std::io::Result<()> {
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
-    }
-    let listener = UnixListener::bind(socket_path)?;
-    std::fs::set_permissions(
-        socket_path,
-        std::fs::Permissions::from_mode(SOCKET_FILE_MODE),
-    )?;
-
-    loop {
-        let (stream, _address) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(_) => continue,
-        };
-        match stream.peer_cred() {
-            Ok(credentials) if is_authorized_uid(credentials.uid()) => {}
-            _ => continue,
-        }
-        let handle = Arc::clone(&handle);
-        tokio::spawn(async move {
-            let (reader, mut writer) = stream.into_split();
-            let mut lines = BufReader::new(reader).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let response = handle_line(&line, &handle);
-                if writer
-                    .write_all(format!("{response}\n").as_bytes())
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-    }
+    run_line_socket(socket_path, move |line| handle_line(line, &handle)).await
 }
 
 #[cfg(test)]
@@ -185,7 +146,8 @@ mod tests {
         AccessRight, CoilDescription, DataType, MachineDescription, MemLayout, RegisterDescription,
     };
     use std::collections::HashMap;
-    use tokio::io::AsyncReadExt;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
     fn test_machine() -> MachineDescription {
@@ -360,6 +322,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let metadata = std::fs::metadata(&socket_path).unwrap();
-        assert_eq!(metadata.permissions().mode() & 0o777, SOCKET_FILE_MODE);
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            crate::line_socket::SOCKET_FILE_MODE
+        );
     }
 }

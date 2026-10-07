@@ -8,21 +8,14 @@
 // not just future handshakes — see `live_connections::LiveConnections`.
 
 use crate::client_trust::{ApprovalOutcome, ApprovedClients};
+use crate::line_socket::run_line_socket;
 use crate::live_connections::LiveConnections;
-use crate::peer_auth::is_authorized_uid;
 use protocol::tls::Fingerprint;
 use std::fmt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-
-/// Same "owned by the server's own service account" discipline as the TLS
-/// private key file (see `protocol::tls::PRIVATE_KEY_FILE_MODE`) — nobody
-/// but this process's own user can even open the socket. `SO_PEERCRED`
-/// (P3) is defense in depth on top of this, not a substitute for it.
-const SOCKET_FILE_MODE: u32 = 0o600;
+use tokio::net::UnixStream;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminCommand {
@@ -162,58 +155,19 @@ fn handle_line(
     }
 }
 
-/// Binds the admin socket at `socket_path` (removing any stale leftover
-/// file first, e.g. left behind by an unclean shutdown) and serves the line
-/// protocol above on every connection, forever.
+/// Binds the admin socket at `socket_path` and serves the line protocol
+/// above on every connection, forever — see `line_socket::run_line_socket`
+/// for the shared bind/chmod/accept-loop/SO_PEERCRED-gate machinery.
 pub async fn run_admin_socket(
     socket_path: &Path,
     approved: Arc<Mutex<ApprovedClients>>,
     live_connections: Arc<Mutex<LiveConnections>>,
     approved_clients_path: std::path::PathBuf,
 ) -> std::io::Result<()> {
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
-    }
-    let listener = UnixListener::bind(socket_path)?;
-    std::fs::set_permissions(
-        socket_path,
-        std::fs::Permissions::from_mode(SOCKET_FILE_MODE),
-    )?;
-
-    loop {
-        let (stream, _address) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            // A single failed accept shouldn't take the whole channel down,
-            // same reasoning as the Modbus TCP/TLS accept loops in main.rs.
-            Err(_) => continue,
-        };
-        match stream.peer_cred() {
-            Ok(credentials) if is_authorized_uid(credentials.uid()) => {}
-            // Rejected before a single byte of the protocol is read, per
-            // CLAUDE.md: an unauthorized UID (or a peer credential lookup
-            // that failed outright) never gets to speak the line protocol
-            // at all, fail-closed just like TLS client-cert verification.
-            _ => continue,
-        }
-        let approved = Arc::clone(&approved);
-        let live_connections = Arc::clone(&live_connections);
-        let approved_clients_path = approved_clients_path.clone();
-        tokio::spawn(async move {
-            let (reader, mut writer) = stream.into_split();
-            let mut lines = BufReader::new(reader).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let response =
-                    handle_line(&line, &approved, &live_connections, &approved_clients_path);
-                if writer
-                    .write_all(format!("{response}\n").as_bytes())
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-    }
+    run_line_socket(socket_path, move |line| {
+        handle_line(line, &approved, &live_connections, &approved_clients_path)
+    })
+    .await
 }
 
 /// Sends one command to the admin socket at `socket_path` and returns its
@@ -231,6 +185,7 @@ pub async fn send_admin_command(socket_path: &Path, command: &str) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn fingerprint() -> Fingerprint {
         Fingerprint::of(b"admin-socket-test")
