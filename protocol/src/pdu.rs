@@ -702,31 +702,26 @@ impl ReadInputRegistersResponse {
     }
 }
 
+// Write Single Coil's wire shape is also "function code + two u16 fields"
+// (same as encode_address_and_quantity/decode_address_and_quantity) with
+// one extra layer: the second field is a bool mapped to/from
+// COIL_VALUE_ON/COIL_VALUE_OFF rather than a raw value, so the shared
+// codec is reused for the byte-level mechanics and only that mapping
+// stays here.
 fn encode_write_single_coil(coil_address: u16, coil_value: bool) -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(TWO_FIELD_PDU_LEN);
-    buffer.push(FUNCTION_CODE_WRITE_SINGLE_COIL);
-    buffer.extend_from_slice(&coil_address.to_be_bytes());
     let wire_value = if coil_value {
         COIL_VALUE_ON
     } else {
         COIL_VALUE_OFF
     };
-    buffer.extend_from_slice(&wire_value.to_be_bytes());
-    buffer
+    encode_address_and_quantity(FUNCTION_CODE_WRITE_SINGLE_COIL, coil_address, wire_value)
 }
 
 fn decode_write_single_coil(bytes: &[u8]) -> Result<(u16, bool), DecodeError> {
-    if bytes.len() < TWO_FIELD_PDU_LEN {
-        return Err(DecodeError::TooShort);
-    }
-    if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_WRITE_SINGLE_COIL {
-        return Err(DecodeError::UnexpectedFunctionCode {
-            expected: FUNCTION_CODE_WRITE_SINGLE_COIL,
-            actual: bytes[FUNCTION_CODE_BYTE],
-        });
-    }
-    let coil_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
-    let wire_value = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
+    let AddressAndQuantity {
+        starting_address: coil_address,
+        quantity: wire_value,
+    } = decode_address_and_quantity(bytes, FUNCTION_CODE_WRITE_SINGLE_COIL)?;
     let coil_value = match wire_value {
         COIL_VALUE_ON => true,
         COIL_VALUE_OFF => false,
