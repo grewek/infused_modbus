@@ -654,6 +654,49 @@ fn handle_report_server_id(pdu: &[u8], server_id: Option<&str>) -> Vec<u8> {
     }
 }
 
+// Shared by handle_write_multiple_registers and the write half of
+// handle_read_write_multiple_registers below: both resolve a batch of
+// register writes against the *static* `registers` description
+// (ReadWrite-only, width-checked) before ever touching `store` — walking
+// register-by-register, same shape as handle_read, since only a register's
+// own starting address is a valid boundary. This is what lets both callers
+// reject the whole request on a bad address/width without applying a
+// partial write (see handle_read_write_multiple_registers's own doc
+// comment). Same concrete types at both call sites, so this is a plain
+// function — no generics/trait-object indirection needed to share it.
+fn resolve_register_writes<'a>(
+    registers: &'a [RegisterDescription],
+    starting_address: u16,
+    values: &[u16],
+    mem_layout: MemLayout,
+) -> Result<Vec<(&'a RegisterDescription, RegisterValue)>, ()> {
+    let mut resolved = Vec::new();
+    let mut address = starting_address;
+    let end_address = starting_address.wrapping_add(values.len() as u16);
+    let mut offset = 0usize;
+    while address != end_address {
+        let Some(register) = registers.iter().find(|register| {
+            register.address == address && register.access == AccessRight::ReadWrite
+        }) else {
+            return Err(());
+        };
+
+        let register_count = register.data_type.register_count() as usize;
+        if offset + register_count > values.len() {
+            return Err(());
+        }
+        let words = &values[offset..offset + register_count];
+        // Always Some: `words` is exactly `register_count` long by
+        // construction above.
+        let value = register_value_from_words(register.data_type, words, mem_layout)
+            .expect("word slice length always matches the register's own width");
+        resolved.push((register, value));
+        offset += register_count;
+        address = address.wrapping_add(register.data_type.register_count());
+    }
+    Ok(resolved)
+}
+
 fn handle_write_multiple_registers(
     pdu: &[u8],
     registers: &[RegisterDescription],
@@ -667,42 +710,17 @@ fn handle_write_multiple_registers(
         );
     };
 
-    // Walk register-by-register, same shape as handle_read: only a
-    // register's own starting address is a valid boundary, so a value
-    // wider than one register consumes that many words from the request
-    // before moving on to the next register's address.
-    let mut resolved: Vec<(&RegisterDescription, RegisterValue)> = Vec::new();
-    let mut address = request.starting_address;
-    let end_address = request
-        .starting_address
-        .wrapping_add(request.register_values.len() as u16);
-    let mut offset = 0usize;
-    while address != end_address {
-        let Some(register) = registers.iter().find(|register| {
-            register.address == address && register.access == AccessRight::ReadWrite
-        }) else {
-            return exception(
-                FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
-                EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            );
-        };
-
-        let register_count = register.data_type.register_count() as usize;
-        if offset + register_count > request.register_values.len() {
-            return exception(
-                FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
-                EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            );
-        }
-        let words = &request.register_values[offset..offset + register_count];
-        // Always Some: `words` is exactly `register_count` long by
-        // construction above.
-        let value = register_value_from_words(register.data_type, words, mem_layout)
-            .expect("word slice length always matches the register's own width");
-        resolved.push((register, value));
-        offset += register_count;
-        address = address.wrapping_add(register.data_type.register_count());
-    }
+    let Ok(resolved) = resolve_register_writes(
+        registers,
+        request.starting_address,
+        &request.register_values,
+        mem_layout,
+    ) else {
+        return exception(
+            FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
+            EXCEPTION_ILLEGAL_DATA_ADDRESS,
+        );
+    };
 
     let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
     for (register, value) in resolved {
@@ -738,37 +756,17 @@ fn handle_read_write_multiple_registers(
         );
     };
 
-    let mut resolved_writes: Vec<(&RegisterDescription, RegisterValue)> = Vec::new();
-    let mut address = request.write_starting_address;
-    let write_end_address = request
-        .write_starting_address
-        .wrapping_add(request.write_values.len() as u16);
-    let mut offset = 0usize;
-    while address != write_end_address {
-        let Some(register) = registers.iter().find(|register| {
-            register.address == address && register.access == AccessRight::ReadWrite
-        }) else {
-            return exception(
-                FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
-                EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            );
-        };
-        let register_count = register.data_type.register_count() as usize;
-        if offset + register_count > request.write_values.len() {
-            return exception(
-                FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
-                EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            );
-        }
-        let words = &request.write_values[offset..offset + register_count];
-        // Always Some: `words` is exactly `register_count` long by
-        // construction above.
-        let value = register_value_from_words(register.data_type, words, mem_layout)
-            .expect("word slice length always matches the register's own width");
-        resolved_writes.push((register, value));
-        offset += register_count;
-        address = address.wrapping_add(register.data_type.register_count());
-    }
+    let Ok(resolved_writes) = resolve_register_writes(
+        registers,
+        request.write_starting_address,
+        &request.write_values,
+        mem_layout,
+    ) else {
+        return exception(
+            FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+            EXCEPTION_ILLEGAL_DATA_ADDRESS,
+        );
+    };
 
     let mut read_registers: Vec<&RegisterDescription> = Vec::new();
     let mut address = request.read_starting_address;
