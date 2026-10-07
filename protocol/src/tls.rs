@@ -51,7 +51,7 @@ pub fn generate_self_signed_identity() -> Result<Identity, rcgen::Error> {
 /// generates a fresh self-signed one and persists it there so the same
 /// identity is reused on every later call — an identity that changed on
 /// every restart would make every previously pinned/approved fingerprint
-/// (see the FUSE `client-trust/` design) stale.
+/// (see CLAUDE.md's "TLS transport security & client trust") stale.
 pub fn load_or_generate_identity(directory: &Path) -> io::Result<Identity> {
     let certificate_path = directory.join(CERTIFICATE_FILE_NAME);
     let private_key_path = directory.join(PRIVATE_KEY_FILE_NAME);

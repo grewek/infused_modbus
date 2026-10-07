@@ -13,10 +13,8 @@
 // `Default`).
 //
 // Unknown keys under `[function-codes]`, or any other top-level key, are a
-// hard parse error via `deny_unknown_fields` — same discipline
-// `fuse-permissions.toml` uses to reject a `client-trust` key, so a typo
-// doesn't leave a technician wrongly believing a function code is
-// enabled/disabled.
+// hard parse error via `deny_unknown_fields`, so a typo doesn't leave a
+// technician wrongly believing a function code is enabled/disabled.
 //
 // This is what makes FC 21 (Write File Record) implementable at all once
 // it's built: a semantically-unscoped write primitive, mitigated by

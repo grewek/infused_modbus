@@ -306,9 +306,9 @@ fn main() {
     let (transaction_sender, transaction_receiver) = mpsc::channel();
 
     // One consumer thread services every machine's writes, reading a
-    // single shared channel tagged with the originating machine's name
-    // (see datafs's multi-machine `InfusedFilesystem` — the same
-    // "TRANSACTION_END confirmation semantics" apply per machine).
+    // single shared channel tagged with the originating machine's name —
+    // CLAUDE.md's "TRANSACTION_END confirmation semantics" apply per
+    // machine the same way.
     let machine_transaction_configs: HashMap<String, MachineTransactionConfig> = description
         .machines
         .iter()

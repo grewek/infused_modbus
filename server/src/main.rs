@@ -26,9 +26,8 @@
 // subcommand above, which talks to a Unix domain socket
 // (ADMIN_SOCKET_PATH below, fixed and not yet CLI-configurable) that this
 // process always serves in the background, regardless of which connection
-// type it was started with — the same "always present regardless of
-// transport" precedent as the FUSE `client-trust/` subtree itself. The
-// server's own TLS identity is generated on first run and persisted under
+// type it was started with. The server's own TLS identity is generated on
+// first run and persisted under
 // TLS_IDENTITY_DIRECTORY below (a fixed default, not yet CLI-configurable).
 //
 // Every register DataType can be read and written over the wire now (see

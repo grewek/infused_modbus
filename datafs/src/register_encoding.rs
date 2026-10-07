@@ -25,7 +25,8 @@
 // U32/I32 (4-byte big-endian representation, 2 registers, MemLayout
 // applied) — the value is simply a u32/i32 restricted to the 24-bit range,
 // with that range enforced where a value is constructed from user input
-// (`InfusedFilesystem::parse_register_value`), not here on the wire path.
+// (`datafs::parse_register_value`, `client::sparkplug_translator::
+// metric_value_to_register_value`), not here on the wire path.
 
 use crate::RegisterValue;
 use protocol::device_description::{DataType, MemLayout};

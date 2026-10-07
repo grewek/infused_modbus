@@ -1,9 +1,9 @@
-// Owns the receiving end of InfusedFilesystem's transaction_sender channel
-// and is where CLAUDE.md's "TRANSACTION_END confirmation semantics" are
-// actually fulfilled: for every register/coil in a drained transaction,
-// attempt the real write and update `report` with the outcome. `datafs`
-// itself never does this — see the module doc comment on
-// InfusedFilesystem.
+// Owns the receiving end of the transaction_sender channel fed by the MQTT
+// DCMD write path (client::sparkplug_command::run_dcmd_forwarder) and is
+// where CLAUDE.md's "TRANSACTION_END confirmation semantics" are actually
+// fulfilled: for every register/coil in a drained transaction, attempt the
+// real write and update `report` with the outcome. `datafs` itself never
+// does this.
 //
 // Deliberately does *not* update `store`/`coil_store` itself on a
 // confirmed write, even though it has the just-written value in hand —

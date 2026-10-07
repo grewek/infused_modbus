@@ -65,10 +65,9 @@ impl Default for BrokerConfig {
 
 /// Mirrors `BrokerConfig`, but with every field optional — parsed from an
 /// operator-supplied `--mqtt-broker-config <path.toml>` (M9), where an
-/// absent field keeps `BrokerConfig::default()`'s value. Same
-/// `deny_unknown_fields` discipline as `datafs::permissions::
-/// FusePermissions`'s own `RawFusePermissions`, so a typo'd key is a hard
-/// parse error rather than a silently-ignored setting.
+/// absent field keeps `BrokerConfig::default()`'s value. `deny_unknown_fields`
+/// so a typo'd key is a hard parse error rather than a silently-ignored
+/// setting, same discipline every other TOML config in this project uses.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBrokerConfig {

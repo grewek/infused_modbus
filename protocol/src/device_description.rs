@@ -137,9 +137,9 @@ pub struct DiscreteInputDescription {
 // entry in this file, `file_number`/`record_number` ARE the address — no
 // base_address+offset resolution, since the wire's own two-axis addressing
 // scheme has no natural "base" to offset from — and there is no `name`
-// field: the FUSE path itself (`file-records/<file_number>/<record_number>`)
-// is the identifier, matching how a real device's own documentation
-// already names these things (e.g. "File 20 = event log"). `record_length`
+// field: the `(file_number, record_number)` pair itself is the identifier,
+// matching how a real device's own documentation already names these
+// things (e.g. "File 20 = event log"). `record_length`
 // is in 16-bit words (matches the wire field's own unit) and is fixed per
 // entry: an incoming request that doesn't ask for exactly this many words
 // is rejected, the same "must land on an exact boundary" discipline
@@ -173,12 +173,14 @@ pub const RESERVED_DEVICE_DESCRIPTION_FILE_NUMBER: u16 = 0xFFFF;
 // instead, one level down, per machine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MachineDescription {
-    // Used directly as the machine's top-level FUSE directory name — must be
-    // unique across the whole file and restricted to ASCII alphanumeric plus
-    // `_`/`-` (see `validate_machine_name`), enforced as a parse error rather
-    // than a runtime surprise, since two machines sharing a name would
-    // collide on one FUSE inode and other characters could break path
-    // handling.
+    // Used directly as this machine's Sparkplug B `device_id` (see
+    // `client::main`'s `edge_node.publish_dbirth(&machine.name, ...)`),
+    // which becomes an MQTT topic path segment — must be unique across the
+    // whole file and restricted to ASCII alphanumeric plus `_`/`-` (see
+    // `validate_machine_name`), enforced as a parse error rather than a
+    // runtime surprise, since two machines sharing a name would collide on
+    // one Sparkplug device topic and other characters (`/`, `+`, `#`, ...)
+    // could break topic handling.
     pub name: String,
     // Which Modbus Unit ID on the shared link this machine answers to. A
     // deliberate, flagged exception to this project's usual "TOML describes
@@ -201,13 +203,14 @@ pub struct MachineDescription {
     // Meaningless when `input_registers` is empty.
     pub input_register_mem_layout: MemLayout,
     // Optional, user-set-once identity string served by the server over
-    // FC 0x11 (Report Server ID) and mirrored read-only into the client's
-    // own FUSE mount (see CLAUDE.md's "FC 0x11 (Report Server ID)"
-    // section) — `None` means "not configured", not "empty string": the
-    // server answers FC11 with ILLEGAL_FUNCTION rather than an empty
-    // identity, and the client's `server-id` file doesn't exist at all
-    // rather than existing-but-blank. Per-machine since FC11 answers per
-    // Unit ID, and each machine on a shared link has its own identity.
+    // FC 0x11 (Report Server ID) (see CLAUDE.md's "FC 0x11 (Report Server
+    // ID)" section) and printed at startup by the client (`client::main`),
+    // so a technician can see whatever ended up in the client's own
+    // effective description — `None` means "not configured", not "empty
+    // string": the server answers FC11 with ILLEGAL_FUNCTION rather than
+    // an empty identity, and the client prints nothing for that machine
+    // rather than an empty value. Per-machine since FC11 answers per Unit
+    // ID, and each machine on a shared link has its own identity.
     pub server_id: Option<String>,
 }
 
@@ -329,13 +332,15 @@ pub enum DeviceDescriptionError {
     },
     // A machine `name` that is empty or contains a character other than
     // ASCII alphanumeric, `_`, or `-` — enforced at parse time since it
-    // becomes a FUSE directory name, and other characters could break path
+    // becomes this machine's Sparkplug B `device_id`, an MQTT topic path
+    // segment, and other characters (`/`, `+`, `#`, ...) could break topic
     // handling.
     InvalidMachineName {
         name: String,
     },
     // Two machines in the same file sharing a `name` — would collide on one
-    // FUSE inode, so rejected outright rather than picking a winner.
+    // Sparkplug device topic, so rejected outright rather than picking a
+    // winner.
     DuplicateMachineName {
         name: String,
     },
