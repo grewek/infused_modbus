@@ -413,35 +413,23 @@ impl ReadInputRegistersRequest {
     }
 }
 
-/// Sets bit `bit_index` (0 = least-significant bit of the first byte,
-/// matching Modbus's own coil/discrete-input packing order) in `packed`.
-fn pack_bit(packed: &mut [u8], bit_index: usize) {
-    let byte_index = bit_index / 8;
-    let bit_within_byte = bit_index % 8;
-    packed[byte_index] |= 1 << bit_within_byte;
-}
+// pack_bit/unpack_bit (bit-by-bit helpers) are gone -- BitValues now stores
+// bits packed exactly like the wire format internally, so both directions
+// below are a single byte-range copy instead of a per-bit loop (measured:
+// this plus BitValues' own packed storage closed the decode-side
+// performance gap found when first benchmarking this port against the
+// pre-move Vec<bool>-based implementation, see CLAUDE.md's "server-no-std
+// initiative").
 
-/// Reads bit `bit_index` back out of `packed` -- the inverse of `pack_bit`.
-fn unpack_bit(packed: &[u8], bit_index: usize) -> bool {
-    let byte_index = bit_index / 8;
-    let bit_within_byte = bit_index % 8;
-    packed[byte_index] & (1 << bit_within_byte) != 0
-}
-
-fn encode_bitfield_response(function_code: u8, values: &[bool]) -> PduBytes {
-    let byte_count = values.len().div_ceil(8);
+fn encode_bitfield_response(function_code: u8, values: &BitValues) -> PduBytes {
     let mut buffer = PduBytes::new();
     buffer.push(function_code).expect("fits MAX_PDU_LEN");
-    buffer.push(byte_count as u8).expect("fits MAX_PDU_LEN");
-    for _ in 0..byte_count {
-        buffer.push(0u8).expect("fits MAX_PDU_LEN");
-    }
-    let packed = &mut buffer.as_mut_slice()[RESPONSE_DATA_START..];
-    for (bit_index, &value) in values.iter().enumerate() {
-        if value {
-            pack_bit(packed, bit_index);
-        }
-    }
+    buffer
+        .push(values.as_packed_bytes().len() as u8)
+        .expect("fits MAX_PDU_LEN");
+    buffer
+        .extend_from_slice(values.as_packed_bytes())
+        .expect("fits MAX_PDU_LEN");
     buffer
 }
 
@@ -450,7 +438,16 @@ fn encode_bitfield_response(function_code: u8, values: &[bool]) -> PduBytes {
 /// most decode paths in this file, this one is reachable by a genuinely
 /// malformed (out-of-spec) peer, not just a theoretically-impossible edge
 /// case, so it's propagated as a real `DecodeError`, never `.expect()`'d.
-fn decode_bitfield_response(bytes: &[u8], function_code: u8) -> Result<BitValues, DecodeError> {
+///
+/// Out-parameter, same reasoning as `decode_register_array_response`'s own
+/// doc comment: `BitValues` is also ~250 bytes inline, not a cheap `Vec`
+/// handle, so returning it by value risked the same redundant-memcpy
+/// pattern at the `Result`/struct-wrapping boundary.
+fn decode_bitfield_response(
+    bytes: &[u8],
+    function_code: u8,
+    values: &mut BitValues,
+) -> Result<(), DecodeError> {
     if bytes.len() < RESPONSE_HEADER_LEN {
         return Err(DecodeError::TooShort);
     }
@@ -465,13 +462,10 @@ fn decode_bitfield_response(bytes: &[u8], function_code: u8) -> Result<BitValues
         return Err(DecodeError::TooShort);
     }
     let packed = &bytes[RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count)];
-    let mut values = BitValues::new();
-    for bit_index in 0..byte_count * 8 {
-        values
-            .push(unpack_bit(packed, bit_index))
-            .map_err(|_| DecodeError::TooLargeForBuffer)?;
-    }
-    Ok(values)
+    values
+        .extend_from_packed_bytes(packed, byte_count * 8)
+        .map_err(|_| DecodeError::TooLargeForBuffer)?;
+    Ok(())
 }
 
 impl ReadCoilsResponse {
@@ -480,9 +474,9 @@ impl ReadCoilsResponse {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        Ok(Self {
-            coil_values: decode_bitfield_response(bytes, FUNCTION_CODE_READ_COILS)?,
-        })
+        let mut coil_values = BitValues::new();
+        decode_bitfield_response(bytes, FUNCTION_CODE_READ_COILS, &mut coil_values)?;
+        Ok(Self { coil_values })
     }
 }
 
@@ -495,11 +489,14 @@ impl ReadDiscreteInputsResponse {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut discrete_input_values = BitValues::new();
+        decode_bitfield_response(
+            bytes,
+            FUNCTION_CODE_READ_DISCRETE_INPUTS,
+            &mut discrete_input_values,
+        )?;
         Ok(Self {
-            discrete_input_values: decode_bitfield_response(
-                bytes,
-                FUNCTION_CODE_READ_DISCRETE_INPUTS,
-            )?,
+            discrete_input_values,
         })
     }
 }
@@ -522,10 +519,29 @@ fn encode_register_array_response(function_code: u8, register_values: &[u16]) ->
 /// capacity" situation as `decode_bitfield_response` above: a wire
 /// `byte_count` of 254 decodes to 127 registers, over `RegisterValues`' own
 /// 125-entry cap.
+///
+/// Out-parameter (`values: &mut RegisterValues`) rather than returning
+/// `RegisterValues` by value: `RegisterValues` is ~250 bytes and lives
+/// inline in its enclosing structs (no heap indirection like `Vec` had).
+/// Measured at the assembly level (benchmark baseline, see CLAUDE.md's
+/// "server-no-std initiative") that returning it by value -- even with
+/// `#[inline(always)]` on every layer of the call chain -- still left one
+/// `memcpy` of the full value at the `Result`/struct-wrapping boundary on
+/// its way out, something `Vec`'s cheap 24-byte handle never suffered
+/// from. Writing directly into a caller-owned `RegisterValues` removes
+/// that copy structurally instead of hoping the optimizer elides it.
+/// Callers (`ReadHoldingRegistersResponse` etc.) still expose the normal
+/// `decode(bytes) -> Result<Self, DecodeError>` public shape -- this is
+/// purely an internal-plumbing fix. A `decode_into(bytes, &mut Self)`
+/// public fast path (letting a caller reuse one `Self` across many decode
+/// calls, eliminating even the last copy) was designed but deliberately
+/// deferred to the phase-2 integration work, where a real hot-path
+/// consumer either does or doesn't materialize to justify it.
 fn decode_register_array_response(
     bytes: &[u8],
     function_code: u8,
-) -> Result<RegisterValues, DecodeError> {
+    values: &mut RegisterValues,
+) -> Result<(), DecodeError> {
     if bytes.len() < RESPONSE_HEADER_LEN {
         return Err(DecodeError::TooShort);
     }
@@ -542,15 +558,14 @@ fn decode_register_array_response(
     if bytes.len() < RESPONSE_DATA_START + byte_count as usize {
         return Err(DecodeError::TooShort);
     }
-    let mut values = RegisterValues::new();
-    for chunk in
-        bytes[RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count as usize)].chunks_exact(2)
-    {
-        values
-            .push(u16::from_be_bytes([chunk[0], chunk[1]]))
-            .map_err(|_| DecodeError::TooLargeForBuffer)?;
-    }
-    Ok(values)
+    values
+        .extend_from_iter(
+            bytes[RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count as usize)]
+                .chunks_exact(2)
+                .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])),
+        )
+        .map_err(|_| DecodeError::TooLargeForBuffer)?;
+    Ok(())
 }
 
 impl ReadHoldingRegistersResponse {
@@ -559,12 +574,13 @@ impl ReadHoldingRegistersResponse {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        Ok(Self {
-            register_values: decode_register_array_response(
-                bytes,
-                FUNCTION_CODE_READ_HOLDING_REGISTERS,
-            )?,
-        })
+        let mut register_values = RegisterValues::new();
+        decode_register_array_response(
+            bytes,
+            FUNCTION_CODE_READ_HOLDING_REGISTERS,
+            &mut register_values,
+        )?;
+        Ok(Self { register_values })
     }
 }
 
@@ -574,12 +590,13 @@ impl ReadInputRegistersResponse {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        Ok(Self {
-            register_values: decode_register_array_response(
-                bytes,
-                FUNCTION_CODE_READ_INPUT_REGISTERS,
-            )?,
-        })
+        let mut register_values = RegisterValues::new();
+        decode_register_array_response(
+            bytes,
+            FUNCTION_CODE_READ_INPUT_REGISTERS,
+            &mut register_values,
+        )?;
+        Ok(Self { register_values })
     }
 }
 
@@ -892,13 +909,13 @@ impl ReadWriteMultipleRegistersRequest {
             return Err(DecodeError::TooShort);
         }
         let mut write_values = RegisterValues::new();
-        for chunk in bytes[READ_WRITE_VALUES_START..(READ_WRITE_VALUES_START + byte_count as usize)]
-            .chunks_exact(2)
-        {
-            write_values
-                .push(u16::from_be_bytes([chunk[0], chunk[1]]))
-                .map_err(|_| DecodeError::TooLargeForBuffer)?;
-        }
+        write_values
+            .extend_from_iter(
+                bytes[READ_WRITE_VALUES_START..(READ_WRITE_VALUES_START + byte_count as usize)]
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])),
+            )
+            .map_err(|_| DecodeError::TooLargeForBuffer)?;
         Ok(Self {
             read_starting_address,
             read_quantity,
@@ -917,12 +934,13 @@ impl ReadWriteMultipleRegistersResponse {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        Ok(Self {
-            register_values: decode_register_array_response(
-                bytes,
-                FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
-            )?,
-        })
+        let mut register_values = RegisterValues::new();
+        decode_register_array_response(
+            bytes,
+            FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+            &mut register_values,
+        )?;
+        Ok(Self { register_values })
     }
 }
 
@@ -941,15 +959,9 @@ impl WriteMultipleCoilsRequest {
             .extend_from_slice(&quantity.to_be_bytes())
             .expect("fits MAX_PDU_LEN");
         buffer.push(byte_count as u8).expect("fits MAX_PDU_LEN");
-        for _ in 0..byte_count {
-            buffer.push(0u8).expect("fits MAX_PDU_LEN");
-        }
-        let packed = &mut buffer.as_mut_slice()[WRITE_MULTIPLE_VALUES_START..];
-        for (index, &coil_value) in self.coil_values.iter().enumerate() {
-            if coil_value {
-                pack_bit(packed, index);
-            }
-        }
+        buffer
+            .extend_from_slice(self.coil_values.as_packed_bytes())
+            .expect("fits MAX_PDU_LEN");
         buffer
     }
 
@@ -985,22 +997,12 @@ impl WriteMultipleCoilsRequest {
         if bytes.len() < WRITE_MULTIPLE_VALUES_START + byte_count {
             return Err(DecodeError::TooShort);
         }
+        let packed =
+            &bytes[WRITE_MULTIPLE_VALUES_START..(WRITE_MULTIPLE_VALUES_START + byte_count)];
         let mut coil_values = BitValues::new();
-        for (byte_index, &byte) in bytes
-            [WRITE_MULTIPLE_VALUES_START..(WRITE_MULTIPLE_VALUES_START + byte_count)]
-            .iter()
-            .enumerate()
-        {
-            for bit in 0..8 {
-                let index = byte_index * 8 + bit;
-                if index >= quantity as usize {
-                    break;
-                }
-                coil_values
-                    .push(byte & (1 << bit) != 0)
-                    .map_err(|_| DecodeError::TooLargeForBuffer)?;
-            }
-        }
+        coil_values
+            .extend_from_packed_bytes(packed, quantity as usize)
+            .map_err(|_| DecodeError::TooLargeForBuffer)?;
         Ok(Self {
             starting_address,
             coil_values,
@@ -1087,14 +1089,14 @@ impl WriteMultipleRegistersRequest {
             return Err(DecodeError::TooShort);
         }
         let mut register_values = RegisterValues::new();
-        for chunk in bytes
-            [WRITE_MULTIPLE_VALUES_START..(WRITE_MULTIPLE_VALUES_START + byte_count as usize)]
-            .chunks_exact(2)
-        {
-            register_values
-                .push(u16::from_be_bytes([chunk[0], chunk[1]]))
-                .map_err(|_| DecodeError::TooLargeForBuffer)?;
-        }
+        register_values
+            .extend_from_iter(
+                bytes[WRITE_MULTIPLE_VALUES_START
+                    ..(WRITE_MULTIPLE_VALUES_START + byte_count as usize)]
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])),
+            )
+            .map_err(|_| DecodeError::TooLargeForBuffer)?;
         Ok(Self {
             starting_address,
             register_values,
