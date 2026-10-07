@@ -560,76 +560,71 @@ impl ReadInputRegistersRequest {
     }
 }
 
+// Shared by every "function code + packed-bit values" response
+// (Extraction-Based Programming: the same concrete encode/decode body had
+// been hand-duplicated across 2 types -- ReadCoilsResponse,
+// ReadDiscreteInputsResponse -- before being folded here).
+fn encode_bitfield_response(function_code: u8, values: &[bool]) -> Vec<u8> {
+    let byte_count = values.len().div_ceil(8);
+    let mut buffer = vec![0u8; RESPONSE_HEADER_LEN + byte_count];
+    buffer[FUNCTION_CODE_BYTE] = function_code;
+    buffer[BYTE_COUNT_BYTE] = byte_count as u8;
+    for (index, &value) in values.iter().enumerate() {
+        if value {
+            buffer[RESPONSE_DATA_START + index / 8] |= 1 << (index % 8);
+        }
+    }
+    buffer
+}
+
+fn decode_bitfield_response(bytes: &[u8], function_code: u8) -> Result<Vec<bool>, DecodeError> {
+    if bytes.len() < RESPONSE_HEADER_LEN {
+        return Err(DecodeError::TooShort);
+    }
+    if bytes[FUNCTION_CODE_BYTE] != function_code {
+        return Err(DecodeError::UnexpectedFunctionCode {
+            expected: function_code,
+            actual: bytes[FUNCTION_CODE_BYTE],
+        });
+    }
+    let byte_count = bytes[BYTE_COUNT_BYTE] as usize;
+    if bytes.len() < RESPONSE_DATA_START + byte_count {
+        return Err(DecodeError::TooShort);
+    }
+    Ok(
+        bytes[RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count)]
+            .iter()
+            .flat_map(|&byte| (0..8).map(move |bit| byte & (1 << bit) != 0))
+            .collect(),
+    )
+}
+
 impl ReadCoilsResponse {
     pub fn encode(&self) -> Vec<u8> {
-        let byte_count = self.coil_values.len().div_ceil(8);
-        let mut buffer = vec![0u8; RESPONSE_HEADER_LEN + byte_count];
-        buffer[FUNCTION_CODE_BYTE] = FUNCTION_CODE_READ_COILS;
-        buffer[BYTE_COUNT_BYTE] = byte_count as u8;
-        for (index, &coil_value) in self.coil_values.iter().enumerate() {
-            if coil_value {
-                buffer[RESPONSE_DATA_START + index / 8] |= 1 << (index % 8);
-            }
-        }
-        buffer
+        encode_bitfield_response(FUNCTION_CODE_READ_COILS, &self.coil_values)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < RESPONSE_HEADER_LEN {
-            return Err(DecodeError::TooShort);
-        }
-        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_COILS {
-            return Err(DecodeError::UnexpectedFunctionCode {
-                expected: FUNCTION_CODE_READ_COILS,
-                actual: bytes[FUNCTION_CODE_BYTE],
-            });
-        }
-        let byte_count = bytes[BYTE_COUNT_BYTE] as usize;
-        if bytes.len() < RESPONSE_DATA_START + byte_count {
-            return Err(DecodeError::TooShort);
-        }
-        let coil_values = bytes[RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count)]
-            .iter()
-            .flat_map(|&byte| (0..8).map(move |bit| byte & (1 << bit) != 0))
-            .collect();
-        Ok(Self { coil_values })
+        Ok(Self {
+            coil_values: decode_bitfield_response(bytes, FUNCTION_CODE_READ_COILS)?,
+        })
     }
 }
 
 impl ReadDiscreteInputsResponse {
     pub fn encode(&self) -> Vec<u8> {
-        let byte_count = self.discrete_input_values.len().div_ceil(8);
-        let mut buffer = vec![0u8; RESPONSE_HEADER_LEN + byte_count];
-        buffer[FUNCTION_CODE_BYTE] = FUNCTION_CODE_READ_DISCRETE_INPUTS;
-        buffer[BYTE_COUNT_BYTE] = byte_count as u8;
-        for (index, &discrete_input_value) in self.discrete_input_values.iter().enumerate() {
-            if discrete_input_value {
-                buffer[RESPONSE_DATA_START + index / 8] |= 1 << (index % 8);
-            }
-        }
-        buffer
+        encode_bitfield_response(
+            FUNCTION_CODE_READ_DISCRETE_INPUTS,
+            &self.discrete_input_values,
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < RESPONSE_HEADER_LEN {
-            return Err(DecodeError::TooShort);
-        }
-        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_DISCRETE_INPUTS {
-            return Err(DecodeError::UnexpectedFunctionCode {
-                expected: FUNCTION_CODE_READ_DISCRETE_INPUTS,
-                actual: bytes[FUNCTION_CODE_BYTE],
-            });
-        }
-        let byte_count = bytes[BYTE_COUNT_BYTE] as usize;
-        if bytes.len() < RESPONSE_DATA_START + byte_count {
-            return Err(DecodeError::TooShort);
-        }
-        let discrete_input_values = bytes[RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count)]
-            .iter()
-            .flat_map(|&byte| (0..8).map(move |bit| byte & (1 << bit) != 0))
-            .collect();
         Ok(Self {
-            discrete_input_values,
+            discrete_input_values: decode_bitfield_response(
+                bytes,
+                FUNCTION_CODE_READ_DISCRETE_INPUTS,
+            )?,
         })
     }
 }
