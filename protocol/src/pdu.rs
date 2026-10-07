@@ -436,27 +436,60 @@ pub struct ReadDeviceIdentificationResponse {
     pub objects: Vec<DeviceIdentificationObject>,
 }
 
+// Shared by every "function code + starting_address + quantity" request/
+// response (Extraction-Based Programming: the same concrete encode/decode
+// body had been hand-duplicated across 6 types -- ReadCoilsRequest,
+// ReadDiscreteInputsRequest, ReadHoldingRegistersRequest,
+// ReadInputRegistersRequest, WriteMultipleCoilsResponse,
+// WriteMultipleRegistersResponse -- before being folded here).
+struct AddressAndQuantity {
+    starting_address: u16,
+    quantity: u16,
+}
+
+fn encode_address_and_quantity(function_code: u8, starting_address: u16, quantity: u16) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(TWO_FIELD_PDU_LEN);
+    buffer.push(function_code);
+    buffer.extend_from_slice(&starting_address.to_be_bytes());
+    buffer.extend_from_slice(&quantity.to_be_bytes());
+    buffer
+}
+
+fn decode_address_and_quantity(
+    bytes: &[u8],
+    function_code: u8,
+) -> Result<AddressAndQuantity, DecodeError> {
+    if bytes.len() < TWO_FIELD_PDU_LEN {
+        return Err(DecodeError::TooShort);
+    }
+    if bytes[FUNCTION_CODE_BYTE] != function_code {
+        return Err(DecodeError::UnexpectedFunctionCode {
+            expected: function_code,
+            actual: bytes[FUNCTION_CODE_BYTE],
+        });
+    }
+    let starting_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
+    let quantity = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
+    Ok(AddressAndQuantity {
+        starting_address,
+        quantity,
+    })
+}
+
 impl ReadCoilsRequest {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(TWO_FIELD_PDU_LEN);
-        buffer.push(FUNCTION_CODE_READ_COILS);
-        buffer.extend_from_slice(&self.starting_address.to_be_bytes());
-        buffer.extend_from_slice(&self.quantity.to_be_bytes());
-        buffer
+        encode_address_and_quantity(
+            FUNCTION_CODE_READ_COILS,
+            self.starting_address,
+            self.quantity,
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < TWO_FIELD_PDU_LEN {
-            return Err(DecodeError::TooShort);
-        }
-        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_COILS {
-            return Err(DecodeError::UnexpectedFunctionCode {
-                expected: FUNCTION_CODE_READ_COILS,
-                actual: bytes[FUNCTION_CODE_BYTE],
-            });
-        }
-        let starting_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
-        let quantity = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
+        let AddressAndQuantity {
+            starting_address,
+            quantity,
+        } = decode_address_and_quantity(bytes, FUNCTION_CODE_READ_COILS)?;
         Ok(Self {
             starting_address,
             quantity,
@@ -466,25 +499,18 @@ impl ReadCoilsRequest {
 
 impl ReadDiscreteInputsRequest {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(TWO_FIELD_PDU_LEN);
-        buffer.push(FUNCTION_CODE_READ_DISCRETE_INPUTS);
-        buffer.extend_from_slice(&self.starting_address.to_be_bytes());
-        buffer.extend_from_slice(&self.quantity.to_be_bytes());
-        buffer
+        encode_address_and_quantity(
+            FUNCTION_CODE_READ_DISCRETE_INPUTS,
+            self.starting_address,
+            self.quantity,
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < TWO_FIELD_PDU_LEN {
-            return Err(DecodeError::TooShort);
-        }
-        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_DISCRETE_INPUTS {
-            return Err(DecodeError::UnexpectedFunctionCode {
-                expected: FUNCTION_CODE_READ_DISCRETE_INPUTS,
-                actual: bytes[FUNCTION_CODE_BYTE],
-            });
-        }
-        let starting_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
-        let quantity = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
+        let AddressAndQuantity {
+            starting_address,
+            quantity,
+        } = decode_address_and_quantity(bytes, FUNCTION_CODE_READ_DISCRETE_INPUTS)?;
         Ok(Self {
             starting_address,
             quantity,
@@ -494,25 +520,18 @@ impl ReadDiscreteInputsRequest {
 
 impl ReadHoldingRegistersRequest {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(5);
-        buffer.push(FUNCTION_CODE_READ_HOLDING_REGISTERS);
-        buffer.extend_from_slice(&self.starting_address.to_be_bytes());
-        buffer.extend_from_slice(&self.quantity.to_be_bytes());
-        buffer
+        encode_address_and_quantity(
+            FUNCTION_CODE_READ_HOLDING_REGISTERS,
+            self.starting_address,
+            self.quantity,
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < TWO_FIELD_PDU_LEN {
-            return Err(DecodeError::TooShort);
-        }
-        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_HOLDING_REGISTERS {
-            return Err(DecodeError::UnexpectedFunctionCode {
-                expected: FUNCTION_CODE_READ_HOLDING_REGISTERS,
-                actual: bytes[FUNCTION_CODE_BYTE],
-            });
-        }
-        let starting_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
-        let quantity = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
+        let AddressAndQuantity {
+            starting_address,
+            quantity,
+        } = decode_address_and_quantity(bytes, FUNCTION_CODE_READ_HOLDING_REGISTERS)?;
         Ok(Self {
             starting_address,
             quantity,
@@ -522,25 +541,18 @@ impl ReadHoldingRegistersRequest {
 
 impl ReadInputRegistersRequest {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(TWO_FIELD_PDU_LEN);
-        buffer.push(FUNCTION_CODE_READ_INPUT_REGISTERS);
-        buffer.extend_from_slice(&self.starting_address.to_be_bytes());
-        buffer.extend_from_slice(&self.quantity.to_be_bytes());
-        buffer
+        encode_address_and_quantity(
+            FUNCTION_CODE_READ_INPUT_REGISTERS,
+            self.starting_address,
+            self.quantity,
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < TWO_FIELD_PDU_LEN {
-            return Err(DecodeError::TooShort);
-        }
-        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_INPUT_REGISTERS {
-            return Err(DecodeError::UnexpectedFunctionCode {
-                expected: FUNCTION_CODE_READ_INPUT_REGISTERS,
-                actual: bytes[FUNCTION_CODE_BYTE],
-            });
-        }
-        let starting_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
-        let quantity = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
+        let AddressAndQuantity {
+            starting_address,
+            quantity,
+        } = decode_address_and_quantity(bytes, FUNCTION_CODE_READ_INPUT_REGISTERS)?;
         Ok(Self {
             starting_address,
             quantity,
@@ -1100,25 +1112,18 @@ impl WriteMultipleCoilsRequest {
 
 impl WriteMultipleCoilsResponse {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(TWO_FIELD_PDU_LEN);
-        buffer.push(FUNCTION_CODE_WRITE_MULTIPLE_COILS);
-        buffer.extend_from_slice(&self.starting_address.to_be_bytes());
-        buffer.extend_from_slice(&self.quantity.to_be_bytes());
-        buffer
+        encode_address_and_quantity(
+            FUNCTION_CODE_WRITE_MULTIPLE_COILS,
+            self.starting_address,
+            self.quantity,
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < TWO_FIELD_PDU_LEN {
-            return Err(DecodeError::TooShort);
-        }
-        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_WRITE_MULTIPLE_COILS {
-            return Err(DecodeError::UnexpectedFunctionCode {
-                expected: FUNCTION_CODE_WRITE_MULTIPLE_COILS,
-                actual: bytes[FUNCTION_CODE_BYTE],
-            });
-        }
-        let starting_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
-        let quantity = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
+        let AddressAndQuantity {
+            starting_address,
+            quantity,
+        } = decode_address_and_quantity(bytes, FUNCTION_CODE_WRITE_MULTIPLE_COILS)?;
         Ok(Self {
             starting_address,
             quantity,
@@ -1190,25 +1195,18 @@ impl WriteMultipleRegistersRequest {
 
 impl WriteMultipleRegistersResponse {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(TWO_FIELD_PDU_LEN);
-        buffer.push(FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS);
-        buffer.extend_from_slice(&self.starting_address.to_be_bytes());
-        buffer.extend_from_slice(&self.quantity.to_be_bytes());
-        buffer
+        encode_address_and_quantity(
+            FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
+            self.starting_address,
+            self.quantity,
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < TWO_FIELD_PDU_LEN {
-            return Err(DecodeError::TooShort);
-        }
-        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS {
-            return Err(DecodeError::UnexpectedFunctionCode {
-                expected: FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
-                actual: bytes[FUNCTION_CODE_BYTE],
-            });
-        }
-        let starting_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
-        let quantity = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
+        let AddressAndQuantity {
+            starting_address,
+            quantity,
+        } = decode_address_and_quantity(bytes, FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS)?;
         Ok(Self {
             starting_address,
             quantity,
