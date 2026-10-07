@@ -348,6 +348,19 @@ fn handle_read_device_description_bulk_transfer(
 // straight from the store, uninterpreted — see CLAUDE.md's "FC 0x14 (Read
 // File Record)" section for why this project doesn't attempt to decode
 // what a record's bytes mean.
+// Shared by handle_read_file_record and handle_write_file_record below:
+// both look up a file-record description by its (file_number,
+// record_number) key before validating anything else about the request.
+fn find_file_record(
+    file_records: &[FileRecordDescription],
+    file_number: u16,
+    record_number: u16,
+) -> Option<&FileRecordDescription> {
+    file_records.iter().find(|description| {
+        description.file_number == file_number && description.record_number == record_number
+    })
+}
+
 fn handle_read_file_record(
     pdu: &[u8],
     file_records: &[FileRecordDescription],
@@ -359,10 +372,11 @@ fn handle_read_file_record(
 
     let mut resolved: Vec<&FileRecordDescription> = Vec::with_capacity(request.sub_requests.len());
     for sub_request in &request.sub_requests {
-        let Some(description) = file_records.iter().find(|description| {
-            description.file_number == sub_request.file_number
-                && description.record_number == sub_request.record_number
-        }) else {
+        let Some(description) = find_file_record(
+            file_records,
+            sub_request.file_number,
+            sub_request.record_number,
+        ) else {
             return exception(
                 FUNCTION_CODE_READ_FILE_RECORD,
                 EXCEPTION_ILLEGAL_DATA_ADDRESS,
@@ -424,10 +438,11 @@ fn handle_write_file_record(
     };
 
     for sub_request in &request.sub_requests {
-        let Some(description) = file_records.iter().find(|description| {
-            description.file_number == sub_request.file_number
-                && description.record_number == sub_request.record_number
-        }) else {
+        let Some(description) = find_file_record(
+            file_records,
+            sub_request.file_number,
+            sub_request.record_number,
+        ) else {
             return exception(
                 FUNCTION_CODE_WRITE_FILE_RECORD,
                 EXCEPTION_ILLEGAL_DATA_ADDRESS,
@@ -525,6 +540,23 @@ fn handle_read(
 // (FC16, handle_write_multiple_registers below), same as the client only
 // ever sends FC6 for a single one-register-wide value (see
 // client::transaction_consumer).
+// Shared by handle_write_single and handle_mask_write_register below: both
+// need a register that's exactly one wire word wide and writable at this
+// address — Write Single Register and Mask Write Register can each only
+// ever address one wire word, so neither can act on anything wider, and
+// `AccessRight::ReadWrite` rules out both an unconfigured address and a
+// read-only register in the same lookup.
+fn find_single_word_read_write_register(
+    registers: &[RegisterDescription],
+    address: u16,
+) -> Option<&RegisterDescription> {
+    registers.iter().find(|register| {
+        register.address == address
+            && register.data_type.register_count() == 1
+            && register.access == AccessRight::ReadWrite
+    })
+}
+
 fn handle_write_single(
     pdu: &[u8],
     registers: &[RegisterDescription],
@@ -538,11 +570,7 @@ fn handle_write_single(
         );
     };
 
-    let register = registers.iter().find(|register| {
-        register.address == request.register_address
-            && register.data_type.register_count() == 1
-            && register.access == AccessRight::ReadWrite
-    });
+    let register = find_single_word_read_write_register(registers, request.register_address);
     match register {
         Some(register) => {
             // Always Some: register_count() == 1 was just checked above,
@@ -595,11 +623,7 @@ fn handle_mask_write_register(
         );
     };
 
-    let register = registers.iter().find(|register| {
-        register.address == request.reference_address
-            && register.data_type.register_count() == 1
-            && register.access == AccessRight::ReadWrite
-    });
+    let register = find_single_word_read_write_register(registers, request.reference_address);
     match register {
         Some(register) => {
             let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
