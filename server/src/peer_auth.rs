@@ -7,10 +7,9 @@
 
 /// The real UID this process is running as — the only UID ever allowed to
 /// talk to a local admin/data socket (see `is_authorized_uid`). Read once
-/// via `libc::getuid()` (already a transitive dependency through `fuser`,
-/// so this reuses it rather than adding a second crate like `nix`/`rustix`
-/// just for one syscall) rather than cached, since a UID can't change
-/// during a process's lifetime.
+/// via `libc::getuid()` (a direct dependency kept minimal on purpose —
+/// one syscall doesn't justify a second crate like `nix`/`rustix`) rather
+/// than cached, since a UID can't change during a process's lifetime.
 pub fn server_uid() -> libc::uid_t {
     // SAFETY: getuid() takes no arguments, performs no memory access, and
     // cannot fail — it's one of the few POSIX calls with no error return.

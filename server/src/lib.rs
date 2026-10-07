@@ -12,4 +12,3 @@ pub mod persistence;
 pub mod server_handle;
 pub mod server_options;
 pub mod tls;
-pub mod transaction_consumer;

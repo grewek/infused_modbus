@@ -450,8 +450,8 @@ fn main() {
     // name-keyed) — this is what `handle_request`/`start_serving` use to
     // route an incoming request's `unit_id` to the right machine's static
     // descriptions and stores. Two different keys for two different
-    // purposes: `machine_stores` by name (FUSE + transaction consumer),
-    // `machines` by unit_id (wire dispatch).
+    // purposes: `machine_stores` by name (`ServerHandle`'s direct store
+    // access), `machines` by unit_id (wire dispatch).
     let machines: Arc<HashMap<u8, ServerMachineState>> = Arc::new(
         description
             .machines
