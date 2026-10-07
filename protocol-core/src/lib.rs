@@ -4,4 +4,8 @@
 
 #![no_std]
 
+pub mod bit_values;
+pub mod device_identification;
+pub mod file_record;
 pub mod pdu_bytes;
+pub mod register_values;
