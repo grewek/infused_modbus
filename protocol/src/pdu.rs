@@ -564,14 +564,30 @@ impl ReadInputRegistersRequest {
 // (Extraction-Based Programming: the same concrete encode/decode body had
 // been hand-duplicated across 2 types -- ReadCoilsResponse,
 // ReadDiscreteInputsResponse -- before being folded here).
+
+/// Sets bit `bit_index` (0 = least-significant bit of the first byte,
+/// matching Modbus's own coil/discrete-input packing order) in `packed`.
+fn pack_bit(packed: &mut [u8], bit_index: usize) {
+    let byte_index = bit_index / 8;
+    let bit_within_byte = bit_index % 8;
+    packed[byte_index] |= 1 << bit_within_byte;
+}
+
+/// Reads bit `bit_index` back out of `packed` -- the inverse of `pack_bit`.
+fn unpack_bit(packed: &[u8], bit_index: usize) -> bool {
+    let byte_index = bit_index / 8;
+    let bit_within_byte = bit_index % 8;
+    packed[byte_index] & (1 << bit_within_byte) != 0
+}
+
 fn encode_bitfield_response(function_code: u8, values: &[bool]) -> Vec<u8> {
     let byte_count = values.len().div_ceil(8);
     let mut buffer = vec![0u8; RESPONSE_HEADER_LEN + byte_count];
     buffer[FUNCTION_CODE_BYTE] = function_code;
     buffer[BYTE_COUNT_BYTE] = byte_count as u8;
-    for (index, &value) in values.iter().enumerate() {
+    for (bit_index, &value) in values.iter().enumerate() {
         if value {
-            buffer[RESPONSE_DATA_START + index / 8] |= 1 << (index % 8);
+            pack_bit(&mut buffer[RESPONSE_DATA_START..], bit_index);
         }
     }
     buffer
@@ -591,12 +607,10 @@ fn decode_bitfield_response(bytes: &[u8], function_code: u8) -> Result<Vec<bool>
     if bytes.len() < RESPONSE_DATA_START + byte_count {
         return Err(DecodeError::TooShort);
     }
-    Ok(
-        bytes[RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count)]
-            .iter()
-            .flat_map(|&byte| (0..8).map(move |bit| byte & (1 << bit) != 0))
-            .collect(),
-    )
+    let packed = &bytes[RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count)];
+    Ok((0..byte_count * 8)
+        .map(|bit_index| unpack_bit(packed, bit_index))
+        .collect())
 }
 
 impl ReadCoilsResponse {
