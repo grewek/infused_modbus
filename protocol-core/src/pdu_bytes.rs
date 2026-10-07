@@ -64,6 +64,13 @@ impl PduBytes {
         &self.data[..self.len]
     }
 
+    /// For in-place bit-packing (coil/discrete-input responses): push the
+    /// needed number of zero bytes first via `push`/`extend_from_slice`,
+    /// then flip individual bits through this.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data[..self.len]
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
