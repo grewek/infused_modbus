@@ -634,77 +634,76 @@ impl ReadDiscreteInputsResponse {
     }
 }
 
+// Shared by every "function code + byte_count + Vec<u16> values" response
+// (Extraction-Based Programming: the same concrete encode/decode body had
+// been hand-duplicated across 3 types -- ReadHoldingRegistersResponse,
+// ReadInputRegistersResponse, ReadWriteMultipleRegistersResponse -- before
+// being folded here).
+fn encode_register_array_response(function_code: u8, register_values: &[u16]) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(RESPONSE_HEADER_LEN + register_values.len() * 2);
+    buffer.push(function_code);
+    buffer.push((register_values.len() * 2) as u8);
+    for value in register_values {
+        buffer.extend_from_slice(&value.to_be_bytes());
+    }
+    buffer
+}
+
+fn decode_register_array_response(
+    bytes: &[u8],
+    function_code: u8,
+) -> Result<Vec<u16>, DecodeError> {
+    if bytes.len() < RESPONSE_HEADER_LEN {
+        return Err(DecodeError::TooShort);
+    }
+    if bytes[FUNCTION_CODE_BYTE] != function_code {
+        return Err(DecodeError::UnexpectedFunctionCode {
+            expected: function_code,
+            actual: bytes[FUNCTION_CODE_BYTE],
+        });
+    }
+    let byte_count = bytes[BYTE_COUNT_BYTE];
+    if !byte_count.is_multiple_of(2) {
+        return Err(DecodeError::OddByteCount { byte_count });
+    }
+    if bytes.len() < RESPONSE_DATA_START + byte_count as usize {
+        return Err(DecodeError::TooShort);
+    }
+    Ok(
+        bytes[RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count as usize)]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect(),
+    )
+}
+
 impl ReadHoldingRegistersResponse {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(RESPONSE_HEADER_LEN + self.register_values.len() * 2);
-        buffer.push(FUNCTION_CODE_READ_HOLDING_REGISTERS);
-        buffer.push((self.register_values.len() * 2) as u8);
-        for value in &self.register_values {
-            buffer.extend_from_slice(&value.to_be_bytes());
-        }
-        buffer
+        encode_register_array_response(FUNCTION_CODE_READ_HOLDING_REGISTERS, &self.register_values)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < RESPONSE_HEADER_LEN {
-            return Err(DecodeError::TooShort);
-        }
-        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_HOLDING_REGISTERS {
-            return Err(DecodeError::UnexpectedFunctionCode {
-                expected: FUNCTION_CODE_READ_HOLDING_REGISTERS,
-                actual: bytes[FUNCTION_CODE_BYTE],
-            });
-        }
-        let byte_count = bytes[BYTE_COUNT_BYTE];
-        if !byte_count.is_multiple_of(2) {
-            return Err(DecodeError::OddByteCount { byte_count });
-        }
-        if bytes.len() < RESPONSE_DATA_START + byte_count as usize {
-            return Err(DecodeError::TooShort);
-        }
-        let register_values = bytes
-            [RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count as usize)]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-            .collect();
-        Ok(Self { register_values })
+        Ok(Self {
+            register_values: decode_register_array_response(
+                bytes,
+                FUNCTION_CODE_READ_HOLDING_REGISTERS,
+            )?,
+        })
     }
 }
 
 impl ReadInputRegistersResponse {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(RESPONSE_HEADER_LEN + self.register_values.len() * 2);
-        buffer.push(FUNCTION_CODE_READ_INPUT_REGISTERS);
-        buffer.push((self.register_values.len() * 2) as u8);
-        for value in &self.register_values {
-            buffer.extend_from_slice(&value.to_be_bytes());
-        }
-        buffer
+        encode_register_array_response(FUNCTION_CODE_READ_INPUT_REGISTERS, &self.register_values)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < RESPONSE_HEADER_LEN {
-            return Err(DecodeError::TooShort);
-        }
-        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_INPUT_REGISTERS {
-            return Err(DecodeError::UnexpectedFunctionCode {
-                expected: FUNCTION_CODE_READ_INPUT_REGISTERS,
-                actual: bytes[FUNCTION_CODE_BYTE],
-            });
-        }
-        let byte_count = bytes[BYTE_COUNT_BYTE];
-        if !byte_count.is_multiple_of(2) {
-            return Err(DecodeError::OddByteCount { byte_count });
-        }
-        if bytes.len() < RESPONSE_DATA_START + byte_count as usize {
-            return Err(DecodeError::TooShort);
-        }
-        let register_values = bytes
-            [RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count as usize)]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-            .collect();
-        Ok(Self { register_values })
+        Ok(Self {
+            register_values: decode_register_array_response(
+                bytes,
+                FUNCTION_CODE_READ_INPUT_REGISTERS,
+            )?,
+        })
     }
 }
 
@@ -1011,38 +1010,19 @@ impl ReadWriteMultipleRegistersRequest {
 
 impl ReadWriteMultipleRegistersResponse {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(RESPONSE_HEADER_LEN + self.register_values.len() * 2);
-        buffer.push(FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS);
-        buffer.push((self.register_values.len() * 2) as u8);
-        for value in &self.register_values {
-            buffer.extend_from_slice(&value.to_be_bytes());
-        }
-        buffer
+        encode_register_array_response(
+            FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+            &self.register_values,
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < RESPONSE_HEADER_LEN {
-            return Err(DecodeError::TooShort);
-        }
-        if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS {
-            return Err(DecodeError::UnexpectedFunctionCode {
-                expected: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
-                actual: bytes[FUNCTION_CODE_BYTE],
-            });
-        }
-        let byte_count = bytes[BYTE_COUNT_BYTE];
-        if !byte_count.is_multiple_of(2) {
-            return Err(DecodeError::OddByteCount { byte_count });
-        }
-        if bytes.len() < RESPONSE_DATA_START + byte_count as usize {
-            return Err(DecodeError::TooShort);
-        }
-        let register_values = bytes
-            [RESPONSE_DATA_START..(RESPONSE_DATA_START + byte_count as usize)]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-            .collect();
-        Ok(Self { register_values })
+        Ok(Self {
+            register_values: decode_register_array_response(
+                bytes,
+                FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+            )?,
+        })
     }
 }
 
