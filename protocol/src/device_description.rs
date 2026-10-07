@@ -254,28 +254,29 @@ struct RawInputRegisterSection {
     entries: Vec<RawInputRegisterEntry>,
 }
 
+// Coils and discrete inputs are both bare "name + offset" (no `data_type`/
+// `access`, see `CoilDescription`/`DiscreteInputDescription`'s own doc
+// comments) — one shared raw-parsing shape for both TOML sections instead
+// of two field-identical copies, cutting the number of distinct types
+// `toml`'s generic deserializer has to be monomorphized for. Validation
+// behavior is unaffected either way: neither this type nor the two it
+// replaces ever had `#[serde(deny_unknown_fields)]` (unlike server_options.rs/
+// client::broker's config types, which do) -- an unrecognized key in a
+// `[[coils.entries]]`/`[[discrete-inputs.entries]]` table is silently
+// ignored before and after this change, not a new or newly-fixed gap.
+// The two *output* types stay fully distinct below (`resolve_addresses`
+// maps each into its own `CoilDescription`/`DiscreteInputDescription`) --
+// only this intermediate parsing stage is shared.
 #[derive(Debug, Deserialize)]
-struct RawCoilEntry {
+struct RawBitEntry {
     name: String,
     offset: u16,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct RawCoilSection {
+struct RawBitSection {
     base_address: u16,
-    entries: Vec<RawCoilEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawDiscreteInputEntry {
-    name: String,
-    offset: u16,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RawDiscreteInputSection {
-    base_address: u16,
-    entries: Vec<RawDiscreteInputEntry>,
+    entries: Vec<RawBitEntry>,
 }
 
 // No wrapping section/`base_address` here, unlike every other entry kind —
@@ -301,9 +302,9 @@ struct RawMachine {
     #[serde(default)]
     registers: RawRegisterSection,
     #[serde(default)]
-    coils: RawCoilSection,
+    coils: RawBitSection,
     #[serde(default, rename = "discrete-inputs")]
-    discrete_inputs: RawDiscreteInputSection,
+    discrete_inputs: RawBitSection,
     #[serde(default, rename = "input-registers")]
     input_registers: RawInputRegisterSection,
     #[serde(default, rename = "file-records")]
@@ -499,8 +500,8 @@ fn resolve_machine(raw: RawMachine) -> Result<MachineDescription, DeviceDescript
         machine_name,
         raw.coils.base_address,
         raw.coils.entries,
-        |entry: &RawCoilEntry| entry.offset,
-        |entry: &RawCoilEntry| entry.name.clone(),
+        |entry: &RawBitEntry| entry.offset,
+        |entry: &RawBitEntry| entry.name.clone(),
     )?
     .into_iter()
     .map(|(entry, address)| CoilDescription {
@@ -534,8 +535,8 @@ fn resolve_machine(raw: RawMachine) -> Result<MachineDescription, DeviceDescript
         machine_name,
         raw.discrete_inputs.base_address,
         raw.discrete_inputs.entries,
-        |entry: &RawDiscreteInputEntry| entry.offset,
-        |entry: &RawDiscreteInputEntry| entry.name.clone(),
+        |entry: &RawBitEntry| entry.offset,
+        |entry: &RawBitEntry| entry.name.clone(),
     )?
     .into_iter()
     .map(|(entry, address)| DiscreteInputDescription {
