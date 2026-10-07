@@ -354,6 +354,17 @@ fn main() {
         "Starting infused_modbus, connected via {connection_string} — machines: {}",
         machine_names.join(", ")
     );
+    // The client's own effective `server_id` per machine (from the local
+    // fallback TOML or an FC43 fetch) — had a dedicated read-only FUSE file
+    // before the FUSE/files removal; printed here now since there's no
+    // other way for a technician to see which of the two it ended up
+    // being. Machines without one configured are silently skipped, same
+    // "None means not configured" convention FC11 itself uses.
+    for machine in &description.machines {
+        if let Some(server_id) = &machine.server_id {
+            println!("  {}: server_id = {server_id:?}", machine.name);
+        }
+    }
 
     // This project doesn't run a broker itself — see CLAUDE.md's "MQTT
     // (Sparkplug B) representation layer" for why the embedded broker was
