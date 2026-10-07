@@ -472,6 +472,20 @@ fn validate_unit_code(
     }
 }
 
+// Named (not inline-closure) accessors for `RawBitEntry`, shared verbatim by
+// the `coils` and `discrete_inputs` calls to `resolve_addresses` below: two
+// identical closure *literals* would still be two distinct monomorphized
+// instantiations of `resolve_addresses` (each closure is its own anonymous
+// type, even with byte-identical bodies) — one shared `fn` item used at both
+// call sites guarantees a single shared instantiation instead.
+fn bit_entry_offset(entry: &RawBitEntry) -> u16 {
+    entry.offset
+}
+
+fn bit_entry_name(entry: &RawBitEntry) -> String {
+    entry.name.clone()
+}
+
 fn resolve_machine(raw: RawMachine) -> Result<MachineDescription, DeviceDescriptionError> {
     let machine_name = raw.name.as_str();
     let mem_layout = raw.registers.mem_layout;
@@ -500,8 +514,8 @@ fn resolve_machine(raw: RawMachine) -> Result<MachineDescription, DeviceDescript
         machine_name,
         raw.coils.base_address,
         raw.coils.entries,
-        |entry: &RawBitEntry| entry.offset,
-        |entry: &RawBitEntry| entry.name.clone(),
+        bit_entry_offset,
+        bit_entry_name,
     )?
     .into_iter()
     .map(|(entry, address)| CoilDescription {
@@ -535,8 +549,8 @@ fn resolve_machine(raw: RawMachine) -> Result<MachineDescription, DeviceDescript
         machine_name,
         raw.discrete_inputs.base_address,
         raw.discrete_inputs.entries,
-        |entry: &RawBitEntry| entry.offset,
-        |entry: &RawBitEntry| entry.name.clone(),
+        bit_entry_offset,
+        bit_entry_name,
     )?
     .into_iter()
     .map(|(entry, address)| DiscreteInputDescription {
