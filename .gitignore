@@ -1,4 +1,7 @@
 /target
+# server-no-std is its own standalone workspace (see its Cargo.toml) with
+# its own target/ directory, not covered by the root /target entry above.
+/server-no-std/target
 
 # Generated TLS identities (self-signed cert + private key) — never commit
 # generated key material, even throwaway/test-generated.

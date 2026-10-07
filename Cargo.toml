@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["protocol", "datafs", "client", "server", "sparkplug", "examples/rolling_door"]
+members = ["protocol", "protocol-core", "datafs", "client", "server", "sparkplug", "examples/rolling_door"]
 
 [profile.release]
 opt-level = "z"

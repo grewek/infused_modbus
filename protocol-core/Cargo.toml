@@ -1,0 +1,13 @@
+# The dependency-free, #![no_std] subset of `protocol`'s Modbus wire-format
+# logic -- shared by `protocol` itself (the std/tokio-based build) and
+# `server-no-std` (../server-no-std, its own standalone workspace). A normal
+# member of this repo's main workspace: unlike `server-no-std`, this is a
+# library, not a binary, so it needs no special panic strategy of its own --
+# `#![no_std]` library code compiles fine into a panic=unwind host binary,
+# the strategy conflict only exists for the final linked executable.
+[package]
+name = "protocol-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

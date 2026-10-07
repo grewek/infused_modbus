@@ -1,0 +1,27 @@
+# Deliberately its own standalone workspace (empty [workspace] table below),
+# not a member of the repo root's workspace: a #![no_std] + #![no_main]
+# binary on this target has no eh_personality lang item (no std, no
+# panic_unwind), so it can only ever build under panic = "abort" -- but
+# `panic` is a workspace-wide Cargo profile setting, not overridable per
+# package. Sharing the root workspace's profile would force panic = "abort"
+# onto every other crate too, which would break `cargo test --workspace`
+# (the std test harness needs unwind for per-test isolation). Keeping this
+# crate in its own nested workspace avoids that entirely -- `cargo build`
+# run from inside this directory resolves its own profile, independent of
+# the root workspace's.
+[workspace]
+
+[package]
+name = "server-no-std"
+version = "0.1.0"
+edition = "2024"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
