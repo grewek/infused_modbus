@@ -111,6 +111,19 @@ struct ServerHandleMachine {
     stores: MachineStores,
 }
 
+/// Shared by `set_register`/`set_coil` below: marks `point_name`'s most
+/// recent write attempt as confirmed. Discrete-inputs/input-registers/file-
+/// records deliberately have no `report/` coverage at all (see their own
+/// `set_*` doc comments), so only these two ever call this.
+fn mark_write_ok(machine: &ServerHandleMachine, point_name: &str) {
+    machine
+        .stores
+        .report
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set(point_name.to_string(), WriteStatus::Ok);
+}
+
 /// One `ServerHandle` covers every machine a `server` process was started
 /// with — mirrors how `HashMap<String, MachineStores>` is already the
 /// established per-machine bundle shape in `server::main`.
@@ -224,12 +237,7 @@ impl ServerHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .set(point_name.to_string(), value);
-        machine
-            .stores
-            .report
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .set(point_name.to_string(), WriteStatus::Ok);
+        mark_write_ok(machine, point_name);
         Ok(())
     }
 
@@ -283,12 +291,7 @@ impl ServerHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .set(point_name.to_string(), value);
-        machine
-            .stores
-            .report
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .set(point_name.to_string(), WriteStatus::Ok);
+        mark_write_ok(machine, point_name);
         Ok(())
     }
 
