@@ -114,8 +114,22 @@ pub fn metric_value_to_register_value(
         (ModbusDataType::I8, MetricValue::Int(raw)) => Ok(RegisterValue::I8(*raw as u8 as i8)),
         (ModbusDataType::U16, MetricValue::Int(raw)) => Ok(RegisterValue::U16(*raw as u16)),
         (ModbusDataType::I16, MetricValue::Int(raw)) => Ok(RegisterValue::I16(*raw as u16 as i16)),
-        (ModbusDataType::U24, MetricValue::Int(raw)) => Ok(RegisterValue::U24(*raw)),
-        (ModbusDataType::I24, MetricValue::Int(raw)) => Ok(RegisterValue::I24(*raw as i32)),
+        (ModbusDataType::U24, MetricValue::Int(raw)) => {
+            const U24_MAX: u32 = 0x00FF_FFFF;
+            if *raw > U24_MAX {
+                return Err(format!("{raw} does not fit in a U24 register"));
+            }
+            Ok(RegisterValue::U24(*raw))
+        }
+        (ModbusDataType::I24, MetricValue::Int(raw)) => {
+            const I24_MIN: i32 = -0x0080_0000;
+            const I24_MAX: i32 = 0x007F_FFFF;
+            let signed = *raw as i32;
+            if !(I24_MIN..=I24_MAX).contains(&signed) {
+                return Err(format!("{signed} does not fit in an I24 register"));
+            }
+            Ok(RegisterValue::I24(signed))
+        }
         (ModbusDataType::U32, MetricValue::Int(raw)) => Ok(RegisterValue::U32(*raw)),
         (ModbusDataType::I32, MetricValue::Int(raw)) => Ok(RegisterValue::I32(*raw as i32)),
         (ModbusDataType::U64, MetricValue::Long(raw)) => Ok(RegisterValue::U64(*raw)),
@@ -841,6 +855,23 @@ mod tests {
     fn metric_value_to_register_value_rejects_a_mismatched_shape() {
         assert!(
             metric_value_to_register_value(&MetricValue::Boolean(true), ModbusDataType::U16)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn metric_value_to_register_value_rejects_u24_out_of_range() {
+        assert!(
+            metric_value_to_register_value(&MetricValue::Int(0x0100_0000), ModbusDataType::U24)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn metric_value_to_register_value_rejects_i24_out_of_range() {
+        // 0x0080_0000 as i32 is 8_388_608, one past I24_MAX (8_388_607).
+        assert!(
+            metric_value_to_register_value(&MetricValue::Int(0x0080_0000), ModbusDataType::I24)
                 .is_err()
         );
     }
