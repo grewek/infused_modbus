@@ -72,6 +72,19 @@ use std::sync::{Arc, Mutex, PoisonError};
 // project's extraction-based-programming convention).
 const MAX_PDU_LEN: usize = 253;
 
+// Shared by every FC handler below: `ExceptionResponse { function_code,
+// exception_code }.encode()` is the one response shape every failure path
+// in this file produces (73 call sites before this was extracted) —
+// Extraction-Based Programming territory once a pattern has shown up this
+// many times, independent of any binary-size consideration.
+fn exception(function_code: u8, exception_code: u8) -> Vec<u8> {
+    ExceptionResponse {
+        function_code,
+        exception_code,
+    }
+    .encode()
+}
+
 /// One configured machine's full dispatch-time state — everything
 /// `handle_request` needs once it has resolved an incoming request's
 /// `unit_id` to a specific machine (see CLAUDE.md's multi-machine design).
@@ -116,13 +129,7 @@ pub fn handle_request(
     fc43_bulk_transfer: &Fc43BulkTransfer,
 ) -> Option<Vec<u8>> {
     let Some(&function_code) = pdu.first() else {
-        return Some(
-            ExceptionResponse {
-                function_code: 0,
-                exception_code: EXCEPTION_ILLEGAL_FUNCTION,
-            }
-            .encode(),
-        );
+        return Some(exception(0, EXCEPTION_ILLEGAL_FUNCTION));
     };
 
     // Every function code's availability is an explicit technician
@@ -134,13 +141,7 @@ pub fn handle_request(
     // disabled function code is disabled process-wide, regardless of which
     // machine would've handled it.
     if !server_options.is_enabled(function_code) {
-        return Some(
-            ExceptionResponse {
-                function_code,
-                exception_code: EXCEPTION_ILLEGAL_FUNCTION,
-            }
-            .encode(),
-        );
+        return Some(exception(function_code, EXCEPTION_ILLEGAL_FUNCTION));
     }
 
     if function_code == FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT {
@@ -231,11 +232,7 @@ pub fn handle_request(
         FUNCTION_CODE_WRITE_FILE_RECORD => {
             handle_write_file_record(pdu, &machine.file_records, &machine.file_record_store)
         }
-        _ => ExceptionResponse {
-            function_code,
-            exception_code: EXCEPTION_ILLEGAL_FUNCTION,
-        }
-        .encode(),
+        _ => exception(function_code, EXCEPTION_ILLEGAL_FUNCTION),
     })
 }
 
@@ -264,30 +261,27 @@ fn handle_encapsulated_interface_transport(
     fc43_bulk_transfer: &Fc43BulkTransfer,
 ) -> Vec<u8> {
     let Ok(request) = ReadDeviceIdentificationRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
-            exception_code: EXCEPTION_ILLEGAL_FUNCTION,
-        }
-        .encode();
+        return exception(
+            FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
+            EXCEPTION_ILLEGAL_FUNCTION,
+        );
     };
     let objects = match build_objects(toml_source) {
         Ok(objects) => objects,
         Err(_) if detect_machine_layout => {
             let Ok(objects) = build_objects(&fc43_bulk_transfer.manifest_toml) else {
-                return ExceptionResponse {
-                    function_code: FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
-                    exception_code: EXCEPTION_SERVER_DEVICE_FAILURE,
-                }
-                .encode();
+                return exception(
+                    FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
+                    EXCEPTION_SERVER_DEVICE_FAILURE,
+                );
             };
             objects
         }
         Err(_) => {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
-                exception_code: EXCEPTION_SERVER_DEVICE_FAILURE,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_ENCAPSULATED_INTERFACE_TRANSPORT,
+                EXCEPTION_SERVER_DEVICE_FAILURE,
+            );
         }
     };
     handle_read_device_identification(&request, &objects)
@@ -311,11 +305,10 @@ fn handle_read_device_description_bulk_transfer(
         let Some(range) =
             bulk_transfer_chunk_range(compressed_toml.len(), sub_request.record_number)
         else {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_READ_FILE_RECORD,
-                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_READ_FILE_RECORD,
+                EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            );
         };
         let chunk = &compressed_toml[range];
         // A chunk's own byte length is only ever shorter than
@@ -325,11 +318,7 @@ fn handle_read_device_description_bulk_transfer(
         // trailing pad byte implied when it's odd (added below).
         let expected_record_length = chunk.len().div_ceil(2) as u16;
         if sub_request.record_length != expected_record_length {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_READ_FILE_RECORD,
-                exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-            }
-            .encode();
+            return exception(FUNCTION_CODE_READ_FILE_RECORD, EXCEPTION_ILLEGAL_DATA_VALUE);
         }
         let mut data = chunk.to_vec();
         if !data.len().is_multiple_of(2) {
@@ -343,11 +332,7 @@ fn handle_read_device_description_bulk_transfer(
     // keep a single chunk's response within budget — checked anyway,
     // same defensive precedent as handle_read_file_record's own check.
     if encoded.len() > MAX_PDU_LEN {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_READ_FILE_RECORD,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(FUNCTION_CODE_READ_FILE_RECORD, EXCEPTION_ILLEGAL_DATA_VALUE);
     }
     encoded
 }
@@ -369,11 +354,7 @@ fn handle_read_file_record(
     file_record_store: &Mutex<FileRecordStore>,
 ) -> Vec<u8> {
     let Ok(request) = ReadFileRecordRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_READ_FILE_RECORD,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(FUNCTION_CODE_READ_FILE_RECORD, EXCEPTION_ILLEGAL_DATA_VALUE);
     };
 
     let mut resolved: Vec<&FileRecordDescription> = Vec::with_capacity(request.sub_requests.len());
@@ -382,22 +363,17 @@ fn handle_read_file_record(
             description.file_number == sub_request.file_number
                 && description.record_number == sub_request.record_number
         }) else {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_READ_FILE_RECORD,
-                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_READ_FILE_RECORD,
+                EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            );
         };
         // Same "must land on an exact boundary" discipline as handle_read's
         // register-by-register walk — a request asking for a different
         // length than what's declared has no well-defined answer, rather
         // than silently truncating/padding to what was actually asked for.
         if description.record_length != sub_request.record_length {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_READ_FILE_RECORD,
-                exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-            }
-            .encode();
+            return exception(FUNCTION_CODE_READ_FILE_RECORD, EXCEPTION_ILLEGAL_DATA_VALUE);
         }
         resolved.push(description);
     }
@@ -420,11 +396,7 @@ fn handle_read_file_record(
     // The spec caps the whole PDU at 253 bytes — reject rather than send a
     // response no real Modbus transport could carry.
     if encoded.len() > MAX_PDU_LEN {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_READ_FILE_RECORD,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(FUNCTION_CODE_READ_FILE_RECORD, EXCEPTION_ILLEGAL_DATA_VALUE);
     }
     encoded
 }
@@ -445,11 +417,10 @@ fn handle_write_file_record(
     file_record_store: &Mutex<FileRecordStore>,
 ) -> Vec<u8> {
     let Ok(request) = WriteFileRecordRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_WRITE_FILE_RECORD,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(
+            FUNCTION_CODE_WRITE_FILE_RECORD,
+            EXCEPTION_ILLEGAL_DATA_VALUE,
+        );
     };
 
     for sub_request in &request.sub_requests {
@@ -457,18 +428,16 @@ fn handle_write_file_record(
             description.file_number == sub_request.file_number
                 && description.record_number == sub_request.record_number
         }) else {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_WRITE_FILE_RECORD,
-                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_WRITE_FILE_RECORD,
+                EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            );
         };
         if sub_request.record_data.len() != description.record_length as usize * 2 {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_WRITE_FILE_RECORD,
-                exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_WRITE_FILE_RECORD,
+                EXCEPTION_ILLEGAL_DATA_VALUE,
+            );
         }
     }
 
@@ -505,11 +474,10 @@ fn handle_read(
     mem_layout: MemLayout,
 ) -> Vec<u8> {
     let Ok(request) = ReadHoldingRegistersRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_READ_HOLDING_REGISTERS,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(
+            FUNCTION_CODE_READ_HOLDING_REGISTERS,
+            EXCEPTION_ILLEGAL_DATA_VALUE,
+        );
     };
 
     let store = store.lock().unwrap_or_else(PoisonError::into_inner);
@@ -526,11 +494,10 @@ fn handle_read(
             .iter()
             .find(|register| register.address == address)
         else {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_READ_HOLDING_REGISTERS,
-                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_READ_HOLDING_REGISTERS,
+                EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            );
         };
 
         let value = match store.get(&register.name) {
@@ -540,11 +507,10 @@ fn handle_read(
         let words = register_value_to_words(value, mem_layout);
 
         if register_values.len() + words.len() > request.quantity as usize {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_READ_HOLDING_REGISTERS,
-                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_READ_HOLDING_REGISTERS,
+                EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            );
         }
         register_values.extend(words);
         address = address.wrapping_add(register.data_type.register_count());
@@ -566,11 +532,10 @@ fn handle_write_single(
     mem_layout: MemLayout,
 ) -> Vec<u8> {
     let Ok(request) = WriteSingleRegisterRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_WRITE_SINGLE_REGISTER,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(
+            FUNCTION_CODE_WRITE_SINGLE_REGISTER,
+            EXCEPTION_ILLEGAL_DATA_VALUE,
+        );
     };
 
     let register = registers.iter().find(|register| {
@@ -601,11 +566,10 @@ fn handle_write_single(
         // Covers three cases alike: no register at this address, a
         // register too wide for FC6, and a read-only register — all "you
         // can't write here [this way]".
-        None => ExceptionResponse {
-            function_code: FUNCTION_CODE_WRITE_SINGLE_REGISTER,
-            exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-        }
-        .encode(),
+        None => exception(
+            FUNCTION_CODE_WRITE_SINGLE_REGISTER,
+            EXCEPTION_ILLEGAL_DATA_ADDRESS,
+        ),
     }
 }
 
@@ -625,11 +589,10 @@ fn handle_mask_write_register(
     mem_layout: MemLayout,
 ) -> Vec<u8> {
     let Ok(request) = MaskWriteRegisterRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_MASK_WRITE_REGISTER,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(
+            FUNCTION_CODE_MASK_WRITE_REGISTER,
+            EXCEPTION_ILLEGAL_DATA_VALUE,
+        );
     };
 
     let register = registers.iter().find(|register| {
@@ -662,11 +625,10 @@ fn handle_mask_write_register(
         // Covers the same three cases as handle_write_single: no register
         // at this address, a register too wide for this FC, and a
         // read-only register.
-        None => ExceptionResponse {
-            function_code: FUNCTION_CODE_MASK_WRITE_REGISTER,
-            exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-        }
-        .encode(),
+        None => exception(
+            FUNCTION_CODE_MASK_WRITE_REGISTER,
+            EXCEPTION_ILLEGAL_DATA_ADDRESS,
+        ),
     }
 }
 
@@ -680,11 +642,7 @@ fn handle_mask_write_register(
 // meaningful isn't really "supporting" the function code.
 fn handle_report_server_id(pdu: &[u8], server_id: Option<&str>) -> Vec<u8> {
     let Ok(_request) = ReportServerIdRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_REPORT_SERVER_ID,
-            exception_code: EXCEPTION_ILLEGAL_FUNCTION,
-        }
-        .encode();
+        return exception(FUNCTION_CODE_REPORT_SERVER_ID, EXCEPTION_ILLEGAL_FUNCTION);
     };
     match server_id {
         Some(server_id) => ReportServerIdResponse {
@@ -692,11 +650,7 @@ fn handle_report_server_id(pdu: &[u8], server_id: Option<&str>) -> Vec<u8> {
             run_indicator_status: true,
         }
         .encode(),
-        None => ExceptionResponse {
-            function_code: FUNCTION_CODE_REPORT_SERVER_ID,
-            exception_code: EXCEPTION_ILLEGAL_FUNCTION,
-        }
-        .encode(),
+        None => exception(FUNCTION_CODE_REPORT_SERVER_ID, EXCEPTION_ILLEGAL_FUNCTION),
     }
 }
 
@@ -707,11 +661,10 @@ fn handle_write_multiple_registers(
     mem_layout: MemLayout,
 ) -> Vec<u8> {
     let Ok(request) = WriteMultipleRegistersRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(
+            FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
+            EXCEPTION_ILLEGAL_DATA_VALUE,
+        );
     };
 
     // Walk register-by-register, same shape as handle_read: only a
@@ -728,20 +681,18 @@ fn handle_write_multiple_registers(
         let Some(register) = registers.iter().find(|register| {
             register.address == address && register.access == AccessRight::ReadWrite
         }) else {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
-                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
+                EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            );
         };
 
         let register_count = register.data_type.register_count() as usize;
         if offset + register_count > request.register_values.len() {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
-                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_WRITE_MULTIPLE_REGISTERS,
+                EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            );
         }
         let words = &request.register_values[offset..offset + register_count];
         // Always Some: `words` is exactly `register_count` long by
@@ -781,11 +732,10 @@ fn handle_read_write_multiple_registers(
     mem_layout: MemLayout,
 ) -> Vec<u8> {
     let Ok(request) = ReadWriteMultipleRegistersRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(
+            FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+            EXCEPTION_ILLEGAL_DATA_VALUE,
+        );
     };
 
     let mut resolved_writes: Vec<(&RegisterDescription, RegisterValue)> = Vec::new();
@@ -798,19 +748,17 @@ fn handle_read_write_multiple_registers(
         let Some(register) = registers.iter().find(|register| {
             register.address == address && register.access == AccessRight::ReadWrite
         }) else {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
-                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+                EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            );
         };
         let register_count = register.data_type.register_count() as usize;
         if offset + register_count > request.write_values.len() {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
-                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+                EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            );
         }
         let words = &request.write_values[offset..offset + register_count];
         // Always Some: `words` is exactly `register_count` long by
@@ -833,19 +781,17 @@ fn handle_read_write_multiple_registers(
             .iter()
             .find(|register| register.address == address)
         else {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
-                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+                EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            );
         };
         word_count += register.data_type.register_count() as usize;
         if word_count > request.read_quantity as usize {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
-                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_READ_WRITE_MULTIPLE_REGISTERS,
+                EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            );
         }
         read_registers.push(register);
         address = address.wrapping_add(register.data_type.register_count());
@@ -872,11 +818,7 @@ fn handle_read_coils(
     coil_store: &Mutex<CoilStore>,
 ) -> Vec<u8> {
     let Ok(request) = ReadCoilsRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_READ_COILS,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(FUNCTION_CODE_READ_COILS, EXCEPTION_ILLEGAL_DATA_VALUE);
     };
 
     let coil_store = coil_store.lock().unwrap_or_else(PoisonError::into_inner);
@@ -889,11 +831,7 @@ fn handle_read_coils(
                 coil_values.push(value);
             }
             None => {
-                return ExceptionResponse {
-                    function_code: FUNCTION_CODE_READ_COILS,
-                    exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-                }
-                .encode();
+                return exception(FUNCTION_CODE_READ_COILS, EXCEPTION_ILLEGAL_DATA_ADDRESS);
             }
         }
     }
@@ -912,11 +850,10 @@ fn handle_read_discrete_inputs(
     discrete_input_store: &Mutex<DiscreteInputStore>,
 ) -> Vec<u8> {
     let Ok(request) = ReadDiscreteInputsRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_READ_DISCRETE_INPUTS,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(
+            FUNCTION_CODE_READ_DISCRETE_INPUTS,
+            EXCEPTION_ILLEGAL_DATA_VALUE,
+        );
     };
 
     let discrete_input_store = discrete_input_store
@@ -936,11 +873,10 @@ fn handle_read_discrete_inputs(
                 discrete_input_values.push(value);
             }
             None => {
-                return ExceptionResponse {
-                    function_code: FUNCTION_CODE_READ_DISCRETE_INPUTS,
-                    exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-                }
-                .encode();
+                return exception(
+                    FUNCTION_CODE_READ_DISCRETE_INPUTS,
+                    EXCEPTION_ILLEGAL_DATA_ADDRESS,
+                );
             }
         }
     }
@@ -962,11 +898,10 @@ fn handle_read_input_registers(
     input_register_mem_layout: MemLayout,
 ) -> Vec<u8> {
     let Ok(request) = ReadInputRegistersRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_READ_INPUT_REGISTERS,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(
+            FUNCTION_CODE_READ_INPUT_REGISTERS,
+            EXCEPTION_ILLEGAL_DATA_VALUE,
+        );
     };
 
     let store = input_register_store
@@ -980,11 +915,10 @@ fn handle_read_input_registers(
             .iter()
             .find(|input_register| input_register.address == address)
         else {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_READ_INPUT_REGISTERS,
-                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_READ_INPUT_REGISTERS,
+                EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            );
         };
 
         let value = match store.get(&input_register.name) {
@@ -994,11 +928,10 @@ fn handle_read_input_registers(
         let words = register_value_to_words(value, input_register_mem_layout);
 
         if register_values.len() + words.len() > request.quantity as usize {
-            return ExceptionResponse {
-                function_code: FUNCTION_CODE_READ_INPUT_REGISTERS,
-                exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-            }
-            .encode();
+            return exception(
+                FUNCTION_CODE_READ_INPUT_REGISTERS,
+                EXCEPTION_ILLEGAL_DATA_ADDRESS,
+            );
         }
         register_values.extend(words);
         address = address.wrapping_add(input_register.data_type.register_count());
@@ -1012,11 +945,10 @@ fn handle_write_single_coil(
     coil_store: &Mutex<CoilStore>,
 ) -> Vec<u8> {
     let Ok(request) = WriteSingleCoilRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_WRITE_SINGLE_COIL,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(
+            FUNCTION_CODE_WRITE_SINGLE_COIL,
+            EXCEPTION_ILLEGAL_DATA_VALUE,
+        );
     };
 
     match coils
@@ -1034,11 +966,10 @@ fn handle_write_single_coil(
             }
             .encode()
         }
-        None => ExceptionResponse {
-            function_code: FUNCTION_CODE_WRITE_SINGLE_COIL,
-            exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-        }
-        .encode(),
+        None => exception(
+            FUNCTION_CODE_WRITE_SINGLE_COIL,
+            EXCEPTION_ILLEGAL_DATA_ADDRESS,
+        ),
     }
 }
 
@@ -1048,11 +979,10 @@ fn handle_write_multiple_coils(
     coil_store: &Mutex<CoilStore>,
 ) -> Vec<u8> {
     let Ok(request) = WriteMultipleCoilsRequest::decode(pdu) else {
-        return ExceptionResponse {
-            function_code: FUNCTION_CODE_WRITE_MULTIPLE_COILS,
-            exception_code: EXCEPTION_ILLEGAL_DATA_VALUE,
-        }
-        .encode();
+        return exception(
+            FUNCTION_CODE_WRITE_MULTIPLE_COILS,
+            EXCEPTION_ILLEGAL_DATA_VALUE,
+        );
     };
 
     let mut resolved = Vec::with_capacity(request.coil_values.len());
@@ -1061,11 +991,10 @@ fn handle_write_multiple_coils(
         match coils.iter().find(|coil| coil.address == address) {
             Some(coil) => resolved.push((coil, value)),
             None => {
-                return ExceptionResponse {
-                    function_code: FUNCTION_CODE_WRITE_MULTIPLE_COILS,
-                    exception_code: EXCEPTION_ILLEGAL_DATA_ADDRESS,
-                }
-                .encode();
+                return exception(
+                    FUNCTION_CODE_WRITE_MULTIPLE_COILS,
+                    EXCEPTION_ILLEGAL_DATA_ADDRESS,
+                );
             }
         }
     }
