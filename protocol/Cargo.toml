@@ -14,5 +14,11 @@ rustls-pki-types = "1.15.1"
 ring = "0.17.14"
 
 [dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+protocol-core = { path = "../protocol-core" }
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["rt", "macros"] }
+
+[[bench]]
+name = "pdu_codec"
+harness = false

@@ -7,3 +7,10 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+
+# `cargo bench` inherits unset fields from [profile.release] by default --
+# without this, benchmarks would silently run under opt-level="z" (optimize
+# for size), not a fair speed comparison. Speed-optimized independent of
+# whatever the production release profile is tuned for.
+[profile.bench]
+opt-level = 3
