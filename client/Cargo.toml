@@ -27,7 +27,7 @@ rustls-webpki = "0.103.15"
 rumqttc = { version = "0.25", default-features = false }
 config = "0.14"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 miniz_oxide = "0.8"
 
 [dev-dependencies]
