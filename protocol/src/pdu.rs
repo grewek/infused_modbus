@@ -763,36 +763,24 @@ impl WriteSingleCoilResponse {
     }
 }
 
-fn encode_write_single_register(register_address: u16, register_value: u16) -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(TWO_FIELD_PDU_LEN);
-    buffer.push(FUNCTION_CODE_WRITE_SINGLE_REGISTER);
-    buffer.extend_from_slice(&register_address.to_be_bytes());
-    buffer.extend_from_slice(&register_value.to_be_bytes());
-    buffer
-}
-
-fn decode_write_single_register(bytes: &[u8]) -> Result<(u16, u16), DecodeError> {
-    if bytes.len() < TWO_FIELD_PDU_LEN {
-        return Err(DecodeError::TooShort);
-    }
-    if bytes[FUNCTION_CODE_BYTE] != FUNCTION_CODE_WRITE_SINGLE_REGISTER {
-        return Err(DecodeError::UnexpectedFunctionCode {
-            expected: FUNCTION_CODE_WRITE_SINGLE_REGISTER,
-            actual: bytes[FUNCTION_CODE_BYTE],
-        });
-    }
-    let register_address = read_u16_be(bytes, ADDRESS_FIELD_BYTE);
-    let register_value = read_u16_be(bytes, QUANTITY_OR_VALUE_FIELD_BYTE);
-    Ok((register_address, register_value))
-}
-
+// Write Single Register's wire shape (function code + address + value) is
+// the same "two u16 fields" PDU as encode_address_and_quantity/
+// decode_address_and_quantity above -- reused directly rather than
+// re-duplicating it under a write-specific name.
 impl WriteSingleRegisterRequest {
     pub fn encode(&self) -> Vec<u8> {
-        encode_write_single_register(self.register_address, self.register_value)
+        encode_address_and_quantity(
+            FUNCTION_CODE_WRITE_SINGLE_REGISTER,
+            self.register_address,
+            self.register_value,
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let (register_address, register_value) = decode_write_single_register(bytes)?;
+        let AddressAndQuantity {
+            starting_address: register_address,
+            quantity: register_value,
+        } = decode_address_and_quantity(bytes, FUNCTION_CODE_WRITE_SINGLE_REGISTER)?;
         Ok(Self {
             register_address,
             register_value,
@@ -802,11 +790,18 @@ impl WriteSingleRegisterRequest {
 
 impl WriteSingleRegisterResponse {
     pub fn encode(&self) -> Vec<u8> {
-        encode_write_single_register(self.register_address, self.register_value)
+        encode_address_and_quantity(
+            FUNCTION_CODE_WRITE_SINGLE_REGISTER,
+            self.register_address,
+            self.register_value,
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let (register_address, register_value) = decode_write_single_register(bytes)?;
+        let AddressAndQuantity {
+            starting_address: register_address,
+            quantity: register_value,
+        } = decode_address_and_quantity(bytes, FUNCTION_CODE_WRITE_SINGLE_REGISTER)?;
         Ok(Self {
             register_address,
             register_value,
